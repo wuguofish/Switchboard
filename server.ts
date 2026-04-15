@@ -331,6 +331,10 @@ export async function startServer(opts: {
   const bunServer = Bun.serve({
     hostname: '127.0.0.1',
     port: opts.port,
+    // MCP Streamable HTTP uses long-lived SSE streams (GET /mcp) that stay open
+    // waiting for server-side notifications. Bun's default 10s idle timeout
+    // would kill them and make clients reconnect-loop. 255 = max allowed.
+    idleTimeout: 255,
 
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url)
