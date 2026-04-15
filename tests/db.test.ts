@@ -1,6 +1,6 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test'
 import { unlinkSync, existsSync } from 'fs'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions } from '../db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages } from '../db'
 import type { Database } from 'bun:sqlite'
 
 const TEST_DB = ':memory:'
@@ -171,4 +171,36 @@ test('listAllSessions returns all registered sessions', () => {
   createSession(db, { alias: null })  // anonymous
   const all = listAllSessions(db)
   expect(all).toHaveLength(3)
+})
+
+test('deleteExpiredMessages removes read messages older than 7 days', () => {
+  const a = createSession(db, { alias: 'a' })
+  const b = createSession(db, { alias: 'b' })
+
+  // Insert a message and force it read_at = 8 days ago
+  const id = insertMessage(db, { sender_id: a, recipient_id: b, broadcast_id: null, content: 'old' })
+  const eightDaysAgo = new Date(Date.now() - 8 * 86400_000).toISOString()
+  db.query('UPDATE messages SET read_at = ? WHERE id = ?').run(eightDaysAgo, id)
+
+  // Fresh unread message — should survive
+  const freshId = insertMessage(db, { sender_id: a, recipient_id: b, broadcast_id: null, content: 'new' })
+
+  const deleted = deleteExpiredMessages(db)
+  expect(deleted).toBe(1)
+
+  const remaining = db.query<{ id: string }, []>('SELECT id FROM messages').all()
+  expect(remaining.map(r => r.id)).toEqual([freshId])
+})
+
+test('deleteExpiredMessages keeps unread messages regardless of age', () => {
+  const a = createSession(db, { alias: 'a' })
+  const b = createSession(db, { alias: 'b' })
+  const id = insertMessage(db, { sender_id: a, recipient_id: b, broadcast_id: null, content: 'old unread' })
+  // Force created_at way back (read_at still NULL)
+  const longAgo = new Date(Date.now() - 100 * 86400_000).toISOString()
+  db.query('UPDATE messages SET created_at = ? WHERE id = ?').run(longAgo, id)
+
+  deleteExpiredMessages(db)
+  const remaining = db.query<{ id: string }, []>('SELECT id FROM messages').all()
+  expect(remaining).toHaveLength(1)
 })

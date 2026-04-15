@@ -148,3 +148,12 @@ export function listAllSessions(db: Database): SessionRow[] {
     'SELECT id, alias, created_at, last_activity FROM sessions ORDER BY created_at ASC'
   ).all()
 }
+
+export function deleteExpiredMessages(db: Database): number {
+  const info = db.query(`
+    DELETE FROM messages
+    WHERE read_at IS NOT NULL
+      AND datetime(read_at) < datetime('now', '-7 days')
+  `).run()
+  return Number(info.changes)
+}
