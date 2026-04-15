@@ -3,7 +3,7 @@ import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
-import type { SessionRow } from './types'
+import type { SessionRow, MessageRow } from './types'
 import { nowUtc } from './time'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -49,4 +49,39 @@ export function updateLastActivity(db: Database, id: string): void {
 
 export function setAlias(db: Database, id: string, newAlias: string): void {
   db.query('UPDATE sessions SET alias = ? WHERE id = ?').run(newAlias, id)
+}
+
+export interface InsertMessageInput {
+  sender_id: string
+  recipient_id: string
+  broadcast_id: string | null
+  content: string
+}
+
+export function insertMessage(db: Database, input: InsertMessageInput): string {
+  const id = randomUUID()
+  const now = nowUtc()
+  db.query(`
+    INSERT INTO messages (id, sender_id, recipient_id, broadcast_id, content, created_at, read_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run(id, input.sender_id, input.recipient_id, input.broadcast_id, input.content, now)
+  return id
+}
+
+export function fetchUnreadForRecipient(db: Database, recipient_id: string): MessageRow[] {
+  return db.query<MessageRow, [string]>(`
+    SELECT id, sender_id, recipient_id, broadcast_id, content, created_at, read_at
+    FROM messages
+    WHERE recipient_id = ? AND read_at IS NULL
+    ORDER BY created_at ASC
+  `).all(recipient_id)
+}
+
+export function markMessagesRead(db: Database, messageIds: string[]): void {
+  if (messageIds.length === 0) return
+  const now = nowUtc()
+  const placeholders = messageIds.map(() => '?').join(',')
+  db.query(
+    `UPDATE messages SET read_at = ? WHERE id IN (${placeholders}) AND read_at IS NULL`
+  ).run(now, ...messageIds)
 }
