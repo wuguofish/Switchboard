@@ -1,6 +1,6 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test'
 import { unlinkSync, existsSync } from 'fs'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead } from '../db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions } from '../db'
 import type { Database } from 'bun:sqlite'
 
 const TEST_DB = ':memory:'
@@ -99,4 +99,76 @@ test('fetchUnread excludes already-read messages', () => {
   const id = insertMessage(db, { sender_id: a, recipient_id: b, broadcast_id: null, content: 'x' })
   markMessagesRead(db, [id])
   expect(fetchUnreadForRecipient(db, b)).toHaveLength(0)
+})
+
+test('insertBroadcast fans out to all sessions except sender', () => {
+  const sender = createSession(db, { alias: 'sender' })
+  const r1 = createSession(db, { alias: 'r1' })
+  const r2 = createSession(db, { alias: 'r2' })
+
+  const result = insertBroadcast(db, { sender_id: sender, content: 'hello all' })
+
+  expect(result.recipient_count).toBe(2)
+  expect(result.broadcast_id).toBeTruthy()
+
+  const r1Msgs = fetchUnreadForRecipient(db, r1)
+  const r2Msgs = fetchUnreadForRecipient(db, r2)
+  const senderMsgs = fetchUnreadForRecipient(db, sender)
+
+  expect(r1Msgs).toHaveLength(1)
+  expect(r2Msgs).toHaveLength(1)
+  expect(senderMsgs).toHaveLength(0)
+  expect(r1Msgs[0].broadcast_id).toBe(result.broadcast_id)
+  expect(r1Msgs[0].broadcast_id).toBe(r2Msgs[0].broadcast_id)
+})
+
+test('insertBroadcast with no other sessions returns zero recipient_count', () => {
+  const sender = createSession(db, { alias: 'only' })
+  const result = insertBroadcast(db, { sender_id: sender, content: 'lonely' })
+  expect(result.recipient_count).toBe(0)
+})
+
+test('recallMessage deletes 1-to-1 message when caller is sender', () => {
+  const a = createSession(db, { alias: 'a' })
+  const b = createSession(db, { alias: 'b' })
+  const id = insertMessage(db, { sender_id: a, recipient_id: b, broadcast_id: null, content: 'oops' })
+  const recalled = recallMessage(db, { message_id: id, caller_id: a })
+  expect(recalled).toBe(1)
+  expect(fetchUnreadForRecipient(db, b)).toHaveLength(0)
+})
+
+test('recallMessage throws when caller is not sender', () => {
+  const a = createSession(db, { alias: 'a' })
+  const b = createSession(db, { alias: 'b' })
+  const id = insertMessage(db, { sender_id: a, recipient_id: b, broadcast_id: null, content: 'x' })
+  expect(() => recallMessage(db, { message_id: id, caller_id: b }))
+    .toThrow(/not the sender/)
+})
+
+test('recallMessage on broadcast deletes all copies', () => {
+  const sender = createSession(db, { alias: 's' })
+  const r1 = createSession(db, { alias: 'r1' })
+  const r2 = createSession(db, { alias: 'r2' })
+  const { broadcast_id } = insertBroadcast(db, { sender_id: sender, content: 'group' })
+  const oneCopy = fetchUnreadForRecipient(db, r1)[0]
+
+  const recalled = recallMessage(db, { message_id: oneCopy.id, caller_id: sender })
+
+  expect(recalled).toBe(2)  // both copies
+  expect(fetchUnreadForRecipient(db, r1)).toHaveLength(0)
+  expect(fetchUnreadForRecipient(db, r2)).toHaveLength(0)
+})
+
+test('recallMessage on missing message returns 0 (idempotent)', () => {
+  const a = createSession(db, { alias: 'a' })
+  const recalled = recallMessage(db, { message_id: 'nonexistent-id', caller_id: a })
+  expect(recalled).toBe(0)
+})
+
+test('listAllSessions returns all registered sessions', () => {
+  createSession(db, { alias: 'a' })
+  createSession(db, { alias: 'b' })
+  createSession(db, { alias: null })  // anonymous
+  const all = listAllSessions(db)
+  expect(all).toHaveLength(3)
 })

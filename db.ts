@@ -85,3 +85,66 @@ export function markMessagesRead(db: Database, messageIds: string[]): void {
     `UPDATE messages SET read_at = ? WHERE id IN (${placeholders}) AND read_at IS NULL`
   ).run(now, ...messageIds)
 }
+
+export interface BroadcastInput {
+  sender_id: string
+  content: string
+}
+
+export interface BroadcastDbResult {
+  broadcast_id: string
+  recipient_count: number
+}
+
+export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastDbResult {
+  const broadcast_id = randomUUID()
+  const recipients = db.query<{ id: string }, [string]>(
+    'SELECT id FROM sessions WHERE id != ?'
+  ).all(input.sender_id)
+
+  const now = nowUtc()
+  const stmt = db.query(`
+    INSERT INTO messages (id, sender_id, recipient_id, broadcast_id, content, created_at, read_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `)
+  const insertTx = db.transaction((rows: typeof recipients) => {
+    for (const r of rows) {
+      stmt.run(randomUUID(), input.sender_id, r.id, broadcast_id, input.content, now)
+    }
+  })
+  insertTx(recipients)
+
+  return { broadcast_id, recipient_count: recipients.length }
+}
+
+export interface RecallInput {
+  message_id: string
+  caller_id: string
+}
+
+export function recallMessage(db: Database, input: RecallInput): number {
+  const msg = db.query<{ sender_id: string; broadcast_id: string | null }, [string]>(
+    'SELECT sender_id, broadcast_id FROM messages WHERE id = ?'
+  ).get(input.message_id)
+
+  if (!msg) return 0  // idempotent: message doesn't exist
+
+  if (msg.sender_id !== input.caller_id) {
+    throw new Error('caller is not the sender of this message')
+  }
+
+  if (msg.broadcast_id) {
+    // Delete all copies of this broadcast
+    const info = db.query('DELETE FROM messages WHERE broadcast_id = ?').run(msg.broadcast_id)
+    return Number(info.changes)
+  } else {
+    const info = db.query('DELETE FROM messages WHERE id = ?').run(input.message_id)
+    return Number(info.changes)
+  }
+}
+
+export function listAllSessions(db: Database): SessionRow[] {
+  return db.query<SessionRow, []>(
+    'SELECT id, alias, created_at, last_activity FROM sessions ORDER BY created_at ASC'
+  ).all()
+}
