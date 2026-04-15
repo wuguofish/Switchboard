@@ -22,6 +22,7 @@ import { openDatabase, createSession, findSessionById, insertMessage, insertBroa
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
+import { startRetentionLoop } from './retention'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -37,6 +38,7 @@ export async function startServer(opts: {
   dbPath: string
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
+  const retention = startRetentionLoop(db)
   const registry = new ConnectionRegistry()
 
   // Map: MCP session ID (from Mcp-Session-Id header) → session entry
@@ -447,6 +449,9 @@ export async function startServer(opts: {
 
   return {
     async stop(): Promise<void> {
+      // Stop retention loop first (before closing DB)
+      retention.stop()
+
       // Close all open transports
       const closePromises: Promise<void>[] = []
       for (const [, entry] of sessionMap) {
