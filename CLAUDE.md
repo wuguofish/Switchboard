@@ -59,3 +59,33 @@ bun test tests/integration.test.ts
 **正解**：`import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'`。它的 `handleRequest(req, { parsedBody })` 接 Fetch `Request` 回 `Response`，跟 `Bun.serve` 的 `fetch()` handler 無縫對接，不用 node:http。
 
 **順便**：body 要先讀一次判斷是不是 `isInitializeRequest`，讀完後要把 `parsedBody` 當第二參數傳給 `handleRequest`，不然 transport 會 double-read body 報錯。看 `createMcpSession()` 那段就知道怎麼接。
+
+## Phase 2: Auto-wake（opt-in）
+
+背景 poller + Stop hook auto-wake，讓 idle session 有新訊息時自動喚醒。設計 spec：`docs/superpowers/specs/2026-04-16-switchboard-phase2-auto-wake-design.md`。
+
+### 如何啟用
+
+1. 把 `client-hooks.example.json` 的內容 **merge** 進 workspace 的 `.claude/settings.local.json`（不要整份 overwrite，現有 permissions array 要保留）
+2. 把 `SWITCHBOARD_ROLE` 改成這個 session 的唯一 role name
+3. `/hooks` reload 設定
+4. Session 啟動時 `bootstrap.ts` 自動 register role；每次 turn 結束 Stop hook spawn `poller.ts` 背景監控 inbox
+5. Poller 偵測到新訊息就 `exit 2` 喚醒 session → 自動 spawn 新 turn
+
+### 兩個 state file
+
+- `D:\tsunu_plan\.claude\switchboard-role.txt` — bootstrap 寫入、Stop hook 讀取
+- `D:\tsunu_plan\.claude\switchboard-poller.state` — poller cooperative watchdog 的 pid state
+
+### Troubleshooting
+
+- **Bootstrap 靜默失敗** → 檢查 switchboard daemon 是否在 `127.0.0.1:9876` 跑；stderr 會寫原因
+- **Session 沒被自動喚醒** → 檢查 `switchboard-role.txt` 是否存在、`switchboard-poller.state` 的 pid 是否在更新
+- **Orphan poller** → 10 分鐘 TTL 自清；立即清理用 Task Manager 找 `bun` process
+- **兩個 session 用同一個 role** → 未定義行為，不要這樣做
+
+### 限制（intentional）
+
+- Anonymous session 無法 auto-wake（必須有 role）
+- 一個 role 同時只能綁一個 session
+- 第一次 bootstrap 需要 switchboard daemon 已啟動

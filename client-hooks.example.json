@@ -1,0 +1,21 @@
+{
+  "env": {
+    "SWITCHBOARD_ROLE": "your-session-role-here"
+  },
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "bun D:/tsunu_plan/mcp-servers/switchboard/bootstrap.ts"
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "bun D:/tsunu_plan/mcp-servers/switchboard/poller.ts",
+        "async": true,
+        "asyncRewake": true
+      }]
+    }]
+  }
+}
