@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead } from './db'
+import { openDatabase, createSession, findSessionById, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
@@ -134,6 +134,20 @@ export async function startServer(opts: {
           name: 'read_messages',
           description: 'Fetch and mark-as-read all unread messages for this session.',
           inputSchema: { type: 'object' as const, properties: {} },
+        },
+        {
+          name: 'list_sessions',
+          description: 'List all registered sessions with online status.',
+          inputSchema: { type: 'object' as const, properties: {} },
+        },
+        {
+          name: 'recall',
+          description: 'Recall a message you sent. For broadcast, recalls all copies.',
+          inputSchema: {
+            type: 'object' as const,
+            properties: { message_id: { type: 'string' } },
+            required: ['message_id'],
+          },
         },
       ],
     }))
@@ -274,6 +288,29 @@ export async function startServer(opts: {
         })
         return {
           content: [{ type: 'text', text: JSON.stringify({ messages }) }],
+        }
+      }
+
+      if (name === 'list_sessions') {
+        const all = listAllSessions(db)
+        const result = all.map(s => ({
+          session_id: s.id,
+          alias: s.alias,
+          online: registry.isOnline(s.id),
+          created_at: toTaipeiISOString(s.created_at),
+          last_activity: toTaipeiISOString(s.last_activity),
+        }))
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+        }
+      }
+
+      if (name === 'recall') {
+        if (!currentSwitchboardId) throw new Error('session not registered')
+        const message_id = (args as Record<string, unknown>)?.message_id as string
+        const recalled_count = recallMessage(db, { message_id, caller_id: currentSwitchboardId })
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ recalled_count }) }],
         }
       }
 

@@ -138,3 +138,66 @@ test('read_messages marks as read (second call returns empty)', async () => {
   await a.close()
   await b.close()
 })
+
+test('list_sessions includes all registered with online flag', async () => {
+  const a = await makeClient('ls-a')
+  const b = await makeClient('ls-b')
+  await a.callTool({ name: 'register', arguments: { role: 'lsA' } })
+  await b.callTool({ name: 'register', arguments: { role: 'lsB' } })
+
+  const listResult = JSON.parse(((await a.callTool({ name: 'list_sessions', arguments: {} })).content as any[])[0].text)
+  const aliases = listResult.map((s: any) => s.alias).filter(Boolean)
+  expect(aliases).toContain('lsA')
+  expect(aliases).toContain('lsB')
+  const lsA = listResult.find((s: any) => s.alias === 'lsA')
+  expect(lsA.online).toBe(true)
+
+  await a.close()
+  await b.close()
+})
+
+test('recall deletes unread message', async () => {
+  const sender = await makeClient('rc-sender')
+  const recipient = await makeClient('rc-recip')
+  await sender.callTool({ name: 'register', arguments: { role: 'rcs' } })
+  await recipient.callTool({ name: 'register', arguments: { role: 'rcr' } })
+
+  const sendResult = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'rcr', message: 'oops' },
+  })).content as any[])[0].text)
+
+  const recallResult = JSON.parse(((await sender.callTool({
+    name: 'recall',
+    arguments: { message_id: sendResult.message_id },
+  })).content as any[])[0].text)
+  expect(recallResult.recalled_count).toBe(1)
+
+  const readResult = JSON.parse(((await recipient.callTool({
+    name: 'read_messages', arguments: {},
+  })).content as any[])[0].text)
+  expect(readResult.messages).toHaveLength(0)
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('recall by non-sender throws', async () => {
+  const sender = await makeClient('rc2-sender')
+  const recipient = await makeClient('rc2-recip')
+  await sender.callTool({ name: 'register', arguments: { role: 'rc2s' } })
+  await recipient.callTool({ name: 'register', arguments: { role: 'rc2r' } })
+
+  const sendResult = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'rc2r', message: 'you cannot recall this' },
+  })).content as any[])[0].text)
+
+  await expect(recipient.callTool({
+    name: 'recall',
+    arguments: { message_id: sendResult.message_id },
+  })).rejects.toThrow()
+
+  await sender.close()
+  await recipient.close()
+})
