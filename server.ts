@@ -18,9 +18,10 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById } from './db'
+import { openDatabase, createSession, findSessionById, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead } from './db'
 import { ConnectionRegistry } from './connections'
-import { setAliasWithCollisionCheck } from './aliases'
+import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
+import { toTaipeiISOString } from './time'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -108,6 +109,32 @@ export async function startServer(opts: {
             required: ['alias'],
           },
         },
+        {
+          name: 'send',
+          description: '1-to-1 message. `to` can be alias or session UUID.',
+          inputSchema: {
+            type: 'object' as const,
+            properties: {
+              to: { type: 'string' },
+              message: { type: 'string' },
+            },
+            required: ['to', 'message'],
+          },
+        },
+        {
+          name: 'broadcast',
+          description: 'Send to all currently registered sessions (except self).',
+          inputSchema: {
+            type: 'object' as const,
+            properties: { message: { type: 'string' } },
+            required: ['message'],
+          },
+        },
+        {
+          name: 'read_messages',
+          description: 'Fetch and mark-as-read all unread messages for this session.',
+          inputSchema: { type: 'object' as const, properties: {} },
+        },
       ],
     }))
 
@@ -176,6 +203,77 @@ export async function startServer(opts: {
               text: JSON.stringify({ old_alias: oldAlias, new_alias: alias }),
             },
           ],
+        }
+      }
+
+      if (name === 'send') {
+        if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
+        const to = (args as Record<string, unknown>)?.to as string
+        const message = (args as Record<string, unknown>)?.message as string
+        const targetId = resolveTarget(db, to)  // throws UnknownTargetError if not found
+        const sender = findSessionById(db, currentSwitchboardId)
+        const message_id = insertMessage(db, {
+          sender_id: currentSwitchboardId,
+          recipient_id: targetId,
+          broadcast_id: null,
+          content: message,
+        })
+        const delivered = registry.pushNotification(targetId, {
+          sender_alias: sender?.alias ?? null,
+          sender_id: currentSwitchboardId,
+          is_broadcast: false,
+        })
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ message_id, delivered_notification: delivered }),
+          }],
+        }
+      }
+
+      if (name === 'broadcast') {
+        if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
+        const message = (args as Record<string, unknown>)?.message as string
+        const sender = findSessionById(db, currentSwitchboardId)
+        const { broadcast_id, recipient_count } = insertBroadcast(db, {
+          sender_id: currentSwitchboardId,
+          content: message,
+        })
+        const onlineIds = registry.listOnline().filter(id => id !== currentSwitchboardId)
+        let notified_count = 0
+        for (const id of onlineIds) {
+          const ok = registry.pushNotification(id, {
+            sender_alias: sender?.alias ?? null,
+            sender_id: currentSwitchboardId,
+            is_broadcast: true,
+          })
+          if (ok) notified_count++
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ broadcast_id, recipient_count, notified_count }),
+          }],
+        }
+      }
+
+      if (name === 'read_messages') {
+        if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
+        const unread = fetchUnreadForRecipient(db, currentSwitchboardId)
+        markMessagesRead(db, unread.map(m => m.id))
+        const messages = unread.map(m => {
+          const senderRow = findSessionById(db, m.sender_id)
+          return {
+            id: m.id,
+            sender_id: m.sender_id,
+            sender_alias: senderRow?.alias ?? null,
+            content: m.content,
+            created_at: toTaipeiISOString(m.created_at),
+            is_broadcast: m.broadcast_id !== null,
+          }
+        })
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ messages }) }],
         }
       }
 

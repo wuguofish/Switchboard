@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from 'bun:test'
+import { test, expect, beforeEach, afterEach } from 'bun:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { startServer } from '../server'
@@ -8,11 +8,11 @@ let handle: ServerHandle
 const TEST_PORT = 19876
 const TEST_URL = `http://127.0.0.1:${TEST_PORT}/mcp`
 
-beforeAll(async () => {
+beforeEach(async () => {
   handle = await startServer({ port: TEST_PORT, dbPath: ':memory:' })
 })
 
-afterAll(async () => {
+afterEach(async () => {
   await handle.stop()
 })
 
@@ -61,4 +61,80 @@ test('set_alias renames session', async () => {
   expect(parsed.new_alias).toBe('beta')
   expect(parsed.old_alias).toBeNull()
   await client.close()
+})
+
+test('send 1-to-1: recipient gets message on read_messages', async () => {
+  const sender = await makeClient('send-sender')
+  const recipient = await makeClient('send-recipient')
+  await sender.callTool({ name: 'register', arguments: { role: 'sendA' } })
+  await recipient.callTool({ name: 'register', arguments: { role: 'sendB' } })
+
+  const sendResult = await sender.callTool({
+    name: 'send',
+    arguments: { to: 'sendB', message: 'hello B' },
+  })
+  const sendParsed = JSON.parse((sendResult.content as any[])[0].text)
+  expect(typeof sendParsed.message_id).toBe('string')
+  expect(sendParsed.delivered_notification).toBe(true)
+
+  const readResult = await recipient.callTool({ name: 'read_messages', arguments: {} })
+  const readParsed = JSON.parse((readResult.content as any[])[0].text)
+  expect(readParsed.messages).toHaveLength(1)
+  expect(readParsed.messages[0].content).toBe('hello B')
+  expect(readParsed.messages[0].sender_alias).toBe('sendA')
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('send to unknown target throws', async () => {
+  const client = await makeClient('unknown-send')
+  await client.callTool({ name: 'register', arguments: { role: 'unk' } })
+  await expect(
+    client.callTool({ name: 'send', arguments: { to: 'ghost', message: 'x' } })
+  ).rejects.toThrow()
+  await client.close()
+})
+
+test('broadcast fans out to all other sessions', async () => {
+  const sender = await makeClient('bcast-sender')
+  const r1 = await makeClient('bcast-r1')
+  const r2 = await makeClient('bcast-r2')
+  await sender.callTool({ name: 'register', arguments: { role: 'bsrc' } })
+  await r1.callTool({ name: 'register', arguments: { role: 'br1' } })
+  await r2.callTool({ name: 'register', arguments: { role: 'br2' } })
+
+  const bResult = await sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'everybody' },
+  })
+  const bParsed = JSON.parse((bResult.content as any[])[0].text)
+  expect(bParsed.recipient_count).toBe(2)
+
+  const r1Read = JSON.parse((
+    (await r1.callTool({ name: 'read_messages', arguments: {} })).content as any[]
+  )[0].text)
+  expect(r1Read.messages).toHaveLength(1)
+  expect(r1Read.messages[0].is_broadcast).toBe(true)
+
+  await sender.close()
+  await r1.close()
+  await r2.close()
+})
+
+test('read_messages marks as read (second call returns empty)', async () => {
+  const a = await makeClient('read-a')
+  const b = await makeClient('read-b')
+  await a.callTool({ name: 'register', arguments: { role: 'ra' } })
+  await b.callTool({ name: 'register', arguments: { role: 'rb' } })
+  await a.callTool({ name: 'send', arguments: { to: 'rb', message: 'once' } })
+
+  const first = JSON.parse(((await b.callTool({ name: 'read_messages', arguments: {} })).content as any[])[0].text)
+  expect(first.messages).toHaveLength(1)
+
+  const second = JSON.parse(((await b.callTool({ name: 'read_messages', arguments: {} })).content as any[])[0].text)
+  expect(second.messages).toHaveLength(0)
+
+  await a.close()
+  await b.close()
 })
