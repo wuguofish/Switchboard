@@ -201,3 +201,41 @@ test('recall by non-sender throws', async () => {
   await sender.close()
   await recipient.close()
 })
+
+test('register with same role twice returns same session_id (idempotent)', async () => {
+  const client1 = await makeClient('idempotent-test-1')
+  const first = JSON.parse(((await client1.callTool({
+    name: 'register',
+    arguments: { role: 'idempotent-role' },
+  })).content as any[])[0].text)
+  expect(first.alias).toBe('idempotent-role')
+  expect(first.anonymous).toBe(false)
+  expect(typeof first.session_id).toBe('string')
+  await client1.close()
+
+  // Second client uses same role — should get same session_id back
+  const client2 = await makeClient('idempotent-test-2')
+  const second = JSON.parse(((await client2.callTool({
+    name: 'register',
+    arguments: { role: 'idempotent-role' },
+  })).content as any[])[0].text)
+  expect(second.session_id).toBe(first.session_id)
+  expect(second.alias).toBe('idempotent-role')
+  expect(second.anonymous).toBe(false)
+  await client2.close()
+})
+
+test('register with null role still creates new anonymous session each time', async () => {
+  const c1 = await makeClient('anon-1')
+  const r1 = JSON.parse(((await c1.callTool({ name: 'register', arguments: {} })).content as any[])[0].text)
+  await c1.close()
+
+  const c2 = await makeClient('anon-2')
+  const r2 = JSON.parse(((await c2.callTool({ name: 'register', arguments: {} })).content as any[])[0].text)
+  await c2.close()
+
+  // Two anonymous calls should get two different session_ids (not idempotent for anon)
+  expect(r1.session_id).not.toBe(r2.session_id)
+  expect(r1.anonymous).toBe(true)
+  expect(r2.anonymous).toBe(true)
+})

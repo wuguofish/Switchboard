@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
@@ -163,12 +163,28 @@ export async function startServer(opts: {
           | string
           | undefined
 
-        // Create a new switchboard session in the DB
-        const newId = createSession(db, { alias: role ?? null })
-        currentSwitchboardId = newId
+        let sessionId: string
+
+        if (role) {
+          // For named roles, check if already registered
+          const existing = findSessionByAlias(db, role)
+          if (existing) {
+            // Reuse existing session
+            sessionId = existing.id
+            updateLastActivity(db, sessionId)
+          } else {
+            // Create new session with this role
+            sessionId = createSession(db, { alias: role })
+          }
+        } else {
+          // Anonymous: always create new session
+          sessionId = createSession(db, { alias: null })
+        }
+
+        currentSwitchboardId = sessionId
 
         // Register push callback in connection registry
-        registry.register(newId, (payload) => {
+        registry.register(sessionId, (payload) => {
           // Push notification to MCP client via server notification
           mcpServer
             .notification({
@@ -182,7 +198,7 @@ export async function startServer(opts: {
 
         const anonymous = role == null
         const responseBody: Record<string, unknown> = {
-          session_id: newId,
+          session_id: sessionId,
           alias: role ?? null,
           anonymous,
         }
