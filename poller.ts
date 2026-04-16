@@ -134,7 +134,7 @@ export function loadConfigFromHookStdin(
       dbPath: opts.dbPath,
       stateFilePath,
       pollIntervalMs: 2000,
-      ttlMs: 600_000,
+      ttlMs: 7_200_000,
       ownPid: process.pid,
       now: () => Date.now(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
