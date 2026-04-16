@@ -23,8 +23,10 @@ export function openDatabase(path: string): Database {
     const colNames = new Set(cols.map((c) => c.name))
     const needsMigration = !colNames.has('cc_session_id') || !colNames.has('released_at')
     if (needsMigration) {
-      db.exec(`DROP TABLE IF EXISTS messages`)
-      db.exec(`DROP TABLE IF EXISTS sessions`)
+      db.transaction(() => {
+        db.exec(`DROP TABLE IF EXISTS messages`)
+        db.exec(`DROP TABLE IF EXISTS sessions`)
+      })()
     }
   }
 
@@ -56,7 +58,7 @@ export function findSessionById(db: Database, id: string): SessionRow | null {
 
 export function findSessionByAlias(db: Database, alias: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
-    `SELECT id, alias, created_at, last_activity
+    `SELECT id, alias, cc_session_id, created_at, last_activity
      FROM sessions
      WHERE alias = ? AND released_at IS NULL`,
   ).get(alias)
@@ -68,7 +70,7 @@ export function findSessionByCcSessionId(
   cc_session_id: string,
 ): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
-    `SELECT id, alias, created_at, last_activity
+    `SELECT id, alias, cc_session_id, created_at, last_activity
      FROM sessions
      WHERE cc_session_id = ? AND released_at IS NULL`,
   ).get(cc_session_id)
@@ -87,7 +89,7 @@ export function updateLastActivity(db: Database, id: string): void {
 }
 
 export function setAlias(db: Database, id: string, newAlias: string): void {
-  db.query('UPDATE sessions SET alias = ? WHERE id = ?').run(newAlias, id)
+  db.query('UPDATE sessions SET alias = ?, released_at = NULL WHERE id = ?').run(newAlias, id)
 }
 
 export interface InsertMessageInput {
@@ -138,7 +140,7 @@ export interface BroadcastDbResult {
 export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastDbResult {
   const broadcast_id = randomUUID()
   const recipients = db.query<{ id: string }, [string]>(
-    'SELECT id FROM sessions WHERE id != ?'
+    'SELECT id FROM sessions WHERE id != ? AND released_at IS NULL'
   ).all(input.sender_id)
 
   const now = nowUtc()

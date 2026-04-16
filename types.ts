@@ -5,6 +5,7 @@ export type SessionId = string  // UUID
 export interface SessionRow {
   id: SessionId
   alias: string | null
+  cc_session_id?: string | null
   created_at: string   // ISO 8601 UTC
   last_activity: string // ISO 8601 UTC
 }
