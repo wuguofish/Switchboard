@@ -133,7 +133,7 @@ export function loadConfigFromHookStdin(
       sessionId: row.id,
       dbPath: opts.dbPath,
       stateFilePath,
-      pollIntervalMs: 2000,
+      pollIntervalMs: 30_000,
       ttlMs: 7_200_000,
       ownPid: process.pid,
       now: () => Date.now(),
