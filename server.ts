@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, updateLastActivity, releaseSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, updateLastActivity, releaseSession, reactivateSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
@@ -66,8 +66,8 @@ export async function startServer(opts: {
       if (mcpSessionId) {
         sessionMap.delete(mcpSessionId)
       }
-      // Unregister from connection registry if registered
       if (currentSwitchboardId) {
+        releaseSession(db, currentSwitchboardId)
         registry.unregister(currentSwitchboardId)
       }
     }
@@ -174,12 +174,26 @@ export async function startServer(opts: {
         let sessionId: string
 
         if (cc_session_id) {
-          // Phase 2.5 path: idempotent by cc_session_id
-          const existing = findSessionByCcSessionId(db, cc_session_id)
+          // Phase 2.5 path: idempotent by cc_session_id.
+          // Use findAnySessionByCcSessionId to also find released rows so a
+          // reconnecting session can reactivate its original row.
+          const existing = findAnySessionByCcSessionId(db, cc_session_id)
           if (existing) {
             sessionId = existing.id
-            if (role !== null && role !== existing.alias) {
-              // Treat as a rename — will throw AliasCollisionError if role taken by another active row
+            const isReleased = existing.released_at != null
+            if (isReleased) {
+              // Row was released on disconnect — reactivate it with the requested alias.
+              // Check for alias collision against other currently-active rows.
+              const targetAlias = role ?? existing.alias
+              if (targetAlias !== null) {
+                const conflict = findSessionByAlias(db, targetAlias)
+                if (conflict && conflict.id !== sessionId) {
+                  throw new Error(`alias already taken: ${targetAlias}`)
+                }
+              }
+              reactivateSession(db, sessionId, targetAlias)
+            } else if (role !== null && role !== existing.alias) {
+              // Active row — treat as a rename; throws AliasCollisionError if taken
               setAliasWithCollisionCheck(db, sessionId, role)
             }
             updateLastActivity(db, sessionId)

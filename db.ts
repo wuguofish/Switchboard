@@ -77,10 +77,34 @@ export function findSessionByCcSessionId(
   return row ?? null
 }
 
+/**
+ * Like findSessionByCcSessionId but also returns released rows.
+ * Used by register to reactivate a row after disconnect.
+ */
+export function findAnySessionByCcSessionId(
+  db: Database,
+  cc_session_id: string,
+): SessionRow | null {
+  const row = db.query<SessionRow, [string]>(
+    `SELECT id, alias, cc_session_id, created_at, last_activity, released_at
+     FROM sessions
+     WHERE cc_session_id = ?`,
+  ).get(cc_session_id)
+  return row ?? null
+}
+
 export function releaseSession(db: Database, id: string): void {
   db.query(
     `UPDATE sessions SET alias = NULL, released_at = ? WHERE id = ?`,
   ).run(nowUtc(), id)
+}
+
+export function reactivateSession(db: Database, id: string, alias: string | null): void {
+  // Clears released_at and restores alias so the row is "active" again.
+  // Called when a cc_session_id reconnects to a previously released session.
+  db.query(
+    `UPDATE sessions SET alias = ?, released_at = NULL WHERE id = ?`,
+  ).run(alias, id)
 }
 
 export function updateLastActivity(db: Database, id: string): void {

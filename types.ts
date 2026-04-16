@@ -6,8 +6,9 @@ export interface SessionRow {
   id: SessionId
   alias: string | null
   cc_session_id?: string | null
-  created_at: string   // ISO 8601 UTC
+  created_at: string    // ISO 8601 UTC
   last_activity: string // ISO 8601 UTC
+  released_at?: string | null // ISO 8601 UTC; NULL means active
 }
 
 export interface MessageRow {

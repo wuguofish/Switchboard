@@ -16,11 +16,17 @@ afterEach(async () => {
   await handle.stop()
 })
 
-async function makeClient(name: string): Promise<Client> {
+async function makeClient(name: string): Promise<Client & { close(): Promise<void> }> {
   const transport = new StreamableHTTPClientTransport(new URL(TEST_URL))
   const client = new Client({ name, version: '0.1.0' }, { capabilities: {} })
   await client.connect(transport)
-  return client
+  // Override close() to send DELETE so server's transport.onclose fires
+  const origClose = client.close.bind(client)
+  ;(client as any).close = async () => {
+    await transport.terminateSession?.().catch(() => {})
+    await origClose()
+  }
+  return client as Client & { close(): Promise<void> }
 }
 
 test('register returns session_id and anonymous flag', async () => {
@@ -275,4 +281,60 @@ test('register without cc_session_id still creates a new session each time (Phas
   })).content as any[])[0].text)
   expect(r1.session_id).not.toBe(r2.session_id)
   await c2.close()
+})
+
+test('alias is released on disconnect, new client can reclaim the name', async () => {
+  const c1 = await makeClient('reclaim-c1')
+  const first = JSON.parse(((await c1.callTool({
+    name: 'register',
+    arguments: { role: 'reclaimable', cc_session_id: 'cc-first' },
+  })).content as any[])[0].text)
+  expect(first.alias).toBe('reclaimable')
+
+  // Disconnect c1 — this should release the alias
+  await c1.close()
+
+  // Give server a tick to process the transport onclose
+  await new Promise((r) => setTimeout(r, 50))
+
+  // c2 should be able to take the same alias without collision
+  const c2 = await makeClient('reclaim-c2')
+  const second = JSON.parse(((await c2.callTool({
+    name: 'register',
+    arguments: { role: 'reclaimable', cc_session_id: 'cc-second' },
+  })).content as any[])[0].text)
+  expect(second.alias).toBe('reclaimable')
+  expect(second.session_id).not.toBe(first.session_id)
+  await c2.close()
+})
+
+test('released session row stays queryable by id (messages FK preserved)', async () => {
+  const sender = await makeClient('fk-sender')
+  const senderResp = JSON.parse(((await sender.callTool({
+    name: 'register',
+    arguments: { role: 'fk-sender-role', cc_session_id: 'cc-fk-s' },
+  })).content as any[])[0].text)
+  const senderId = senderResp.session_id
+
+  const recipient = await makeClient('fk-recipient')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'fk-recipient-role', cc_session_id: 'cc-fk-r' },
+  })
+
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'fk-recipient-role', message: 'test msg' },
+  })
+
+  // Disconnect sender — its row gets released but should still exist in DB
+  await sender.close()
+  await new Promise((r) => setTimeout(r, 50))
+
+  // Recipient reads messages — sender_alias in the returned message should still resolve
+  const readResult = await recipient.callTool({ name: 'read_messages', arguments: {} })
+  const readParsed = JSON.parse((readResult.content as any[])[0].text)
+  expect(readParsed.messages).toHaveLength(1)
+  expect(readParsed.messages[0].sender_id).toBe(senderId)
+  await recipient.close()
 })
