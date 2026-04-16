@@ -12,19 +12,38 @@ export function openDatabase(path: string): Database {
   const db = new Database(path)
   db.exec('PRAGMA foreign_keys = ON')
   db.exec('PRAGMA journal_mode = WAL')
+
+  // Migration guard: if sessions table exists but missing Phase 2.5 columns,
+  // drop sessions + messages (they will be rebuilt from schema.sql).
+  const tableExists = db
+    .query<{ name: string }, [string]>(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
+    .get('sessions')
+  if (tableExists) {
+    const cols = db.query<{ name: string }, []>(`PRAGMA table_info(sessions)`).all()
+    const colNames = new Set(cols.map((c) => c.name))
+    const needsMigration = !colNames.has('cc_session_id') || !colNames.has('released_at')
+    if (needsMigration) {
+      db.exec(`DROP TABLE IF EXISTS messages`)
+      db.exec(`DROP TABLE IF EXISTS sessions`)
+    }
+  }
+
   const schemaPath = join(__dirname, 'schema.sql')
   const schema = readFileSync(schemaPath, 'utf8')
   db.exec(schema)
   return db
 }
 
-export function createSession(db: Database, opts: { alias: string | null }): string {
+export function createSession(
+  db: Database,
+  opts: { alias: string | null; cc_session_id?: string | null },
+): string {
   const id = randomUUID()
   const now = nowUtc()
   db.query(`
-    INSERT INTO sessions (id, alias, created_at, last_activity)
-    VALUES (?, ?, ?, ?)
-  `).run(id, opts.alias, now, now)
+    INSERT INTO sessions (id, alias, cc_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, NULL)
+  `).run(id, opts.alias, opts.cc_session_id ?? null, now, now)
   return id
 }
 
@@ -37,9 +56,29 @@ export function findSessionById(db: Database, id: string): SessionRow | null {
 
 export function findSessionByAlias(db: Database, alias: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
-    'SELECT id, alias, created_at, last_activity FROM sessions WHERE alias = ?'
+    `SELECT id, alias, created_at, last_activity
+     FROM sessions
+     WHERE alias = ? AND released_at IS NULL`,
   ).get(alias)
   return row ?? null
+}
+
+export function findSessionByCcSessionId(
+  db: Database,
+  cc_session_id: string,
+): SessionRow | null {
+  const row = db.query<SessionRow, [string]>(
+    `SELECT id, alias, created_at, last_activity
+     FROM sessions
+     WHERE cc_session_id = ? AND released_at IS NULL`,
+  ).get(cc_session_id)
+  return row ?? null
+}
+
+export function releaseSession(db: Database, id: string): void {
+  db.query(
+    `UPDATE sessions SET alias = NULL, released_at = ? WHERE id = ?`,
+  ).run(nowUtc(), id)
 }
 
 export function updateLastActivity(db: Database, id: string): void {

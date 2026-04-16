@@ -1,7 +1,9 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test'
-import { unlinkSync, existsSync } from 'fs'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages } from '../db'
-import type { Database } from 'bun:sqlite'
+import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { Database } from 'bun:sqlite'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -203,4 +205,106 @@ test('deleteExpiredMessages keeps unread messages regardless of age', () => {
   deleteExpiredMessages(db)
   const remaining = db.query<{ id: string }, []>('SELECT id FROM messages').all()
   expect(remaining).toHaveLength(1)
+})
+
+test('openDatabase drops old Phase 1 sessions table if cc_session_id column missing', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'switchboard-migration-'))
+  const dbPath = join(tmp, 'phase1.db')
+
+  const rawDb = new Database(dbPath)
+  rawDb.exec(`
+    CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        alias TEXT UNIQUE,
+        created_at TEXT NOT NULL,
+        last_activity TEXT NOT NULL
+    );
+    CREATE TABLE messages (
+        id TEXT PRIMARY KEY,
+        sender_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        broadcast_id TEXT,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        read_at TEXT
+    );
+  `)
+  rawDb.exec(`INSERT INTO sessions (id, alias, created_at, last_activity) VALUES ('old-id', 'old-alias', '2026-04-16T00:00:00Z', '2026-04-16T00:00:00Z')`)
+  rawDb.close()
+
+  const db = openDatabase(dbPath)
+  const cols = db.query<{ name: string }, []>(`PRAGMA table_info(sessions)`).all()
+  const colNames = cols.map((c) => c.name)
+  expect(colNames).toContain('cc_session_id')
+  expect(colNames).toContain('released_at')
+  const rows = db.query('SELECT id FROM sessions').all()
+  expect(rows).toHaveLength(0)
+  db.close()
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+test('createSession accepts optional cc_session_id', () => {
+  const db = openDatabase(':memory:')
+  const id = createSession(db, { alias: 'my-role', cc_session_id: 'cc-abc-123' })
+  const row = db
+    .query<{ id: string; cc_session_id: string | null }, [string]>(
+      `SELECT id, cc_session_id FROM sessions WHERE id = ?`,
+    )
+    .get(id)
+  expect(row?.cc_session_id).toBe('cc-abc-123')
+  db.close()
+})
+
+test('findSessionByCcSessionId returns active row only', () => {
+  const db = openDatabase(':memory:')
+  const id1 = createSession(db, { alias: 'role-a', cc_session_id: 'cc-111' })
+  expect(findSessionByCcSessionId(db, 'cc-111')?.id).toBe(id1)
+  expect(findSessionByCcSessionId(db, 'cc-999')).toBeNull()
+
+  // After release, should not find
+  releaseSession(db, id1)
+  expect(findSessionByCcSessionId(db, 'cc-111')).toBeNull()
+  db.close()
+})
+
+test('releaseSession clears alias and sets released_at', () => {
+  const db = openDatabase(':memory:')
+  const id = createSession(db, { alias: 'release-test', cc_session_id: 'cc-r' })
+  releaseSession(db, id)
+  const row = db
+    .query<{ alias: string | null; released_at: string | null }, [string]>(
+      `SELECT alias, released_at FROM sessions WHERE id = ?`,
+    )
+    .get(id)
+  expect(row?.alias).toBeNull()
+  expect(row?.released_at).not.toBeNull()
+  db.close()
+})
+
+test('partial unique index lets new session reclaim alias after release', () => {
+  const db = openDatabase(':memory:')
+  const id1 = createSession(db, { alias: 'reclaim-me', cc_session_id: 'cc-old' })
+  releaseSession(db, id1)
+  const id2 = createSession(db, { alias: 'reclaim-me', cc_session_id: 'cc-new' })
+  expect(id2).not.toBe(id1)
+  const active = findSessionByAlias(db, 'reclaim-me')
+  expect(active?.id).toBe(id2)
+  db.close()
+})
+
+test('partial unique index blocks two active rows with same alias', () => {
+  const db = openDatabase(':memory:')
+  createSession(db, { alias: 'conflict', cc_session_id: 'cc-1' })
+  expect(() => {
+    createSession(db, { alias: 'conflict', cc_session_id: 'cc-2' })
+  }).toThrow()
+  db.close()
+})
+
+test('findSessionByAlias ignores released rows', () => {
+  const db = openDatabase(':memory:')
+  const id = createSession(db, { alias: 'hidden', cc_session_id: 'cc-h' })
+  releaseSession(db, id)
+  expect(findSessionByAlias(db, 'hidden')).toBeNull()
+  db.close()
 })
