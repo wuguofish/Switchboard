@@ -1,6 +1,12 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test'
 import { Database } from 'bun:sqlite'
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs'
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdtempSync,
+  rmSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { openDatabase, createSession, insertMessage } from '../db'
@@ -9,6 +15,7 @@ import {
   isStillLeader,
   countUnread,
   runPoller,
+  loadConfigFromHookStdin,
   type PollerConfig,
 } from '../poller'
 
@@ -25,13 +32,17 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  try { db.close() } catch {}
+  try {
+    db.close()
+  } catch {}
   rmSync(tmpDir, { recursive: true, force: true })
 })
 
 function makeConfig(overrides: Partial<PollerConfig> = {}): PollerConfig {
   return {
-    role: 'test-role',
+    ccSessionId: 'cc-test-session',
+    alias: 'test-role',
+    sessionId: 'sw-sess-id',
     dbPath,
     stateFilePath: stateFile,
     pollIntervalMs: 10,
@@ -43,15 +54,13 @@ function makeConfig(overrides: Partial<PollerConfig> = {}): PollerConfig {
   }
 }
 
-// ─── Leadership tests ───────────────────────────────────────────────────────
-
-test('claimLeadership writes state file with own pid', () => {
+test('claimLeadership writes state file with own pid + cc_session_id', () => {
   const config = makeConfig()
   claimLeadership(config)
   expect(existsSync(stateFile)).toBe(true)
   const parsed = JSON.parse(readFileSync(stateFile, 'utf8'))
   expect(parsed.pid).toBe(9999)
-  expect(parsed.role).toBe('test-role')
+  expect(parsed.cc_session_id).toBe('cc-test-session')
   expect(typeof parsed.started_at).toBe('string')
 })
 
@@ -70,28 +79,39 @@ test('isStillLeader returns false when state file holds different pid', () => {
 
 test('isStillLeader returns false when state file missing', () => {
   const config = makeConfig()
-  // no claimLeadership
   expect(isStillLeader(config)).toBe(false)
 })
 
-// ─── countUnread tests ───────────────────────────────────────────────────────
-
 test('countUnread returns 0 when no messages', () => {
-  createSession(db, { alias: 'test-role' })
+  createSession(db, { alias: 'test-role', cc_session_id: 'cc-test-session' })
   db.close()
-  // Re-open for direct query
   const readDb = new Database(dbPath, { readonly: true })
   expect(countUnread(readDb, 'test-role')).toBe(0)
   readDb.close()
 })
 
-test('countUnread returns unread count for matching alias, ignores other roles', () => {
-  const sender = createSession(db, { alias: 'sender' })
-  const recipient = createSession(db, { alias: 'test-role' })
-  const bystander = createSession(db, { alias: 'other-role' })
-  insertMessage(db, { sender_id: sender, recipient_id: recipient, broadcast_id: null, content: 'hi1' })
-  insertMessage(db, { sender_id: sender, recipient_id: recipient, broadcast_id: null, content: 'hi2' })
-  insertMessage(db, { sender_id: sender, recipient_id: bystander, broadcast_id: null, content: 'not mine' })
+test('countUnread returns unread count for matching alias', () => {
+  const sender = createSession(db, { alias: 'sender', cc_session_id: 'cc-s' })
+  const recipient = createSession(db, { alias: 'test-role', cc_session_id: 'cc-r' })
+  const bystander = createSession(db, { alias: 'other-role', cc_session_id: 'cc-b' })
+  insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'hi1',
+  })
+  insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'hi2',
+  })
+  insertMessage(db, {
+    sender_id: sender,
+    recipient_id: bystander,
+    broadcast_id: null,
+    content: 'not mine',
+  })
   db.close()
   const readDb = new Database(dbPath, { readonly: true })
   expect(countUnread(readDb, 'test-role')).toBe(2)
@@ -100,15 +120,18 @@ test('countUnread returns unread count for matching alias, ignores other roles',
   readDb.close()
 })
 
-// ─── runPoller tests ─────────────────────────────────────────────────────────
-
 test('runPoller exits 2 with SWITCHBOARD INBOX message when unread > 0', async () => {
-  const sender = createSession(db, { alias: 'sender' })
-  const recipient = createSession(db, { alias: 'test-role' })
-  insertMessage(db, { sender_id: sender, recipient_id: recipient, broadcast_id: null, content: 'wake up' })
+  const sender = createSession(db, { alias: 'sender', cc_session_id: 'cc-s' })
+  const recipient = createSession(db, { alias: 'test-role', cc_session_id: 'cc-test-session' })
+  insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'wake up',
+  })
   db.close()
 
-  const config = makeConfig()
+  const config = makeConfig({ sessionId: recipient })
   const result = await runPoller(config)
   expect(result.exitCode).toBe(2)
   expect(result.message).toContain('SWITCHBOARD INBOX')
@@ -116,34 +139,33 @@ test('runPoller exits 2 with SWITCHBOARD INBOX message when unread > 0', async (
   expect(result.message).toContain('test-role')
 })
 
-test('runPoller exits 0 when TTL reached with no unread messages', async () => {
-  createSession(db, { alias: 'test-role' })
+test('runPoller exits 0 when TTL reached with no unread', async () => {
+  createSession(db, { alias: 'test-role', cc_session_id: 'cc-test-session' })
   db.close()
-
-  // Fast clock: each call to now() advances 500ms, TTL 100ms → exit within 1 iteration
   let fakeTime = 0
   const config = makeConfig({
     ttlMs: 100,
     pollIntervalMs: 1,
-    now: () => { fakeTime += 500; return fakeTime },
+    now: () => {
+      fakeTime += 500
+      return fakeTime
+    },
   })
   const result = await runPoller(config)
   expect(result.exitCode).toBe(0)
   expect(result.message).toBeUndefined()
 })
 
-test('runPoller exits 0 when superseded by another poller mid-sleep', async () => {
-  createSession(db, { alias: 'test-role' })
+test('runPoller exits 0 when superseded mid-sleep', async () => {
+  createSession(db, { alias: 'test-role', cc_session_id: 'cc-test-session' })
   db.close()
-
   const config = makeConfig({
     ownPid: 1111,
     ttlMs: 30_000,
     sleep: async (ms) => {
-      // During the first sleep, another poller "takes over" by writing the state file
       const otherState = JSON.stringify({
         pid: 2222,
-        role: 'test-role',
+        cc_session_id: 'cc-test-session',
         started_at: new Date().toISOString(),
       })
       writeFileSync(stateFile, otherState, 'utf8')
@@ -152,5 +174,66 @@ test('runPoller exits 0 when superseded by another poller mid-sleep', async () =
   })
   const result = await runPoller(config)
   expect(result.exitCode).toBe(0)
-  expect(result.message).toBeUndefined()
+})
+
+test('loadConfigFromHookStdin resolves alias via cc_session_id lookup', () => {
+  const id = createSession(db, { alias: 'lookup-role', cc_session_id: 'cc-lookup' })
+  db.close()
+
+  const input = JSON.stringify({ session_id: 'cc-lookup' })
+  const config = loadConfigFromHookStdin(input, {
+    dbPath,
+    stateFileDir: tmpDir,
+  })
+  expect(config).not.toBeNull()
+  expect(config?.ccSessionId).toBe('cc-lookup')
+  expect(config?.alias).toBe('lookup-role')
+  expect(config?.sessionId).toBe(id)
+  expect(config?.stateFilePath).toContain('cc-lookup')
+})
+
+test('loadConfigFromHookStdin returns null when session has not registered yet', () => {
+  db.close()
+  const input = JSON.stringify({ session_id: 'cc-never-registered' })
+  const config = loadConfigFromHookStdin(input, {
+    dbPath,
+    stateFileDir: tmpDir,
+  })
+  expect(config).toBeNull()
+})
+
+test('loadConfigFromHookStdin returns null when session row has no alias', () => {
+  createSession(db, { alias: null, cc_session_id: 'cc-anon' })
+  db.close()
+  const input = JSON.stringify({ session_id: 'cc-anon' })
+  const config = loadConfigFromHookStdin(input, {
+    dbPath,
+    stateFileDir: tmpDir,
+  })
+  expect(config).toBeNull()
+})
+
+test('loadConfigFromHookStdin returns null when stdin has no session_id field', () => {
+  db.close()
+  const config = loadConfigFromHookStdin('{}', {
+    dbPath,
+    stateFileDir: tmpDir,
+  })
+  expect(config).toBeNull()
+})
+
+test('loadConfigFromHookStdin returns null for released session row', () => {
+  const id = createSession(db, { alias: 'will-release', cc_session_id: 'cc-rel' })
+  db.query(`UPDATE sessions SET alias = NULL, released_at = ? WHERE id = ?`).run(
+    '2026-04-16T00:00:00Z',
+    id,
+  )
+  db.close()
+
+  const input = JSON.stringify({ session_id: 'cc-rel' })
+  const config = loadConfigFromHookStdin(input, {
+    dbPath,
+    stateFileDir: tmpDir,
+  })
+  expect(config).toBeNull()
 })

@@ -1,9 +1,11 @@
 import { Database } from 'bun:sqlite'
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'fs'
-import { dirname } from 'path'
+import { dirname, join } from 'path'
 
 export interface PollerConfig {
-  role: string
+  ccSessionId: string
+  alias: string
+  sessionId: string
   dbPath: string
   stateFilePath: string
   pollIntervalMs: number
@@ -15,7 +17,7 @@ export interface PollerConfig {
 
 export interface PollerState {
   pid: number
-  role: string
+  cc_session_id: string
   started_at: string
 }
 
@@ -24,14 +26,10 @@ export interface PollerResult {
   message?: string
 }
 
-/**
- * Atomically write the state file to claim leadership.
- * Uses write-to-temp then rename for atomicity.
- */
 export function claimLeadership(config: PollerConfig): void {
   const state: PollerState = {
     pid: config.ownPid,
-    role: config.role,
+    cc_session_id: config.ccSessionId,
     started_at: new Date().toISOString(),
   }
   const content = JSON.stringify(state)
@@ -42,10 +40,6 @@ export function claimLeadership(config: PollerConfig): void {
   renameSync(tmp, config.stateFilePath)
 }
 
-/**
- * Check if this poller is still the leader by comparing pid in state file.
- * Returns false if file is missing or holds a different pid.
- */
 export function isStillLeader(config: PollerConfig): boolean {
   try {
     const content = readFileSync(config.stateFilePath, 'utf8')
@@ -56,28 +50,16 @@ export function isStillLeader(config: PollerConfig): boolean {
   }
 }
 
-/**
- * Count unread messages addressed to a given role alias.
- * Opens the DB in readonly mode so it can run concurrently with the daemon's WAL writes.
- */
-export function countUnread(db: Database, role: string): number {
+export function countUnread(db: Database, alias: string): number {
   const row = db.query<{ count: number }, [string]>(`
     SELECT COUNT(*) as count
     FROM messages m
     JOIN sessions s ON m.recipient_id = s.id
-    WHERE s.alias = ? AND m.read_at IS NULL
-  `).get(role)
+    WHERE s.alias = ? AND s.released_at IS NULL AND m.read_at IS NULL
+  `).get(alias)
   return row?.count ?? 0
 }
 
-/**
- * Main poll loop:
- * 1. Claim leadership (write state file with own PID)
- * 2. Open DB readonly
- * 3. Loop: check TTL, check leadership, check unread, sleep
- * 4. Exit 2 with SWITCHBOARD INBOX message if unread found
- * 5. Exit 0 if TTL exceeded or superseded
- */
 export async function runPoller(config: PollerConfig): Promise<PollerResult> {
   claimLeadership(config)
   const db = new Database(config.dbPath, { readonly: true })
@@ -85,21 +67,19 @@ export async function runPoller(config: PollerConfig): Promise<PollerResult> {
 
   try {
     while (true) {
-      // TTL safety net: prevent orphan polling forever
       if (config.now() - startTime >= config.ttlMs) {
         return { exitCode: 0 }
       }
 
-      // Cooperative watchdog: exit if another poller claimed leadership
       if (!isStillLeader(config)) {
         return { exitCode: 0 }
       }
 
-      const count = countUnread(db, config.role)
+      const count = countUnread(db, config.alias)
       if (count > 0) {
         return {
           exitCode: 2,
-          message: `SWITCHBOARD INBOX: ${count} unread message(s) for role "${config.role}" — call mcp__switchboard__read_messages to retrieve`,
+          message: `SWITCHBOARD INBOX: ${count} unread message(s) for role "${config.alias}" — call mcp__switchboard__read_messages to retrieve`,
         }
       }
 
@@ -110,34 +90,70 @@ export async function runPoller(config: PollerConfig): Promise<PollerResult> {
   }
 }
 
-/**
- * Load poller configuration from environment variables.
- * Exits 0 with stderr message if SWITCHBOARD_ROLE is not set.
- */
-export function loadConfigFromEnv(): PollerConfig {
-  const role = process.env.SWITCHBOARD_ROLE
-  if (!role) {
-    process.stderr.write('switchboard poller: SWITCHBOARD_ROLE not set, exiting\n')
-    process.exit(0)
+export interface LoadConfigOptions {
+  dbPath: string
+  stateFileDir: string
+}
+
+export function loadConfigFromHookStdin(
+  input: string,
+  opts: LoadConfigOptions,
+): PollerConfig | null {
+  let payload: { session_id?: string }
+  try {
+    payload = JSON.parse(input)
+  } catch {
+    return null
   }
-  return {
-    role,
-    dbPath: process.env.SWITCHBOARD_DB ?? 'C:/Users/ATone/.claude/switchboard.db',
-    stateFilePath: process.env.SWITCHBOARD_POLLER_STATE ?? 'D:/tsunu_plan/.claude/switchboard-poller.state',
-    pollIntervalMs: 2000,
-    ttlMs: 600_000,  // 10 minutes
-    ownPid: process.pid,
-    now: () => Date.now(),
-    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  const ccSessionId = payload.session_id
+  if (!ccSessionId) return null
+
+  const db = new Database(opts.dbPath, { readonly: true })
+  try {
+    const row = db.query<
+      { id: string; alias: string | null },
+      [string]
+    >(
+      `SELECT id, alias FROM sessions
+       WHERE cc_session_id = ?
+         AND released_at IS NULL
+         AND alias IS NOT NULL`,
+    ).get(ccSessionId)
+    if (!row || !row.alias) return null
+
+    const safeName = ccSessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const stateFilePath = join(
+      opts.stateFileDir,
+      `switchboard-poller-${safeName}.state`,
+    )
+
+    return {
+      ccSessionId,
+      alias: row.alias,
+      sessionId: row.id,
+      dbPath: opts.dbPath,
+      stateFilePath,
+      pollIntervalMs: 2000,
+      ttlMs: 600_000,
+      ownPid: process.pid,
+      now: () => Date.now(),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    }
+  } finally {
+    db.close()
   }
 }
 
-/**
- * Entry point when run directly as a script.
- * Loads config from env, runs poller, writes stdout if wakeup needed, exits with code.
- */
 export async function main() {
-  const config = loadConfigFromEnv()
+  const input = await Bun.stdin.text()
+  const config = loadConfigFromHookStdin(input, {
+    dbPath: process.env.SWITCHBOARD_DB ?? 'C:/Users/ATone/.claude/switchboard.db',
+    stateFileDir:
+      process.env.SWITCHBOARD_POLLER_STATE_DIR ?? 'D:/tsunu_plan/.claude',
+  })
+  if (!config) {
+    process.exit(0)
+  }
   const result = await runPoller(config)
   if (result.message) {
     console.log(result.message)
