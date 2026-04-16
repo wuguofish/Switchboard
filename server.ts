@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, updateLastActivity, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, updateLastActivity, releaseSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
@@ -84,13 +84,21 @@ export async function startServer(opts: {
           name: 'register',
           description:
             'Create a switchboard session for this MCP connection. ' +
-            'Optionally supply a role name as your alias.',
+            'Optionally supply a role name as your alias. ' +
+            'Supply cc_session_id (Claude Code session id, from SessionStart hook ' +
+            'additionalContext) to bind this switchboard session to a specific ' +
+            'Claude Code session — subsequent register calls with the same ' +
+            'cc_session_id update the existing row instead of creating a new one.',
           inputSchema: {
             type: 'object' as const,
             properties: {
               role: {
                 type: 'string',
                 description: 'Optional alias / role name for this session.',
+              },
+              cc_session_id: {
+                type: 'string',
+                description: 'Optional Claude Code session id (from hook additionalContext). When provided, register becomes idempotent: same cc_session_id returns / updates the same switchboard session row.',
               },
             },
             required: [],
@@ -159,47 +167,62 @@ export async function startServer(opts: {
       const { name, arguments: args } = req.params
 
       if (name === 'register') {
-        const role = (args as Record<string, unknown>)?.role as
-          | string
-          | undefined
+        const argsObj = (args as Record<string, unknown>) ?? {}
+        const role = (argsObj.role as string | undefined) ?? null
+        const cc_session_id = (argsObj.cc_session_id as string | undefined) ?? null
 
         let sessionId: string
 
-        if (role) {
-          // For named roles, check if already registered
-          const existing = findSessionByAlias(db, role)
+        if (cc_session_id) {
+          // Phase 2.5 path: idempotent by cc_session_id
+          const existing = findSessionByCcSessionId(db, cc_session_id)
           if (existing) {
-            // Reuse existing session
             sessionId = existing.id
+            if (role !== null && role !== existing.alias) {
+              // Treat as a rename — will throw AliasCollisionError if role taken by another active row
+              setAliasWithCollisionCheck(db, sessionId, role)
+            }
             updateLastActivity(db, sessionId)
           } else {
-            // Create new session with this role
-            sessionId = createSession(db, { alias: role })
+            // New session: validate role collision before insert
+            if (role !== null) {
+              const conflict = findSessionByAlias(db, role)
+              if (conflict) {
+                throw new Error(`alias already taken: ${role}`)
+              }
+            }
+            sessionId = createSession(db, { alias: role, cc_session_id })
           }
         } else {
-          // Anonymous: always create new session
-          sessionId = createSession(db, { alias: null })
+          // Phase 1 fallback path: no cc_session_id means every call is a fresh session
+          if (role !== null) {
+            const conflict = findSessionByAlias(db, role)
+            if (conflict) {
+              throw new Error(`alias already taken: ${role}`)
+            }
+          }
+          sessionId = createSession(db, { alias: role, cc_session_id: null })
         }
 
         currentSwitchboardId = sessionId
 
-        // Register push callback in connection registry
         registry.register(sessionId, (payload) => {
-          // Push notification to MCP client via server notification
           mcpServer
             .notification({
               method: 'notifications/switchboard/new_message',
               params: payload as Record<string, unknown>,
             })
-            .catch(() => {
-              // Ignore push errors (client may have disconnected)
-            })
+            .catch(() => {})
         })
 
-        const anonymous = role == null
+        const finalAlias =
+          cc_session_id && role === null
+            ? findSessionById(db, sessionId)?.alias ?? null
+            : role
+        const anonymous = finalAlias === null
         const responseBody: Record<string, unknown> = {
           session_id: sessionId,
-          alias: role ?? null,
+          alias: finalAlias,
           anonymous,
         }
         if (anonymous) {

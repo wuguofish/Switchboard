@@ -202,40 +202,77 @@ test('recall by non-sender throws', async () => {
   await recipient.close()
 })
 
-test('register with same role twice returns same session_id (idempotent)', async () => {
-  const client1 = await makeClient('idempotent-test-1')
-  const first = JSON.parse(((await client1.callTool({
+test('register(role, cc_session_id) returns same session on second call with same cc_session_id', async () => {
+  const c1 = await makeClient('cc-idem-1')
+  const first = JSON.parse(((await c1.callTool({
     name: 'register',
-    arguments: { role: 'idempotent-role' },
+    arguments: { role: 'cc-role', cc_session_id: 'cc-abc' },
   })).content as any[])[0].text)
-  expect(first.alias).toBe('idempotent-role')
+  expect(first.alias).toBe('cc-role')
   expect(first.anonymous).toBe(false)
-  expect(typeof first.session_id).toBe('string')
-  await client1.close()
-
-  // Second client uses same role — should get same session_id back
-  const client2 = await makeClient('idempotent-test-2')
-  const second = JSON.parse(((await client2.callTool({
-    name: 'register',
-    arguments: { role: 'idempotent-role' },
-  })).content as any[])[0].text)
-  expect(second.session_id).toBe(first.session_id)
-  expect(second.alias).toBe('idempotent-role')
-  expect(second.anonymous).toBe(false)
-  await client2.close()
-})
-
-test('register with null role still creates new anonymous session each time', async () => {
-  const c1 = await makeClient('anon-1')
-  const r1 = JSON.parse(((await c1.callTool({ name: 'register', arguments: {} })).content as any[])[0].text)
   await c1.close()
 
-  const c2 = await makeClient('anon-2')
-  const r2 = JSON.parse(((await c2.callTool({ name: 'register', arguments: {} })).content as any[])[0].text)
+  const c2 = await makeClient('cc-idem-2')
+  const second = JSON.parse(((await c2.callTool({
+    name: 'register',
+    arguments: { role: 'cc-role', cc_session_id: 'cc-abc' },
+  })).content as any[])[0].text)
+  expect(second.session_id).toBe(first.session_id)
+  expect(second.alias).toBe('cc-role')
   await c2.close()
+})
 
-  // Two anonymous calls should get two different session_ids (not idempotent for anon)
+test('register(role1, cc_a) then register(role2, cc_a) renames the row (same session_id)', async () => {
+  const c1 = await makeClient('rename-1')
+  const first = JSON.parse(((await c1.callTool({
+    name: 'register',
+    arguments: { role: 'old-name', cc_session_id: 'cc-rn' },
+  })).content as any[])[0].text)
+  await c1.close()
+
+  const c2 = await makeClient('rename-2')
+  const second = JSON.parse(((await c2.callTool({
+    name: 'register',
+    arguments: { role: 'new-name', cc_session_id: 'cc-rn' },
+  })).content as any[])[0].text)
+  expect(second.session_id).toBe(first.session_id)
+  expect(second.alias).toBe('new-name')
+  await c2.close()
+})
+
+test('register with role conflict on different cc_session_id throws collision', async () => {
+  const c1 = await makeClient('conflict-1')
+  await c1.callTool({
+    name: 'register',
+    arguments: { role: 'taken-role', cc_session_id: 'cc-owner' },
+  })
+  // Note: we keep c1 connected so the row stays active
+
+  const c2 = await makeClient('conflict-2')
+  await expect(
+    c2.callTool({
+      name: 'register',
+      arguments: { role: 'taken-role', cc_session_id: 'cc-other' },
+    }),
+  ).rejects.toThrow()
+
+  await c1.close()
+  await c2.close()
+})
+
+test('register without cc_session_id still creates a new session each time (Phase 1 fallback)', async () => {
+  const c1 = await makeClient('fallback-1')
+  const r1 = JSON.parse(((await c1.callTool({
+    name: 'register',
+    arguments: { role: 'fallback-role-unique-1' },
+  })).content as any[])[0].text)
+  await c1.close()
+
+  const c2 = await makeClient('fallback-2')
+  const r2 = JSON.parse(((await c2.callTool({
+    name: 'register',
+    arguments: { role: 'fallback-role-unique-2' },
+  })).content as any[])[0].text)
   expect(r1.session_id).not.toBe(r2.session_id)
-  expect(r1.anonymous).toBe(true)
-  expect(r2.anonymous).toBe(true)
+  await c2.close()
 })

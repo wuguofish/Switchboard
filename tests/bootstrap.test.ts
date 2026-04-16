@@ -49,13 +49,16 @@ test('runBootstrap registers role with switchboard and writes role.txt', async (
   expect(readFileSync(config.roleFilePath, 'utf8')).toBe('bootstrap-test-role')
 })
 
-test('runBootstrap is idempotent: second call with same role still exits 0', async () => {
+test('runBootstrap second call with same role exits 1 (Phase 2.5: no cc_session_id = collision)', async () => {
+  // Phase 2.5: register() without cc_session_id is NOT idempotent by role.
+  // Bootstrap without cc_session_id will collide on second call with same role.
+  // Real bootstrap (hook-session-start.ts) should supply cc_session_id to be idempotent.
   const config = makeConfig({ role: 'bootstrap-idempotent' })
   const first = await runBootstrap(config)
   expect(first.exitCode).toBe(0)
   const second = await runBootstrap(config)
-  expect(second.exitCode).toBe(0)
-  // Second call relies on register() being idempotent (Task 1)
+  expect(second.exitCode).toBe(1)
+  expect(second.message).toMatch(/alias already taken/i)
 })
 
 test('runBootstrap exits 1 when switchboard unreachable', async () => {
