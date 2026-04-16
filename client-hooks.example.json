@@ -1,12 +1,9 @@
 {
-  "env": {
-    "SWITCHBOARD_ROLE": "your-session-role-here"
-  },
   "hooks": {
     "SessionStart": [{
       "hooks": [{
         "type": "command",
-        "command": "bun D:/tsunu_plan/mcp-servers/switchboard/bootstrap.ts"
+        "command": "bun D:/tsunu_plan/mcp-servers/switchboard/hook-session-start.ts"
       }]
     }],
     "Stop": [{

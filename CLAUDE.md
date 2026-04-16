@@ -60,32 +60,42 @@ bun test tests/integration.test.ts
 
 **順便**：body 要先讀一次判斷是不是 `isInitializeRequest`，讀完後要把 `parsedBody` 當第二參數傳給 `handleRequest`，不然 transport 會 double-read body 報錯。看 `createMcpSession()` 那段就知道怎麼接。
 
-## Phase 2: Auto-wake（opt-in）
+## Phase 2.5: Auto-wake with per-session identity（opt-in）
 
-背景 poller + Stop hook auto-wake，讓 idle session 有新訊息時自動喚醒。設計 spec：`docs/superpowers/specs/2026-04-16-switchboard-phase2-auto-wake-design.md`。
+背景 poller + Stop hook auto-wake，讓 idle session 有新訊息時自動喚醒。身份綁定從 workspace 層級（Phase 2 的 `SWITCHBOARD_ROLE` env var）移到每個 Claude Code session 的 `session_id`，所以同一個 workspace 裡並行的多個 session 各自有獨立身份、獨立 poller。設計 spec：`docs/superpowers/specs/2026-04-16-switchboard-phase2-5-per-session-identity-design.md`。
 
-### 如何啟用
+### 啟用流程
 
-1. 把 `client-hooks.example.json` 的內容 **merge** 進 workspace 的 `.claude/settings.local.json`（不要整份 overwrite，現有 permissions array 要保留）
-2. 把 `SWITCHBOARD_ROLE` 改成這個 session 的唯一 role name
-3. `/hooks` reload 設定
-4. Session 啟動時 `bootstrap.ts` 自動 register role；每次 turn 結束 Stop hook spawn `poller.ts` 背景監控 inbox
-5. Poller 偵測到新訊息就 `exit 2` 喚醒 session → 自動 spawn 新 turn
+1. 把 `client-hooks.example.json` 的內容 **merge** 進 workspace 的 `.claude/settings.local.json`（保留現有 permissions array，只加 `hooks` 欄位）
+2. `/hooks` reload 設定
+3. Session 啟動時 `hook-session-start.ts` 從 hook stdin 讀到 cc_session_id，注入成 additionalContext，告訴 session 內的 Claude 它自己的 id
+4. Claude 看到 additionalContext 後，自己決定要不要 `register(role, cc_session_id)`，以什麼名字上線（不上線 = 這個 session 匿名存在，不能被其他 session 找到）
+5. 每次 turn 結束 Stop hook 把 stdin JSON pipe 給 `poller.ts`，poller 從 DB 反查 cc_session_id → alias，開始監控 inbox
+6. Poller 偵測到新訊息就 `exit 2` 喚醒 session → 自動 spawn 新 turn
 
-### 兩個 state file
+### Runtime state files
 
-- `D:\tsunu_plan\.claude\switchboard-role.txt` — bootstrap 寫入、Stop hook 讀取
-- `D:\tsunu_plan\.claude\switchboard-poller.state` — poller cooperative watchdog 的 pid state
+- `D:\tsunu_plan\.claude\switchboard-poller-<cc_session_id>.state` — 每個 session 一份，cooperative watchdog 用的 pid state
+
+Phase 2 的 `switchboard-role.txt` 已刪除（靜態 config signal 不再需要）。
+
+### 如何取消上線
+
+- Session disconnect 時 `transport.onclose` 會自動 `releaseSession` → alias 變 NULL，`released_at` 蓋時戳；新 session 可以立即 claim 同一個 role 名字
 
 ### Troubleshooting
 
-- **Bootstrap 靜默失敗** → 檢查 switchboard daemon 是否在 `127.0.0.1:9876` 跑；stderr 會寫原因
-- **Session 沒被自動喚醒** → 檢查 `switchboard-role.txt` 是否存在、`switchboard-poller.state` 的 pid 是否在更新
+- **Session 沒被自動喚醒** → 確認 Claude 在第一輪有呼叫 `register(role, cc_session_id)`；DB 裡 `SELECT * FROM sessions WHERE cc_session_id = 'xxx'` 應該看到 active row
+- **Role collision** → 另一個 active session 正在用同樣的 role。換名字或等對方 disconnect
 - **Orphan poller** → 10 分鐘 TTL 自清；立即清理用 Task Manager 找 `bun` process
-- **兩個 session 用同一個 role** → 未定義行為，不要這樣做
+- **重設** → 直接關掉 session 並刪 `switchboard.db`（Phase 2.5 migration guard 會處理 schema 重建）
 
 ### 限制（intentional）
 
-- Anonymous session 無法 auto-wake（必須有 role）
-- 一個 role 同時只能綁一個 session
-- 第一次 bootstrap 需要 switchboard daemon 已啟動
+- Anonymous session（沒 alias）無法 auto-wake（poller `loadConfigFromHookStdin` 會返回 null）
+- 一個 role 同時只能綁一個 active session；要換手必須先 disconnect
+- 第一次 register 需要 switchboard daemon 已啟動
+
+### Phase 1 fallback
+
+`register()` 不給 `cc_session_id` 仍會走 Phase 1 行為（每次 new row），保留給不跑 hook 的 ad-hoc client 用。

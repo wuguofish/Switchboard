@@ -45,51 +45,72 @@ Open **two** Claude Code sessions (two terminal windows) in `D:\tsunu_plan`.
 **Session B:**
 2. `read_messages` → should include the broadcast with `is_broadcast: true`
 
-## Phase 2 auto-wake scenario
+## Phase 2.5 auto-wake scenario
 
 ### Prereq
 
 1. Switchboard daemon running (`bun main.ts` or scheduled task)
-2. Two Claude Code sessions, each with different `SWITCHBOARD_ROLE` in their workspace `.claude/settings.local.json`:
-   - Session A: `SWITCHBOARD_ROLE=smoke-auto-a`
-   - Session B: `SWITCHBOARD_ROLE=smoke-auto-b`
-3. Both sessions have SessionStart + Stop hooks from `client-hooks.example.json` merged in
-4. Both sessions restarted (or `/hooks` reload'd) after env var set
+2. Two Claude Code sessions in the same workspace, both with `client-hooks.example.json` merged into `.claude/settings.local.json`
+3. Both sessions restarted (or `/hooks` reload'd) after config change
+4. `switchboard.db` is fresh (delete old Phase 1/2 file; migration guard will also handle this on startup)
 
-### Verify bootstrap
+### Verify hook-session-start
 
-On session startup, both sessions' bootstrap should have run:
+On each session startup, the SessionStart hook injects a system reminder containing the cc_session_id. The Claude in each session should see a line like:
 
-- Check `D:\tsunu_plan\.claude\switchboard-role.txt` exists and contains the role of the most recently started session (both bootstraps write to the same file — this is fine because the content is the same per-workspace; if you run multi-workspace, switch to per-workspace paths)
+```
+Your Claude Code session id is: abcdef12-...
+```
 
-### Round trip
+### Claude-side register
 
-1. **Session A** (the sender):
-   - Call `mcp__switchboard__list_sessions` → verify both `smoke-auto-a` and `smoke-auto-b` are `online: true`
-   - Call `mcp__switchboard__send` with `{to: "smoke-auto-b", message: "auto-wake test"}`
-   - Finish the turn (stop replying)
+In each session, the Claude calls:
 
-2. **Session B** (the recipient):
-   - **Do NOT send any user prompt**. Just watch.
+```
+mcp__switchboard__register(role='smoke-a', cc_session_id='<cc-id-from-reminder>')
+```
+
+(Different role per session — e.g. `smoke-a` and `smoke-b`.)
+
+### Round trip — two sessions in same workspace
+
+1. **Session A** (sender):
+   - Call `mcp__switchboard__list_sessions` → verify both `smoke-a` and `smoke-b` are `online: true`
+   - Call `mcp__switchboard__send` with `{to: "smoke-b", message: "auto-wake test"}`
+   - Finish the turn
+
+2. **Session B** (recipient):
+   - **Do NOT send any user prompt**
    - Within ~2-5 seconds, Session B should auto-spawn a new turn
-   - In that new turn, Claude should see a system reminder containing `SWITCHBOARD INBOX: 1 unread message(s) for role "smoke-auto-b"`
-   - Claude should automatically call `mcp__switchboard__read_messages` and retrieve the "auto-wake test" message
+   - New turn should see `SWITCHBOARD INBOX: 1 unread message(s) for role "smoke-b"`
+   - Claude should automatically call `mcp__switchboard__read_messages`
 
-3. **Success criteria**: Session B displayed a new turn + read the message **without any user interaction on B's side**.
+3. **Success**: Session B displayed a new turn + read the message without user input on B's side.
 
-### Recall during auto-wake window
+### Reclaim after disconnect
 
-1. Session A sends a message to Session B, finishes turn
-2. Session B's poller detects unread (poll interval ≤ 2s), exits 2
-3. **Before Session B processes the wake**, Session A calls `mcp__switchboard__recall` on that message_id
-4. Session B wakes up, calls `read_messages` → should get 0 messages (recalled in time)
+1. Session A is registered as `reclaim-test` with cc_session_id `cc-a1`
+2. Close Session A
+3. Start Session C in the same workspace (new cc_session_id)
+4. In Session C, call `register(role='reclaim-test', cc_session_id='<cc-id>')`
+5. **Expected**: register succeeds (alias was released on A's disconnect); `list_sessions` shows C as `reclaim-test`
 
-This verifies recall interacts correctly with the auto-wake path.
+### First-turn race
+
+1. Start Session D with hook config enabled
+2. Before Claude in D has a chance to call `register`, send a message from Session A to `nonexistent-role`
+3. **Expected**: A's `send` call throws `recipient not found` (role doesn't exist because D hasn't registered yet)
+
+### Multi-session isolation
+
+1. Start Session A, register as `multi-a`
+2. Start Session B, register as `multi-b`
+3. Check `D:\tsunu_plan\.claude\` — there should be TWO state files: `switchboard-poller-<cc-a>.state` and `switchboard-poller-<cc-b>.state`, each with a different pid
+4. Send from A to B → only B wakes
+5. Send from B to A → only A wakes
 
 ### Orphan cleanup
 
-1. Start a session with auto-wake enabled
-2. Close the Claude Code session (Ctrl+C / quit)
-3. Check Task Manager / `ps` for any `bun poller.ts` processes
-4. Within 10 minutes (TTL), any running poller should exit 0 cleanly
-5. `switchboard-poller.state` may be stale but next session's bootstrap will overwrite it
+1. Start a session, register, let poller run
+2. Force-close Claude Code without graceful shutdown (kill process)
+3. Within 10 minutes (TTL), any running `bun poller.ts` should exit 0 on its own
