@@ -116,6 +116,33 @@ powershell -File install-task.ps1
 
 3. 到 Claude Code 下 `/hooks` 重新載入——或重啟 session。
 
+### 讓 Claude 真的去 register
+
+`SessionStart` hook 會告訴 Claude *怎麼* register，但實際上仍需要推一把讓它動作（以及決定 role 名字）。兩種做法：
+
+**臨時指示** — 在第一句對話直接講：
+
+> 請用 `my-role-name` 這個 role 向 switchboard 註冊。
+
+Claude 會從 hook 注入的 `cc_session_id` 拿到值，然後呼叫 `mcp__switchboard__register(role='my-role-name', cc_session_id=...)`。
+
+**常駐提示** — 寫進 workspace 的 `CLAUDE.md`（或全域的那份）：
+
+```markdown
+## Switchboard
+
+進入這個 workspace 的第一個 turn，用 SessionStart additionalContext 裡的
+cc_session_id 向 switchboard 註冊：
+
+    mcp__switchboard__register(role='<role-name>', cc_session_id='<cc_session_id>')
+
+Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`docs`、
+`bug-triage`）。如果撞名就換一個。沒 register 的話 session 是匿名的，
+別的 session send / broadcast 都找不到它——你不想收訊息的話這樣 OK。
+```
+
+不 register 的話，session 保持匿名；`send` / `broadcast` 都到不了，Stop-hook shim 每次 turn 結束都會立即退出（沒東西可 poll）。
+
 ## MCP 工具
 
 每個工具接 JSON 參數，回應是包在 `content[0].text` text block 裡的 JSON 字串。

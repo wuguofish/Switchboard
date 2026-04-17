@@ -116,6 +116,34 @@ Registers the scheduled task `Switchboard MCP Daemon`, which runs `start-daemon.
 
 3. In Claude Code, `/hooks` to reload — or restart the session.
 
+### Getting Claude to register
+
+The `SessionStart` hook injects context telling Claude *how* to register, but Claude still needs a nudge to actually do it (and to decide on a role name). Two options:
+
+**Ad hoc** — just say it in your first message:
+
+> Please register with switchboard as `my-role-name`.
+
+Claude will see the injected `cc_session_id` from the hook and call `mcp__switchboard__register(role='my-role-name', cc_session_id=...)`.
+
+**Persistent** — add to your workspace's `CLAUDE.md` (or the user-global one):
+
+```markdown
+## Switchboard
+
+On your first turn in this workspace, register with switchboard using the
+cc_session_id from the SessionStart additionalContext:
+
+    mcp__switchboard__register(role='<role-name>', cc_session_id='<cc_session_id>')
+
+Pick a role name that describes what this session is doing (e.g. `tools`,
+`docs`, `bug-triage`). If the role is taken, try a variant. Skipping
+registration leaves the session anonymous and unreachable from other
+sessions — fine if you don't want messages.
+```
+
+Without `register`, the session stays anonymous; `send` and `broadcast` cannot reach it, and the Stop-hook shim exits immediately on every turn (nothing to poll for).
+
 ## MCP tools
 
 Each tool takes JSON arguments; responses are JSON inside a `content[0].text` text block.
