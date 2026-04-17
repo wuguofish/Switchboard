@@ -75,7 +75,6 @@ powershell -File start-daemon.ps1
 |------|--------|------|
 | `SWITCHBOARD_PORT` | `9876` | Daemon HTTP port |
 | `SWITCHBOARD_DB` | `C:/Users/ATone/.claude/switchboard.db` | SQLite 檔案路徑 |
-| `SWITCHBOARD_POLLER_STATE_DIR` | `D:/tsunu_plan/.claude` | 每 session 的 state file 位置 |
 
 ### 登入自動啟動（Windows Scheduled Task）
 
@@ -157,7 +156,7 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
 
-`to` 可以是 alias 或 session UUID。`delivered_notification` 只在收件人有可用的 auto-wake 路徑時才回 true（active 的 `/poll` long-poll，或舊版 state file 且 pid 仍在）——這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
+`to` 可以是 alias 或 session UUID。`delivered_notification` 只在收件人當下有 active 的 `/poll` long-poll 時才回 true——in-memory 的 polling set 是唯一可靠的訊號。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
 
 ## HTTP endpoints
 
@@ -183,7 +182,7 @@ Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 l
 
 - 已讀訊息 7 天後自動刪除。
 - 看起來孤兒的 session（沒 MCP 連線 *且* 5+ 分鐘沒活動）會在下一次保留 tick（每分鐘一次）被 release，alias 讓出。
-- Stop-hook shim 偵測到 Claude Code parent 死了就自我了斷，不會留下 orphan poller。舊版 `bun poller.ts` fallback 透過 `process.kill(ppid, 0)` 做同樣的事。
+- Stop-hook shim 偵測到 Claude Code parent 死了就自我了斷，不會留下 orphan poller。暫時性 daemon 錯誤（重啟、TCP 閃斷、5xx）會 backoff retry 而不退出，短暫 outage 不會讓 session 到下次 turn 才能接收訊息。舊版 `bun poller.ts` fallback 同樣用 `process.kill(ppid, 0)` 做 parent-pid check。
 
 ## 安全
 

@@ -23,7 +23,6 @@ import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
-import { isPollerAlive } from './poller'
 import { UnreadWaiterRegistry } from './waiters'
 
 export interface ServerHandle {
@@ -35,28 +34,27 @@ interface SessionEntry {
   mcpServer: Server
 }
 
-const DEFAULT_POLLER_STATE_DIR = 'D:/tsunu_plan/.claude'
-
 export async function startServer(opts: {
   port: number
   dbPath: string
-  pollerStateDir?: string
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
-  const pollerStateDir = opts.pollerStateDir ?? DEFAULT_POLLER_STATE_DIR
   const waiters = new UnreadWaiterRegistry()
 
-  // Unified "recipient can be auto-woken" check. True if either:
-  // (a) the recipient has a bun poller.ts writing a state file with a live pid, or
-  // (b) a curl shim is currently long-polling on /poll for this cc_session_id.
-  // Either path results in a Stop-hook rewake when a message arrives, so
-  // delivered_notification can honestly claim delivery.
+  // "recipient can be auto-woken" — true iff a curl shim is currently
+  // long-polling /poll for this cc_session_id. A shim in /poll guarantees
+  // the daemon will push the message the moment insertMessage completes.
+  //
+  // Previously this also fell back to poller.ts's state-file check
+  // (legacy bun-based poller). That was removed because: (1) the shim
+  // doesn't write state files, so on a stale file the pid may have been
+  // reused by an unrelated process, yielding false positives; (2) the
+  // in-memory polling set is the truthful signal.
   const canAutoWake = (ccSessionId: string | null | undefined): boolean => {
     if (!ccSessionId) return false
-    if (waiters.isPolling(ccSessionId)) return true
-    return isPollerAlive(ccSessionId, { stateFileDir: pollerStateDir })
+    return waiters.isPolling(ccSessionId)
   }
 
   // Map: MCP session ID (from Mcp-Session-Id header) → session entry

@@ -44,9 +44,18 @@ function Test-ParentAlive {
 }
 
 # 3. Long-poll loop. Each /poll call is capped at ~240s server-side; we
-#    re-enter unless the parent is gone or we hit an auth/setup error.
+#    re-enter unless the parent is gone or we hit an unrecoverable setup error.
+#
+# Transient errors (daemon restarting, TCP blip, 5xx) must NOT drop us out
+# of the loop — if we exit 0 here, the session stays unreachable until the
+# next turn ends. The original shim did that and caused pixai-class overnight
+# wake-up failures. We retry with backoff instead; only unrecoverable
+# conditions (parent gone, session released) actually exit.
 $segmentTimeoutS = 240
 $curlMaxTimeS = $segmentTimeoutS + 10
+$retrySleepS = 3
+$maxBackoffS = 30
+$curFail = 0
 
 while ($true) {
     if (-not (Test-ParentAlive)) { exit 0 }
@@ -56,19 +65,25 @@ while ($true) {
     $raw = & curl.exe -s -S -f --max-time $curlMaxTimeS $pollUrl 2>$null
     $curlExit = $LASTEXITCODE
 
-    if ($curlExit -ne 0) {
-        # Daemon unreachable / 404 / parse error — nothing we can do; let
-        # Claude Code exit normally (no rewake). The next turn's Stop hook
-        # will retry.
-        exit 0
+    if ($curlExit -ne 0 -or -not $raw) {
+        # Transient failure: daemon restarting, connection refused, 5xx,
+        # bad response. Back off and retry as long as parent is alive.
+        $curFail++
+        $sleep = [Math]::Min($retrySleepS * $curFail, $maxBackoffS)
+        Start-Sleep -Seconds $sleep
+        continue
     }
-    if (-not $raw) { exit 0 }
 
     try {
         $resp = $raw | ConvertFrom-Json -ErrorAction Stop
     } catch {
-        exit 0
+        $curFail++
+        $sleep = [Math]::Min($retrySleepS * $curFail, $maxBackoffS)
+        Start-Sleep -Seconds $sleep
+        continue
     }
+
+    $curFail = 0
 
     switch ($resp.status) {
         'unread' {
@@ -76,7 +91,8 @@ while ($true) {
             exit 2
         }
         'no-session' {
-            # Session never registered (or got released). No sense polling.
+            # Session never registered or was explicitly released.
+            # Unlike transient errors this is terminal — nothing to poll for.
             exit 0
         }
         'timeout' {
@@ -84,7 +100,11 @@ while ($true) {
             continue
         }
         default {
-            exit 0
+            # Unknown status; treat as transient and retry.
+            $curFail++
+            $sleep = [Math]::Min($retrySleepS * $curFail, $maxBackoffS)
+            Start-Sleep -Seconds $sleep
+            continue
         }
     }
 }

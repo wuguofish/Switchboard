@@ -392,6 +392,44 @@ test('send to a recipient currently long-polling reports delivered_notification:
   await recipient.close()
 })
 
+test('delivered_notification is false when only a legacy state file exists (no live /poll)', async () => {
+  // Regression: canAutoWake used to also trust poller.ts's state file, so a
+  // stale file whose pid had been reused as an unrelated process would make
+  // delivered_notification falsely report true. The shim does not write
+  // state files, so we now only trust waiters.isPolling. This test guards
+  // against re-introducing the fallback.
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-statefile-'))
+  try {
+    // Stash a state file pointing at our own (live) pid — the old code path
+    // would accept this as "alive".
+    const ccSessionId = 'cc-legacy-statefile-only'
+    const stateFile = path.join(tmpDir, `switchboard-poller-${ccSessionId}.state`)
+    fs.writeFileSync(stateFile, JSON.stringify({ pid: process.pid, cc_session_id: ccSessionId, started_at: new Date().toISOString() }))
+
+    const recipient = await makeClient('legacy-statefile-recip')
+    await recipient.callTool({
+      name: 'register',
+      arguments: { role: 'legacy-rcp', cc_session_id: ccSessionId },
+    })
+
+    const sender = await makeClient('legacy-statefile-sender')
+    await sender.callTool({ name: 'register', arguments: { role: 'legacy-snd' } })
+    const sendResult = JSON.parse(((await sender.callTool({
+      name: 'send',
+      arguments: { to: 'legacy-rcp', message: 'legacy mode' },
+    })).content as any[])[0].text)
+    expect(sendResult.delivered_notification).toBe(false)
+
+    await sender.close()
+    await recipient.close()
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
 test('alias is released on disconnect, new client can reclaim the name', async () => {
   const c1 = await makeClient('reclaim-c1')
   const first = JSON.parse(((await c1.callTool({

@@ -75,7 +75,6 @@ Environment variables (all optional):
 |----------|---------|---------|
 | `SWITCHBOARD_PORT` | `9876` | Daemon HTTP port |
 | `SWITCHBOARD_DB` | `C:/Users/ATone/.claude/switchboard.db` | SQLite file path |
-| `SWITCHBOARD_POLLER_STATE_DIR` | `D:/tsunu_plan/.claude` | Where per-session state files live |
 
 ### Auto-start on login (Windows scheduled task)
 
@@ -158,7 +157,7 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
 
-`to` accepts either an alias or a session UUID. `delivered_notification` is true only when the recipient has a live auto-wake path — either an active `/poll` long-poll or a legacy poller state file with a running pid. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+`to` accepts either an alias or a session UUID. `delivered_notification` is true only when the recipient has a live `/poll` long-poll in progress — the in-memory polling set is the truthful signal. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
 
 ## HTTP endpoints
 
@@ -184,7 +183,7 @@ Without `cc_session_id`, registration still succeeds (Phase 1 fallback) but ever
 
 - Messages marked read are deleted after 7 days.
 - Sessions that look orphaned — no active MCP connection *and* no activity for 5+ minutes — are released on the next retention tick (every minute), freeing their aliases.
-- The Stop-hook shim self-terminates when its Claude Code parent dies, so no orphan poller outlives its session. The legacy `bun poller.ts` fallback does the same via `process.kill(ppid, 0)`.
+- The Stop-hook shim self-terminates when its Claude Code parent dies, so no orphan poller outlives its session. Transient daemon errors (restart, TCP blip, 5xx) back off and retry rather than exiting, so a brief outage does not leave the session unreachable until the next Claude Code turn. The legacy `bun poller.ts` fallback does the same parent-pid check via `process.kill(ppid, 0)`.
 
 ## Security
 

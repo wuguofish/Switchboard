@@ -75,7 +75,7 @@ bun test tests/integration.test.ts
 
 ### Runtime state files
 
-- `D:\tsunu_plan\.claude\switchboard-poller-<cc_session_id>.state` — 舊版 `bun poller.ts` 用的 pid state（留作向後相容）；新版 `poller-shim.ps1` 不寫 state file，改由 daemon 的 in-memory `pollingSessions` 提供 liveness 訊號
+- `D:\tsunu_plan\.claude\switchboard-poller-<cc_session_id>.state` — 舊版 `bun poller.ts` 會寫，留作 fallback 自己的 parent-pid check 用。新版 `poller-shim.ps1` 不寫 state file。`canAutoWake`（決定 `delivered_notification`/`notified_count`）**只看** daemon 的 in-memory `waiters.isPolling`，不再讀 state file——state file 的 pid 可能被作業系統 reuse 造成假陽性
 
 ### 舊版 `bun poller.ts`（仍可用作 fallback）
 
@@ -92,6 +92,7 @@ Phase 2 的 `switchboard-role.txt` 已刪除（靜態 config signal 不再需要
 - **Session 沒被自動喚醒** → 確認 Claude 在第一輪有呼叫 `register(role, cc_session_id)`；DB 裡 `SELECT * FROM sessions WHERE cc_session_id = 'xxx'` 應該看到 active row
 - **Role collision** → 另一個 active session 正在用同樣的 role。換名字或等對方 disconnect
 - **Orphan poller** → shim 用 parent-pid alive check 自清（Claude Code 死了下 tick 就退出）；舊版 `bun poller.ts` 同樣有 parent-pid check，失靈時 fallback 24 小時 TTL
+- **暫時性 daemon 錯誤** → shim 遇到 curl 失敗（connection refused / 5xx / 解析錯）會 linear backoff retry（3s → 30s 上限），不會直接 `exit 0`。只有 `no-session`（session 已釋放）或 parent 死才 terminal exit。這樣 daemon 重啟 / 網路閃斷不會讓 session 到下次 turn 才收訊
 - **重設** → 直接關掉 session 並刪 `switchboard.db`（Phase 2.5 migration guard 會處理 schema 重建）
 
 ### 限制（intentional）
