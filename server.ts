@@ -38,11 +38,18 @@ export async function startServer(opts: {
   dbPath: string
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
-  const retention = startRetentionLoop(db)
   const registry = new ConnectionRegistry()
+  const retention = startRetentionLoop(db, registry)
 
   // Map: MCP session ID (from Mcp-Session-Id header) → session entry
   const sessionMap = new Map<string, SessionEntry>()
+
+  // Map: MCP session ID → switchboard session ID. Populated in register(),
+  // cleared in transport.onclose. Lets the HTTP fetch handler refresh
+  // last_activity on any incoming request (including SSE reconnects),
+  // which keeps genuinely-connected-but-idle sessions out of the
+  // retention loop's stale-cleanup sweep.
+  const mcpSessionToSwitchboard = new Map<string, string>()
 
   /**
    * Creates a new Server + Transport pair for a fresh MCP session.
@@ -65,6 +72,7 @@ export async function startServer(opts: {
       const mcpSessionId = transport.sessionId
       if (mcpSessionId) {
         sessionMap.delete(mcpSessionId)
+        mcpSessionToSwitchboard.delete(mcpSessionId)
       }
       if (currentSwitchboardId) {
         releaseSession(db, currentSwitchboardId)
@@ -219,6 +227,9 @@ export async function startServer(opts: {
         }
 
         currentSwitchboardId = sessionId
+        if (transport.sessionId) {
+          mcpSessionToSwitchboard.set(transport.sessionId, sessionId)
+        }
 
         registry.register(sessionId, (payload) => {
           mcpServer
@@ -226,7 +237,14 @@ export async function startServer(opts: {
               method: 'notifications/switchboard/new_message',
               params: payload as Record<string, unknown>,
             })
-            .catch(() => {})
+            .catch(() => {
+              // Notification rejected — transport is likely dead but onclose
+              // may not have fired (TCP reset / SSE break without DELETE).
+              // Drop the leaked registry entry so list_sessions stops
+              // reporting this session as online; retention will release
+              // the DB row on its next tick.
+              registry.unregister(sessionId)
+            })
         })
 
         const finalAlias =
@@ -406,6 +424,17 @@ export async function startServer(opts: {
       }
 
       const mcpSessionId = req.headers.get('mcp-session-id')
+
+      // Liveness signal: any request on an already-registered MCP session
+      // (POST for tool calls, GET for SSE reconnects, DELETE for shutdown)
+      // counts as activity. Refresh last_activity so retention's stale-cleanup
+      // sweep treats truly-connected-but-idle sessions as alive.
+      if (mcpSessionId) {
+        const switchboardId = mcpSessionToSwitchboard.get(mcpSessionId)
+        if (switchboardId) {
+          updateLastActivity(db, switchboardId)
+        }
+      }
 
       if (req.method === 'POST') {
         // Need to inspect body to decide if this is an initialize request

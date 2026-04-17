@@ -222,3 +222,40 @@ export function deleteExpiredMessages(db: Database): number {
   `).run()
   return Number(info.changes)
 }
+
+/**
+ * Release sessions that look orphaned: alive in DB (released_at IS NULL) but
+ * either (a) not currently connected to any transport, and (b) no activity
+ * within staleThresholdMs. Both conditions must hold — the connection check
+ * protects legitimately-idle live sessions, the time check protects against
+ * registry leaks that might falsely list a dead transport as connected.
+ *
+ * @param connectedIds session IDs currently present in ConnectionRegistry
+ * @returns IDs of sessions that were released by this call
+ */
+export function releaseStaleActiveSessions(
+  db: Database,
+  connectedIds: string[],
+  staleThresholdMs: number,
+): string[] {
+  const cutoff = new Date(Date.now() - staleThresholdMs).toISOString()
+  const candidates = db
+    .query<{ id: string }, [string]>(
+      `SELECT id FROM sessions
+       WHERE released_at IS NULL
+         AND last_activity < ?`,
+    )
+    .all(cutoff)
+  const connected = new Set(connectedIds)
+  const staleIds = candidates.map((r) => r.id).filter((id) => !connected.has(id))
+  if (staleIds.length === 0) return []
+
+  const now = nowUtc()
+  const placeholders = staleIds.map(() => '?').join(',')
+  db.query(
+    `UPDATE sessions
+     SET alias = NULL, released_at = ?
+     WHERE id IN (${placeholders}) AND released_at IS NULL`,
+  ).run(now, ...staleIds)
+  return staleIds
+}

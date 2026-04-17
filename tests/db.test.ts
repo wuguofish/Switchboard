@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages } from '../db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -307,4 +307,81 @@ test('findSessionByAlias ignores released rows', () => {
   releaseSession(db, id)
   expect(findSessionByAlias(db, 'hidden')).toBeNull()
   db.close()
+})
+
+// --- releaseStaleActiveSessions ---
+
+function backdateLastActivity(db: Database, id: string, msAgo: number): void {
+  const iso = new Date(Date.now() - msAgo).toISOString()
+  db.query('UPDATE sessions SET last_activity = ? WHERE id = ?').run(iso, id)
+}
+
+test('releaseStaleActiveSessions releases stale unconnected sessions', () => {
+  const stale = createSession(db, { alias: 'stale-role' })
+  backdateLastActivity(db, stale, 10 * 60_000) // 10 min ago
+
+  const released = releaseStaleActiveSessions(db, [], 5 * 60_000)
+  expect(released).toEqual([stale])
+
+  const row = db
+    .query<{ alias: string | null; released_at: string | null }, [string]>(
+      'SELECT alias, released_at FROM sessions WHERE id = ?',
+    )
+    .get(stale)
+  expect(row?.alias).toBeNull()
+  expect(row?.released_at).not.toBeNull()
+})
+
+test('releaseStaleActiveSessions keeps connected sessions even when last_activity is old', () => {
+  const connected = createSession(db, { alias: 'idle-but-alive' })
+  backdateLastActivity(db, connected, 30 * 60_000) // 30 min ago
+
+  const released = releaseStaleActiveSessions(db, [connected], 5 * 60_000)
+  expect(released).toEqual([])
+
+  expect(findSessionByAlias(db, 'idle-but-alive')?.id).toBe(connected)
+})
+
+test('releaseStaleActiveSessions keeps sessions with recent activity even when disconnected', () => {
+  const recent = createSession(db, { alias: 'just-registered' })
+  // last_activity was set to now by createSession; no backdating
+
+  const released = releaseStaleActiveSessions(db, [], 5 * 60_000)
+  expect(released).toEqual([])
+  expect(findSessionByAlias(db, 'just-registered')?.id).toBe(recent)
+})
+
+test('releaseStaleActiveSessions skips already-released sessions', () => {
+  const id = createSession(db, { alias: 'already-gone' })
+  releaseSession(db, id)
+  backdateLastActivity(db, id, 60 * 60_000) // 1 hour ago
+
+  const released = releaseStaleActiveSessions(db, [], 5 * 60_000)
+  expect(released).toEqual([])
+})
+
+test('releaseStaleActiveSessions releases multiple stale sessions in one call', () => {
+  const a = createSession(db, { alias: 'stale-a' })
+  const b = createSession(db, { alias: 'stale-b' })
+  const c = createSession(db, { alias: 'alive-c' })
+  backdateLastActivity(db, a, 10 * 60_000)
+  backdateLastActivity(db, b, 20 * 60_000)
+  backdateLastActivity(db, c, 30 * 60_000)
+
+  const released = releaseStaleActiveSessions(db, [c], 5 * 60_000)
+  expect(released.sort()).toEqual([a, b].sort())
+  expect(findSessionByAlias(db, 'alive-c')?.id).toBe(c)
+  expect(findSessionByAlias(db, 'stale-a')).toBeNull()
+  expect(findSessionByAlias(db, 'stale-b')).toBeNull()
+})
+
+test('releaseStaleActiveSessions frees alias for re-use', () => {
+  const first = createSession(db, { alias: 'shared-name' })
+  backdateLastActivity(db, first, 10 * 60_000)
+  releaseStaleActiveSessions(db, [], 5 * 60_000)
+
+  // New session should be able to claim the alias
+  const second = createSession(db, { alias: 'shared-name' })
+  expect(second).not.toBe(first)
+  expect(findSessionByAlias(db, 'shared-name')?.id).toBe(second)
 })

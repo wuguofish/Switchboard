@@ -3,3 +3,5 @@ node_modules/
 *.db-journal
 .db-test/
 bun.lockb
+daemon.out.log
+daemon.err.log
