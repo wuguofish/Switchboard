@@ -23,6 +23,7 @@ import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
+import { isPollerAlive } from './poller'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -33,13 +34,17 @@ interface SessionEntry {
   mcpServer: Server
 }
 
+const DEFAULT_POLLER_STATE_DIR = 'D:/tsunu_plan/.claude'
+
 export async function startServer(opts: {
   port: number
   dbPath: string
+  pollerStateDir?: string
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
+  const pollerStateDir = opts.pollerStateDir ?? DEFAULT_POLLER_STATE_DIR
 
   // Map: MCP session ID (from Mcp-Session-Id header) → session entry
   const sessionMap = new Map<string, SessionEntry>()
@@ -305,15 +310,27 @@ export async function startServer(opts: {
           broadcast_id: null,
           content: message,
         })
-        const delivered = registry.pushNotification(targetId, {
+        const pushed = registry.pushNotification(targetId, {
           sender_alias: sender?.alias ?? null,
           sender_id: currentSwitchboardId,
           is_broadcast: false,
         })
+        // delivered_notification promises "the recipient will notice this
+        // without user intervention" — that requires both a live transport
+        // (pushed) and a live poller process to convert the SSE notification
+        // into a Stop-hook rewake. Anonymous / Phase 1 recipients have no
+        // poller and always get false, which is the honest answer.
+        const recipient = findSessionById(db, targetId)
+        const pollerLive = isPollerAlive(recipient?.cc_session_id, {
+          stateFileDir: pollerStateDir,
+        })
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({ message_id, delivered_notification: delivered }),
+            text: JSON.stringify({
+              message_id,
+              delivered_notification: pushed && pollerLive,
+            }),
           }],
         }
       }
@@ -329,12 +346,16 @@ export async function startServer(opts: {
         const onlineIds = registry.listOnline().filter(id => id !== currentSwitchboardId)
         let notified_count = 0
         for (const id of onlineIds) {
-          const ok = registry.pushNotification(id, {
+          const pushed = registry.pushNotification(id, {
             sender_alias: sender?.alias ?? null,
             sender_id: currentSwitchboardId,
             is_broadcast: true,
           })
-          if (ok) notified_count++
+          const recipient = findSessionById(db, id)
+          const pollerLive = isPollerAlive(recipient?.cc_session_id, {
+            stateFileDir: pollerStateDir,
+          })
+          if (pushed && pollerLive) notified_count++
         }
         return {
           content: [{

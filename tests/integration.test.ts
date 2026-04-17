@@ -81,7 +81,11 @@ test('send 1-to-1: recipient gets message on read_messages', async () => {
   })
   const sendParsed = JSON.parse((sendResult.content as any[])[0].text)
   expect(typeof sendParsed.message_id).toBe('string')
-  expect(sendParsed.delivered_notification).toBe(true)
+  // Phase 1 recipient (registered without cc_session_id) has no poller
+  // process, so delivered_notification is false — the message still lands
+  // in the DB and shows up on read_messages below, which is the real
+  // correctness signal. See poller.isPollerAlive for the semantics.
+  expect(sendParsed.delivered_notification).toBe(false)
 
   const readResult = await recipient.callTool({ name: 'read_messages', arguments: {} })
   const readParsed = JSON.parse((readResult.content as any[])[0].text)

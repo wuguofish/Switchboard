@@ -16,6 +16,8 @@ import {
   countUnread,
   runPoller,
   loadConfigFromHookStdin,
+  isPidAlive,
+  isPollerAlive,
   type PollerConfig,
 } from '../poller'
 
@@ -50,6 +52,7 @@ function makeConfig(overrides: Partial<PollerConfig> = {}): PollerConfig {
     ownPid: 9999,
     now: () => Date.now(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    isParentAlive: () => true,
     ...overrides,
   }
 }
@@ -220,6 +223,113 @@ test('loadConfigFromHookStdin returns null when stdin has no session_id field', 
     stateFileDir: tmpDir,
   })
   expect(config).toBeNull()
+})
+
+test('runPoller exits 0 when parent process has died', async () => {
+  createSession(db, { alias: 'test-role', cc_session_id: 'cc-test-session' })
+  db.close()
+  const config = makeConfig({
+    ttlMs: 30_000,
+    pollIntervalMs: 10,
+    isParentAlive: () => false,
+  })
+  const result = await runPoller(config)
+  expect(result.exitCode).toBe(0)
+  expect(result.message).toBeUndefined()
+})
+
+test('runPoller keeps running while parent is alive and no unread', async () => {
+  createSession(db, { alias: 'test-role', cc_session_id: 'cc-test-session' })
+  db.close()
+  let ticks = 0
+  const config = makeConfig({
+    ttlMs: 30_000,
+    pollIntervalMs: 1,
+    isParentAlive: () => {
+      ticks += 1
+      // After a handful of loops, simulate the parent dying so the test
+      // terminates deterministically.
+      return ticks < 3
+    },
+  })
+  const result = await runPoller(config)
+  expect(result.exitCode).toBe(0)
+  expect(ticks).toBeGreaterThanOrEqual(3)
+})
+
+test('isPidAlive returns true for the current process and false for a clearly-dead pid', () => {
+  expect(isPidAlive(process.pid)).toBe(true)
+  // pid 0 is the scheduler on POSIX and invalid on Windows — either way
+  // process.kill(0, 0) throws, so the helper should report dead.
+  // Use 999_999_999 as a pid that almost certainly does not exist.
+  expect(isPidAlive(999_999_999)).toBe(false)
+})
+
+test('isPollerAlive returns false when cc_session_id is null or undefined', () => {
+  expect(isPollerAlive(null, { stateFileDir: tmpDir })).toBe(false)
+  expect(isPollerAlive(undefined, { stateFileDir: tmpDir })).toBe(false)
+})
+
+test('isPollerAlive returns false when state file does not exist', () => {
+  expect(isPollerAlive('cc-never-polled', { stateFileDir: tmpDir })).toBe(false)
+})
+
+test('isPollerAlive returns false when state file points at a dead pid', () => {
+  const safe = 'cc-dead'
+  const path = join(tmpDir, `switchboard-poller-${safe}.state`)
+  writeFileSync(
+    path,
+    JSON.stringify({
+      pid: 999_999_999,
+      cc_session_id: safe,
+      started_at: new Date().toISOString(),
+    }),
+    'utf8',
+  )
+  expect(isPollerAlive(safe, { stateFileDir: tmpDir })).toBe(false)
+})
+
+test('isPollerAlive returns true when state file points at a live pid', () => {
+  const safe = 'cc-alive'
+  const path = join(tmpDir, `switchboard-poller-${safe}.state`)
+  writeFileSync(
+    path,
+    JSON.stringify({
+      pid: process.pid,
+      cc_session_id: safe,
+      started_at: new Date().toISOString(),
+    }),
+    'utf8',
+  )
+  expect(isPollerAlive(safe, { stateFileDir: tmpDir })).toBe(true)
+})
+
+test('isPollerAlive sanitises cc_session_id the same way runPoller does', () => {
+  const raw = 'cc/with\\weird..chars'
+  const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '_')
+  const path = join(tmpDir, `switchboard-poller-${safe}.state`)
+  writeFileSync(
+    path,
+    JSON.stringify({
+      pid: process.pid,
+      cc_session_id: raw,
+      started_at: new Date().toISOString(),
+    }),
+    'utf8',
+  )
+  expect(isPollerAlive(raw, { stateFileDir: tmpDir })).toBe(true)
+})
+
+test('loadConfigFromHookStdin wires an isParentAlive hook that uses process.ppid', () => {
+  createSession(db, { alias: 'parent-test', cc_session_id: 'cc-parent' })
+  db.close()
+  const config = loadConfigFromHookStdin(
+    JSON.stringify({ session_id: 'cc-parent' }),
+    { dbPath, stateFileDir: tmpDir },
+  )
+  expect(config).not.toBeNull()
+  // process.ppid refers to the test runner, which is alive right now.
+  expect(config?.isParentAlive()).toBe(true)
 })
 
 test('loadConfigFromHookStdin returns null for released session row', () => {

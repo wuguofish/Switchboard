@@ -13,6 +13,13 @@ export interface PollerConfig {
   ownPid: number
   now: () => number
   sleep: (ms: number) => Promise<void>
+  /**
+   * Returns true while the spawning Claude Code process is still alive.
+   * When it dies the poller should exit immediately so it does not become
+   * an orphan that squats on the state file and prevents a fresh session
+   * (under a reused cc_session_id) from claiming leadership.
+   */
+  isParentAlive: () => boolean
 }
 
 export interface PollerState {
@@ -75,6 +82,10 @@ export async function runPoller(config: PollerConfig): Promise<PollerResult> {
         return { exitCode: 0 }
       }
 
+      if (!config.isParentAlive()) {
+        return { exitCode: 0 }
+      }
+
       const count = countUnread(db, config.alias)
       if (count > 0) {
         return {
@@ -87,6 +98,48 @@ export async function runPoller(config: PollerConfig): Promise<PollerResult> {
     }
   } finally {
     db.close()
+  }
+}
+
+/**
+ * Test whether a process with the given pid is alive. Works on Windows and
+ * POSIX alike: `process.kill(pid, 0)` sends a no-op signal that throws ESRCH
+ * (or EPERM) if the target does not exist. Used by loadConfigFromHookStdin
+ * to wire up the default isParentAlive hook against the real parent pid.
+ */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve whether the recipient has a live poller process that will convert
+ * a pushed notification into a rewake (Stop hook asyncRewake). Used by
+ * send/broadcast to produce an honest delivered_notification signal:
+ * - cc_session_id is required; anonymous / Phase 1 sessions have no poller
+ * - state file absence means the session never ran a poller since the last
+ *   daemon start
+ * - pid from the state file must still be alive (isPidAlive)
+ */
+export function isPollerAlive(
+  ccSessionId: string | null | undefined,
+  opts: { stateFileDir: string },
+): boolean {
+  if (!ccSessionId) return false
+  const safeName = ccSessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
+  const statePath = join(
+    opts.stateFileDir,
+    `switchboard-poller-${safeName}.state`,
+  )
+  try {
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as PollerState
+    return isPidAlive(state.pid)
+  } catch {
+    return false
   }
 }
 
@@ -126,6 +179,11 @@ export function loadConfigFromHookStdin(
       opts.stateFileDir,
       `switchboard-poller-${safeName}.state`,
     )
+    // Capture the parent pid at load time. If the spawning Claude Code dies
+    // the kernel reparents us (POSIX) or the pid becomes invalid (Windows),
+    // and isPidAlive returns false on the next tick — the poller exits
+    // without needing the TTL timer to fire hours later.
+    const parentPid = process.ppid
 
     return {
       ccSessionId,
@@ -134,10 +192,13 @@ export function loadConfigFromHookStdin(
       dbPath: opts.dbPath,
       stateFilePath,
       pollIntervalMs: 30_000,
-      ttlMs: 7_200_000,
+      // Parent-pid check is the primary orphan guard. Keep a very long TTL
+      // as a belt-and-braces upper bound in case isPidAlive misfires.
+      ttlMs: 24 * 60 * 60 * 1000,
       ownPid: process.pid,
       now: () => Date.now(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      isParentAlive: () => isPidAlive(parentPid),
     }
   } finally {
     db.close()

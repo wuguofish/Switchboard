@@ -51,7 +51,7 @@ export function createSession(
 
 export function findSessionById(db: Database, id: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
-    'SELECT id, alias, created_at, last_activity FROM sessions WHERE id = ?'
+    'SELECT id, alias, cc_session_id, created_at, last_activity FROM sessions WHERE id = ?'
   ).get(id)
   return row ?? null
 }
