@@ -159,6 +159,7 @@ export interface BroadcastInput {
 export interface BroadcastDbResult {
   broadcast_id: string
   recipient_count: number
+  recipient_ids: string[]
 }
 
 export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastDbResult {
@@ -179,7 +180,11 @@ export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastD
   })
   insertTx(recipients)
 
-  return { broadcast_id, recipient_count: recipients.length }
+  return {
+    broadcast_id,
+    recipient_count: recipients.length,
+    recipient_ids: recipients.map((r) => r.id),
+  }
 }
 
 export interface RecallInput {
@@ -212,6 +217,14 @@ export function listAllSessions(db: Database): SessionRow[] {
   return db.query<SessionRow, []>(
     'SELECT id, alias, created_at, last_activity FROM sessions ORDER BY created_at ASC'
   ).all()
+}
+
+/** Count unread messages addressed to a specific session id. */
+export function countUnreadBySessionId(db: Database, sessionId: string): number {
+  const row = db.query<{ count: number }, [string]>(
+    'SELECT COUNT(*) as count FROM messages WHERE recipient_id = ? AND read_at IS NULL',
+  ).get(sessionId)
+  return row?.count ?? 0
 }
 
 export function deleteExpiredMessages(db: Database): number {

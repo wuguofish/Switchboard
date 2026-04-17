@@ -18,12 +18,13 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, updateLastActivity, releaseSession, reactivateSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, updateLastActivity, releaseSession, reactivateSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
 import { isPollerAlive } from './poller'
+import { UnreadWaiterRegistry } from './waiters'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -45,6 +46,18 @@ export async function startServer(opts: {
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
   const pollerStateDir = opts.pollerStateDir ?? DEFAULT_POLLER_STATE_DIR
+  const waiters = new UnreadWaiterRegistry()
+
+  // Unified "recipient can be auto-woken" check. True if either:
+  // (a) the recipient has a bun poller.ts writing a state file with a live pid, or
+  // (b) a curl shim is currently long-polling on /poll for this cc_session_id.
+  // Either path results in a Stop-hook rewake when a message arrives, so
+  // delivered_notification can honestly claim delivery.
+  const canAutoWake = (ccSessionId: string | null | undefined): boolean => {
+    if (!ccSessionId) return false
+    if (waiters.isPolling(ccSessionId)) return true
+    return isPollerAlive(ccSessionId, { stateFileDir: pollerStateDir })
+  }
 
   // Map: MCP session ID (from Mcp-Session-Id header) → session entry
   const sessionMap = new Map<string, SessionEntry>()
@@ -315,21 +328,22 @@ export async function startServer(opts: {
           sender_id: currentSwitchboardId,
           is_broadcast: false,
         })
+        // Wake any long-poll waiter for this recipient so the curl shim
+        // returns immediately with SWITCHBOARD INBOX. Safe to call even if
+        // no waiter exists.
+        waiters.notify(targetId)
         // delivered_notification promises "the recipient will notice this
-        // without user intervention" — that requires both a live transport
-        // (pushed) and a live poller process to convert the SSE notification
-        // into a Stop-hook rewake. Anonymous / Phase 1 recipients have no
-        // poller and always get false, which is the honest answer.
+        // without user intervention" — that requires a live transport
+        // (pushed) and a live auto-wake path (bun poller state file OR an
+        // active curl long-poll). Anonymous / Phase 1 recipients with no
+        // cc_session_id always get false — the honest answer.
         const recipient = findSessionById(db, targetId)
-        const pollerLive = isPollerAlive(recipient?.cc_session_id, {
-          stateFileDir: pollerStateDir,
-        })
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
               message_id,
-              delivered_notification: pushed && pollerLive,
+              delivered_notification: pushed && canAutoWake(recipient?.cc_session_id),
             }),
           }],
         }
@@ -339,10 +353,12 @@ export async function startServer(opts: {
         if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
         const message = (args as Record<string, unknown>)?.message as string
         const sender = findSessionById(db, currentSwitchboardId)
-        const { broadcast_id, recipient_count } = insertBroadcast(db, {
+        const { broadcast_id, recipient_count, recipient_ids } = insertBroadcast(db, {
           sender_id: currentSwitchboardId,
           content: message,
         })
+        // Wake every long-poll waiter that just got a new message row.
+        waiters.notifyMany(recipient_ids)
         const onlineIds = registry.listOnline().filter(id => id !== currentSwitchboardId)
         let notified_count = 0
         for (const id of onlineIds) {
@@ -352,10 +368,7 @@ export async function startServer(opts: {
             is_broadcast: true,
           })
           const recipient = findSessionById(db, id)
-          const pollerLive = isPollerAlive(recipient?.cc_session_id, {
-            stateFileDir: pollerStateDir,
-          })
-          if (pushed && pollerLive) notified_count++
+          if (pushed && canAutoWake(recipient?.cc_session_id)) notified_count++
         }
         return {
           content: [{
@@ -419,6 +432,65 @@ export async function startServer(opts: {
     return transport
   }
 
+  /**
+   * GET /poll?cc_session_id=X&timeout_s=N
+   *
+   * Long-poll endpoint for Stop-hook shim scripts. Replaces bun poller.ts —
+   * the shim calls this and blocks on the daemon instead of running its own
+   * JS runtime. Returns JSON describing the result:
+   *   { status: "unread",    count, alias, message }  -> shim exits 2
+   *   { status: "timeout"   }                         -> shim loops or exits 0
+   *   { status: "no-session" }                        -> shim exits 0
+   *
+   * Bun.serve idleTimeout caps per-request wait at ~255s, so shim callers
+   * should use timeout_s <= 240 and loop themselves; on timeout they can
+   * check their own parent-alive signal before re-dialing.
+   */
+  async function handlePoll(req: Request, url: URL): Promise<Response> {
+    if (req.method !== 'GET') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+    const ccSessionId = url.searchParams.get('cc_session_id')
+    if (!ccSessionId) {
+      return new Response('Missing cc_session_id', { status: 400 })
+    }
+    const timeoutRaw = url.searchParams.get('timeout_s') ?? '240'
+    const parsed = parseInt(timeoutRaw, 10)
+    const timeoutS = Math.min(Math.max(Number.isFinite(parsed) ? parsed : 240, 1), 250)
+
+    const session = findSessionByCcSessionId(db, ccSessionId)
+    if (!session || !session.alias) {
+      return Response.json({ status: 'no-session' })
+    }
+
+    // A live curl long-poll counts as activity for retention purposes.
+    updateLastActivity(db, session.id)
+
+    const initial = countUnreadBySessionId(db, session.id)
+    if (initial > 0) {
+      return Response.json({
+        status: 'unread',
+        count: initial,
+        alias: session.alias,
+        message: `SWITCHBOARD INBOX: ${initial} unread message(s) for role "${session.alias}" — call mcp__switchboard__read_messages to retrieve`,
+      })
+    }
+
+    await waiters.wait(session.id, ccSessionId, timeoutS * 1000, req.signal)
+    // Re-check: the waiter may have resolved because of a new message, a
+    // timeout, or a client abort. Only the first case yields status=unread.
+    const final = countUnreadBySessionId(db, session.id)
+    if (final > 0) {
+      return Response.json({
+        status: 'unread',
+        count: final,
+        alias: session.alias,
+        message: `SWITCHBOARD INBOX: ${final} unread message(s) for role "${session.alias}" — call mcp__switchboard__read_messages to retrieve`,
+      })
+    }
+    return Response.json({ status: 'timeout' })
+  }
+
   // --- Bun HTTP server ---
   const bunServer = Bun.serve({
     hostname: '127.0.0.1',
@@ -430,6 +502,10 @@ export async function startServer(opts: {
 
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url)
+
+      if (url.pathname === '/poll') {
+        return handlePoll(req, url)
+      }
 
       if (url.pathname !== '/mcp') {
         return new Response('Not Found', { status: 404 })
@@ -558,6 +634,9 @@ export async function startServer(opts: {
     async stop(): Promise<void> {
       // Stop retention loop first (before closing DB)
       retention.stop()
+
+      // Release any /poll long-polls so their handlers return promptly.
+      waiters.cancelAll()
 
       // Close all open transports
       const closePromises: Promise<void>[] = []

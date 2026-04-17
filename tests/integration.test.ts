@@ -287,6 +287,111 @@ test('register without cc_session_id still creates a new session each time (Phas
   await c2.close()
 })
 
+// --- /poll long-polling endpoint ---
+
+const POLL_URL = `http://127.0.0.1:${TEST_PORT}/poll`
+
+test('/poll returns no-session when cc_session_id is unknown', async () => {
+  const resp = await fetch(`${POLL_URL}?cc_session_id=cc-never-registered&timeout_s=1`)
+  expect(resp.status).toBe(200)
+  const body = await resp.json()
+  expect(body.status).toBe('no-session')
+})
+
+test('/poll returns unread immediately when messages are already waiting', async () => {
+  const sender = await makeClient('poll-sender-imm')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'poll-snd-imm', cc_session_id: 'cc-poll-snd-imm' },
+  })
+  const recipient = await makeClient('poll-recip-imm')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'poll-rcp-imm', cc_session_id: 'cc-poll-rcp-imm' },
+  })
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'poll-rcp-imm', message: 'already here' },
+  })
+
+  const resp = await fetch(`${POLL_URL}?cc_session_id=cc-poll-rcp-imm&timeout_s=5`)
+  const body = await resp.json()
+  expect(body.status).toBe('unread')
+  expect(body.count).toBe(1)
+  expect(body.alias).toBe('poll-rcp-imm')
+  expect(body.message).toContain('SWITCHBOARD INBOX')
+  expect(body.message).toContain('poll-rcp-imm')
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('/poll long-poll resolves when a send arrives mid-wait', async () => {
+  const recipient = await makeClient('poll-recip-late')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'poll-rcp-late', cc_session_id: 'cc-poll-rcp-late' },
+  })
+
+  const pollPromise = fetch(`${POLL_URL}?cc_session_id=cc-poll-rcp-late&timeout_s=5`)
+  await new Promise((r) => setTimeout(r, 80))
+
+  const sender = await makeClient('poll-sender-late')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'poll-snd-late', cc_session_id: 'cc-poll-snd-late' },
+  })
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'poll-rcp-late', message: 'wake up' },
+  })
+
+  const resp = await pollPromise
+  const body = await resp.json()
+  expect(body.status).toBe('unread')
+  expect(body.count).toBeGreaterThanOrEqual(1)
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('/poll returns timeout when no message arrives within the window', async () => {
+  const recipient = await makeClient('poll-recip-idle')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'poll-rcp-idle', cc_session_id: 'cc-poll-rcp-idle' },
+  })
+  const resp = await fetch(`${POLL_URL}?cc_session_id=cc-poll-rcp-idle&timeout_s=1`)
+  const body = await resp.json()
+  expect(body.status).toBe('timeout')
+  await recipient.close()
+})
+
+test('send to a recipient currently long-polling reports delivered_notification: true', async () => {
+  const recipient = await makeClient('poll-recip-dn')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'poll-rcp-dn', cc_session_id: 'cc-poll-rcp-dn' },
+  })
+  const pollPromise = fetch(`${POLL_URL}?cc_session_id=cc-poll-rcp-dn&timeout_s=3`)
+  await new Promise((r) => setTimeout(r, 80))
+
+  const sender = await makeClient('poll-sender-dn')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'poll-snd-dn', cc_session_id: 'cc-poll-snd-dn' },
+  })
+  const sendResult = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'poll-rcp-dn', message: 'live poll' },
+  })).content as any[])[0].text)
+  expect(sendResult.delivered_notification).toBe(true)
+
+  await pollPromise
+  await sender.close()
+  await recipient.close()
+})
+
 test('alias is released on disconnect, new client can reclaim the name', async () => {
   const c1 = await makeClient('reclaim-c1')
   const first = JSON.parse(((await c1.callTool({

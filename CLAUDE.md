@@ -70,12 +70,16 @@ bun test tests/integration.test.ts
 2. `/hooks` reload 設定
 3. Session 啟動時 `hook-session-start.ts` 從 hook stdin 讀到 cc_session_id，注入成 additionalContext，告訴 session 內的 Claude 它自己的 id
 4. Claude 看到 additionalContext 後，自己決定要不要 `register(role, cc_session_id)`，以什麼名字上線（不上線 = 這個 session 匿名存在，不能被其他 session 找到）
-5. 每次 turn 結束 Stop hook 把 stdin JSON pipe 給 `poller.ts`，poller 從 DB 反查 cc_session_id → alias，開始監控 inbox
-6. Poller 偵測到新訊息就 `exit 2` 喚醒 session → 自動 spawn 新 turn
+5. 每次 turn 結束 Stop hook 把 stdin JSON pipe 給 `poller-shim.ps1`，shim 呼叫 daemon 的 `/poll` long-polling endpoint（~30-50 MB PowerShell vs. 舊版 `bun poller.ts` ~150 MB）
+6. Daemon 偵測到新訊息 → `/poll` 回 `status=unread` → shim `exit 2` 喚醒 session → 自動 spawn 新 turn
 
 ### Runtime state files
 
-- `D:\tsunu_plan\.claude\switchboard-poller-<cc_session_id>.state` — 每個 session 一份，cooperative watchdog 用的 pid state
+- `D:\tsunu_plan\.claude\switchboard-poller-<cc_session_id>.state` — 舊版 `bun poller.ts` 用的 pid state（留作向後相容）；新版 `poller-shim.ps1` 不寫 state file，改由 daemon 的 in-memory `pollingSessions` 提供 liveness 訊號
+
+### 舊版 `bun poller.ts`（仍可用作 fallback）
+
+舊的 Stop hook command `bun D:/tsunu_plan/mcp-servers/switchboard/poller.ts` 仍然能 work — 會寫 state file，parent-pid alive check 也已就位。但每個 poller 子進程 ~150 MB，並行多個 session 時記憶體壓力大。預設改用 shim，舊版只推薦在 PowerShell 不可用的環境使用。
 
 Phase 2 的 `switchboard-role.txt` 已刪除（靜態 config signal 不再需要）。
 
@@ -87,7 +91,7 @@ Phase 2 的 `switchboard-role.txt` 已刪除（靜態 config signal 不再需要
 
 - **Session 沒被自動喚醒** → 確認 Claude 在第一輪有呼叫 `register(role, cc_session_id)`；DB 裡 `SELECT * FROM sessions WHERE cc_session_id = 'xxx'` 應該看到 active row
 - **Role collision** → 另一個 active session 正在用同樣的 role。換名字或等對方 disconnect
-- **Orphan poller** → 10 分鐘 TTL 自清；立即清理用 Task Manager 找 `bun` process
+- **Orphan poller** → shim 用 parent-pid alive check 自清（Claude Code 死了下 tick 就退出）；舊版 `bun poller.ts` 同樣有 parent-pid check，失靈時 fallback 24 小時 TTL
 - **重設** → 直接關掉 session 並刪 `switchboard.db`（Phase 2.5 migration guard 會處理 schema 重建）
 
 ### 限制（intentional）

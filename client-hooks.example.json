@@ -9,7 +9,7 @@
     "Stop": [{
       "hooks": [{
         "type": "command",
-        "command": "bun D:/tsunu_plan/mcp-servers/switchboard/poller.ts",
+        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File D:/tsunu_plan/mcp-servers/switchboard/poller-shim.ps1",
         "async": true,
         "asyncRewake": true
       }]
