@@ -10,7 +10,9 @@ Claude Code runs each workspace / terminal as its own process, with no built-in 
 
 - **Directed messages** (`send`) and **fan-out** (`broadcast`) between named sessions
 - **Recall** for messages you wish you hadn't sent
-- **Auto-wake** — a Stop-hook shim long-polls the daemon, so when a message arrives the next Claude Code turn starts with an `INBOX` reminder
+- **Auto-wake, two paths**:
+  - A Stop-hook shim long-polls `/poll`, so when a message arrives the next Claude Code turn starts with an `INBOX` reminder.
+  - *Or* (recommended for long-lived sessions) Claude Code's `Monitor` tool `curl -N`s `/monitor` as a persistent chunked stream; each inbox line fires an assistant turn directly, sidestepping the known `asyncRewake`-degrades-over-time failure mode.
 - **Persistence** — messages live in SQLite and survive daemon restarts
 
 Everything is bound to `127.0.0.1` with no authentication, which makes it safe for intra-machine coordination but never appropriate to expose to a network.
@@ -19,29 +21,24 @@ Everything is bound to `127.0.0.1` with no authentication, which makes it safe f
 
 ```
    Claude Code session A                Claude Code session B
-   ┌─────────────────────┐              ┌─────────────────────┐
-   │ MCP client          │              │ MCP client          │
-   │      │              │              │              │      │
-   │      ▼              │              │              ▼      │
-   │ POST/GET /mcp       │              │       POST/GET /mcp │
-   │                     │              │                     │
-   │ Stop-hook shim      │              │      Stop-hook shim │
-   │  curl --max-time    │              │     curl --max-time │
-   │      │              │              │              │      │
-   └──────┼──────────────┘              └──────────────┼──────┘
-          │                                            │
-          └──────────► 127.0.0.1:9876 ◄────────────────┘
-                       ┌──────────────┐
-                       │ Switchboard  │
-                       │ daemon (Bun) │
-                       │  /mcp  /poll │
-                       │  SQLite WAL  │
-                       └──────────────┘
+   ┌──────────────────────┐             ┌──────────────────────┐
+   │ MCP client → /mcp    │             │    /mcp ← MCP client │
+   │ Monitor  → /monitor  │             │ /monitor ←  Monitor  │
+   │ Stop shim → /poll    │             │    /poll ← Stop shim │
+   └──────────┬───────────┘             └──────────┬───────────┘
+              │                                    │
+              └───────► 127.0.0.1:9876 ◄───────────┘
+                        ┌────────────────────┐
+                        │   Switchboard      │
+                        │   daemon (Bun)     │
+                        │ /mcp /poll /monitor│
+                        │   SQLite WAL       │
+                        └────────────────────┘
 ```
 
 - Daemon: Bun + `WebStandardStreamableHTTPServerTransport`, bound to `127.0.0.1:9876`
 - Storage: SQLite in WAL mode; sessions and messages survive restarts
-- Transport: Streamable HTTP MCP for tool calls; a separate `/poll` endpoint for Stop-hook long-polling
+- Transport: Streamable HTTP MCP for tool calls; `/poll` for Stop-hook long-polling; `/monitor` for persistent `Monitor`-tool subscribers
 
 ## Requirements
 
@@ -157,7 +154,7 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
 
-`to` accepts either an alias or a session UUID. `delivered_notification` is true only when the recipient has a live `/poll` long-poll in progress — the in-memory polling set is the truthful signal. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+`to` accepts either an alias or a session UUID. `delivered_notification` is true when the recipient has either a live `/poll` long-poll *or* an active `/monitor` subscription — the in-memory polling set covers both wake paths. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
 
 ## HTTP endpoints
 
@@ -166,8 +163,48 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
   - `{status: "unread", count, alias, message}` — Stop-hook shim exits 2
   - `{status: "timeout"}` — shim re-dials
   - `{status: "no-session"}` — alias is gone; shim exits 0
+- `GET /monitor?cc_session_id=<uuid>` — persistent chunked text stream for Claude Code's `Monitor` tool. One line per event:
+  - `hello <alias>` — baseline, emitted once on connect when inbox is empty
+  - `inbox <N> <alias>` — unread waiting (on connect) or a new `send`/`broadcast` arrived
+  - `heartbeat <iso-ts>` — emitted every 240s of silence so Bun's `idleTimeout` doesn't cut the stream
 
-Bun's `idleTimeout` caps individual `/poll` waits at ~250s, so shims loop.
+Bun's `idleTimeout` caps individual `/poll` waits at ~250s, so shims loop. `/monitor` stays open for the life of the session; clients should wrap `curl -sN` in a reconnect loop so a daemon restart self-heals.
+
+## Wake paths — which one, when?
+
+Both `/poll` and `/monitor` end at the same place (the `UnreadWaiterRegistry` inside the daemon), so either delivers messages reliably. They differ in transport, lifetime, and failure mode:
+
+|                         | `/poll` + Stop-hook shim               | `/monitor` + Monitor tool                |
+|-------------------------|----------------------------------------|------------------------------------------|
+| Trigger                 | Every `Stop` hook (one per turn)       | Each new stream line fires a turn        |
+| Connection              | Fresh long-poll each turn              | One persistent chunked connection        |
+| Reconnect on daemon bounce | Automatic on next turn              | Handled by client wrapper (`while :; do curl -N …; sleep 5; done`) |
+| Works when session is idle with no user input | Yes, but relies on `asyncRewake`, which has been observed to degrade in long-lived sessions | Yes; each stdout line is an independent `Monitor` event |
+| Anonymous sessions      | Not wakeable (no cc_session_id to match) | Not wakeable (same constraint)         |
+
+The two paths are **complementary, not exclusive** — you can run both at the same time (read paths are idempotent). The recommendation is: keep the Stop-hook shim as a fallback, and add `/monitor` for any session that needs to stay reachable for hours without a turn.
+
+### Subscribing from a Claude Code session
+
+In the session you want to keep reachable, start the `Monitor` tool after `register`:
+
+```
+Monitor({
+  description: 'switchboard inbox for <my-alias>',
+  persistent: true,
+  command: 'while :; do curl -sN "http://127.0.0.1:9876/monitor?cc_session_id=<cc_session_id>" || true; sleep 5; done',
+})
+```
+
+The `while … sleep 5` wrapper auto-reconnects if the daemon restarts or the TCP connection blips. Advanced subscribers can `grep --line-buffered "^inbox "` to suppress `hello`/`heartbeat` noise once the stream is known to be healthy.
+
+Trigger rules worth internalising:
+- A direct `send(to=you)` wakes you.
+- A `broadcast` that includes you (every non-released session except the sender) wakes you.
+- *Your own* `send` / `broadcast` does **not** wake you — the sender is excluded on the server side.
+- Other sessions' 1-to-1 traffic never leaks onto your stream.
+
+The `hook-session-start.ts` `SessionStart` hook already teaches new sessions this snippet, so fresh workspaces pick up the wake path without extra setup.
 
 ## Phase 2.5: per-session identity
 
@@ -204,11 +241,11 @@ bunx tsc --noEmit        # type check
 
 ```
 main.ts                  # daemon entry
-server.ts                # MCP tool handlers + /poll endpoint + Bun.serve wiring
+server.ts                # MCP tool handlers + /poll + /monitor + Bun.serve wiring
 db.ts                    # SQLite helpers (sessions, messages, retention queries)
 schema.sql               # DB schema with Phase 2.5 columns
 connections.ts           # in-memory ConnectionRegistry for push callbacks
-waiters.ts               # UnreadWaiterRegistry for /poll long-polling
+waiters.ts               # UnreadWaiterRegistry — shared by /poll and /monitor
 retention.ts             # periodic expired-message + stale-session cleanup
 aliases.ts               # alias collision handling + target resolution
 poller.ts                # legacy bun-based Stop-hook poller (fallback)

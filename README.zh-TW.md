@@ -10,7 +10,9 @@ Claude Code 每個 workspace / 終端機都是獨立 process，原生沒有 sess
 
 - **點對點訊息** (`send`) 與 **廣播** (`broadcast`)
 - **收回** (`recall`) 已送出的訊息
-- **自動喚醒** — Stop-hook shim 長連線到 daemon，一有新訊息，下一個 Claude Code turn 就帶 `INBOX` 提醒啟動
+- **自動喚醒，兩條 path**：
+  - Stop-hook shim 長連線到 `/poll`，一有新訊息，下一個 Claude Code turn 就帶 `INBOX` 提醒啟動
+  - *或*（長跑 session 建議）讓 Claude Code 的 `Monitor` tool 以 `curl -N` 訂閱 `/monitor` 的 chunked stream，每行 inbox event 直接 fire 新 turn，繞過「`asyncRewake` 會隨時間漸失效」的已知問題
 - **持久化** — 訊息存在 SQLite，daemon 重啟也不會丟
 
 整套只綁 `127.0.0.1`、沒有認證——本機協調方便，但絕對不能暴露到網路上。
@@ -19,29 +21,24 @@ Claude Code 每個 workspace / 終端機都是獨立 process，原生沒有 sess
 
 ```
    Claude Code session A                Claude Code session B
-   ┌─────────────────────┐              ┌─────────────────────┐
-   │ MCP client          │              │ MCP client          │
-   │      │              │              │              │      │
-   │      ▼              │              │              ▼      │
-   │ POST/GET /mcp       │              │       POST/GET /mcp │
-   │                     │              │                     │
-   │ Stop-hook shim      │              │      Stop-hook shim │
-   │  curl --max-time    │              │     curl --max-time │
-   │      │              │              │              │      │
-   └──────┼──────────────┘              └──────────────┼──────┘
-          │                                            │
-          └──────────► 127.0.0.1:9876 ◄────────────────┘
-                       ┌──────────────┐
-                       │ Switchboard  │
-                       │ daemon (Bun) │
-                       │  /mcp  /poll │
-                       │  SQLite WAL  │
-                       └──────────────┘
+   ┌──────────────────────┐             ┌──────────────────────┐
+   │ MCP client → /mcp    │             │    /mcp ← MCP client │
+   │ Monitor  → /monitor  │             │ /monitor ←  Monitor  │
+   │ Stop shim → /poll    │             │    /poll ← Stop shim │
+   └──────────┬───────────┘             └──────────┬───────────┘
+              │                                    │
+              └───────► 127.0.0.1:9876 ◄───────────┘
+                        ┌────────────────────┐
+                        │   Switchboard      │
+                        │   daemon (Bun)     │
+                        │ /mcp /poll /monitor│
+                        │   SQLite WAL       │
+                        └────────────────────┘
 ```
 
 - Daemon：Bun + `WebStandardStreamableHTTPServerTransport`，bind `127.0.0.1:9876`
 - 儲存：SQLite（WAL 模式），session 與訊息皆能在重啟後保留
-- 傳輸：工具呼叫走 Streamable HTTP MCP；Stop-hook long-polling 走另一個 `/poll` endpoint
+- 傳輸：工具呼叫走 Streamable HTTP MCP；Stop-hook long-polling 走 `/poll`；`Monitor` tool 的長期訂閱走 `/monitor`
 
 ## 需求
 
@@ -156,7 +153,7 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
 
-`to` 可以是 alias 或 session UUID。`delivered_notification` 只在收件人當下有 active 的 `/poll` long-poll 時才回 true——in-memory 的 polling set 是唯一可靠的訊號。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
+`to` 可以是 alias 或 session UUID。`delivered_notification` 只要收件人當下有 active 的 `/poll` long-poll *或* `/monitor` 訂閱就會回 true——in-memory 的 polling set 涵蓋兩條 wake path。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
 
 ## HTTP endpoints
 
@@ -165,8 +162,48 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
   - `{status: "unread", count, alias, message}` — Stop-hook shim 應 `exit 2`
   - `{status: "timeout"}` — shim 重新撥接
   - `{status: "no-session"}` — alias 消失；shim `exit 0`
+- `GET /monitor?cc_session_id=<uuid>` — 為 Claude Code 的 `Monitor` tool 設計的長駐 chunked text stream，每行一個 event：
+  - `hello <alias>` — 連上時的 baseline，inbox 空時才發
+  - `inbox <N> <alias>` — 連上時有未讀、或有新的 `send` / `broadcast` 到
+  - `heartbeat <iso-ts>` — 每 240s 靜默時的 keep-alive，避免被 Bun `idleTimeout` 砍斷
 
-Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 loop 即可。
+Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 loop 即可。`/monitor` 則一直開著陪整個 session 生命週期，客戶端建議把 `curl -sN` 包在 reconnect loop 裡，daemon 重啟時能自我修復。
+
+## Wake paths — 哪條、什麼時候用？
+
+`/poll` 和 `/monitor` 最終都打到 daemon 內部同一組 `UnreadWaiterRegistry`，任一條都可靠傳遞訊息。差別在傳輸方式、生命週期、失敗模式：
+
+|                           | `/poll` + Stop-hook shim           | `/monitor` + Monitor tool           |
+|---------------------------|------------------------------------|-------------------------------------|
+| 觸發                      | 每次 `Stop` hook（一個 turn 一次） | stream 每行 fire 一個 turn           |
+| 連線                      | 每個 turn 建新 long-poll           | 一條常駐 chunked 連線                |
+| Daemon 重啟時的 reconnect | 下個 turn 自動重建                 | 靠客戶端 wrapper（`while :; do curl -N …; sleep 5; done`） |
+| Session 空轉（使用者沒打字）時仍能被喚醒 | 可，但靠 `asyncRewake`，長 session 已觀察到會漸失效 | 可，每行 stdout 都是獨立的 `Monitor` event |
+| Anonymous session         | 不能被喚醒（沒 cc_session_id 可 match） | 不能被喚醒（同條件限制）          |
+
+兩條 **互補、不互斥** — 可以同時跑（read 路徑 idempotent）。建議：保留 Stop-hook shim 當 fallback，任何需要幾小時都能被找到的 session 再加上 `/monitor`。
+
+### 從 Claude Code session 訂閱
+
+在你想保持可達的 session 裡，`register` 之後啟動 `Monitor` tool：
+
+```
+Monitor({
+  description: 'switchboard inbox for <my-alias>',
+  persistent: true,
+  command: 'while :; do curl -sN "http://127.0.0.1:9876/monitor?cc_session_id=<cc_session_id>" || true; sleep 5; done',
+})
+```
+
+`while … sleep 5` wrapper 會在 daemon 重啟或 TCP 閃斷時自動重連。進階訂閱者可以在確定 stream 穩定後補 `grep --line-buffered "^inbox "` 把 `hello` / `heartbeat` noise 過濾掉。
+
+觸發規則值得內化：
+- 別人 `send(to=你)` 會喚醒你。
+- 別人 `broadcast`（包含你；也就是所有非 released 且非 sender 的 session）會喚醒你。
+- *你自己* 的 `send` / `broadcast` **不會**喚醒自己——server 端會排除 sender。
+- 別人之間的 1-to-1 不會洩進你的 stream。
+
+`hook-session-start.ts` 的 `SessionStart` hook 已經把這段教學帶進 new session 的 `additionalContext`，新 workspace 不必額外設定就能拿到 wake path。
 
 ## Phase 2.5：per-session identity
 
@@ -203,11 +240,11 @@ bunx tsc --noEmit        # type check
 
 ```
 main.ts                  # daemon 入口
-server.ts                # MCP 工具 handler + /poll endpoint + Bun.serve
+server.ts                # MCP 工具 handler + /poll + /monitor + Bun.serve
 db.ts                    # SQLite helper（session、訊息、保留查詢）
 schema.sql               # Phase 2.5 欄位的 schema
 connections.ts           # in-memory ConnectionRegistry，管 push callback
-waiters.ts               # UnreadWaiterRegistry，管 /poll long-polling
+waiters.ts               # UnreadWaiterRegistry，/poll 和 /monitor 共用
 retention.ts             # 定期清過期訊息 + 孤兒 session
 aliases.ts               # alias 碰撞處理 + 目標解析
 poller.ts                # 舊版 bun 實作的 Stop-hook poller（fallback）
