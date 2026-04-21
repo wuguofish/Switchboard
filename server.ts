@@ -489,6 +489,96 @@ export async function startServer(opts: {
     return Response.json({ status: 'timeout' })
   }
 
+  /**
+   * GET /monitor?cc_session_id=X
+   *
+   * Live chunked text stream for the Claude Code `Monitor` tool. The client
+   * runs `curl -sN http://127.0.0.1:.../monitor?cc_session_id=...` as a
+   * background monitor; each stdout line fires an assistant wake. Line grammar:
+   *   hello <alias>            -> fired once on connect when inbox is empty
+   *   inbox <n> <alias>        -> fired once on connect if already unread, and
+   *                               every time a new message arrives for this cc
+   *   heartbeat <iso-ts>       -> fired on 240s idle to beat Bun's idleTimeout
+   *
+   * Unlike /poll (one-shot long-poll that the shim loops), /monitor is
+   * persistent — one HTTP connection for the lifetime of the session. The
+   * side effect of calling waiters.wait() here is that `canAutoWake` sees
+   * this cc_session_id as polling, so sender-side `delivered_notification`
+   * stays honest.
+   */
+  async function handleMonitor(req: Request, url: URL): Promise<Response> {
+    if (req.method !== 'GET') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+    const ccSessionId = url.searchParams.get('cc_session_id')
+    if (!ccSessionId) {
+      return new Response('Missing cc_session_id\n', { status: 400 })
+    }
+    const session = findSessionByCcSessionId(db, ccSessionId)
+    if (!session || !session.alias) {
+      // Returning 404 with a JSON body keeps shape consistent with /poll's
+      // "no-session" result, so clients can treat both endpoints the same.
+      return Response.json({ status: 'no-session' }, { status: 404 })
+    }
+
+    const sessionId = session.id
+    const alias = session.alias
+    const encoder = new TextEncoder()
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const write = (line: string): boolean => {
+          try {
+            controller.enqueue(encoder.encode(line + '\n'))
+            return true
+          } catch { return false }
+        }
+
+        // Opening the stream counts as activity; retention should not sweep us.
+        updateLastActivity(db, sessionId)
+
+        // Catch up immediately: if inbox already has unread rows, emit one
+        // "inbox N" line so the subscriber wakes right away without going
+        // through a separate /poll call.
+        const initial = countUnreadBySessionId(db, sessionId)
+        if (initial > 0) {
+          write(`inbox ${initial} ${alias}`)
+        } else {
+          write(`hello ${alias}`)
+        }
+
+        // Event loop: block on waiter, emit one line per resolution,
+        // re-subscribe. Heartbeat when waiter resolves by timeout so Bun's
+        // idleTimeout (255s) doesn't cut the connection.
+        const HEARTBEAT_MS = 240_000
+        while (!req.signal.aborted) {
+          await waiters.wait(sessionId, ccSessionId, HEARTBEAT_MS, req.signal)
+          if (req.signal.aborted) break
+          const count = countUnreadBySessionId(db, sessionId)
+          const ok = count > 0
+            ? write(`inbox ${count} ${alias}`)
+            : write(`heartbeat ${new Date().toISOString()}`)
+          if (!ok) break
+          updateLastActivity(db, sessionId)
+        }
+        try { controller.close() } catch {}
+      },
+      cancel() {
+        // client abort — nothing to clean up beyond the waiter (wait()
+        // already registered the AbortSignal, so it releases itself).
+      },
+    })
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-cache, no-store, must-revalidate',
+        'x-accel-buffering': 'no',
+      },
+    })
+  }
+
   // --- Bun HTTP server ---
   const bunServer = Bun.serve({
     hostname: '127.0.0.1',
@@ -503,6 +593,10 @@ export async function startServer(opts: {
 
       if (url.pathname === '/poll') {
         return handlePoll(req, url)
+      }
+
+      if (url.pathname === '/monitor') {
+        return handleMonitor(req, url)
       }
 
       if (url.pathname !== '/mcp') {

@@ -33,7 +33,25 @@ or wait until that session disconnects.
 
 If you don't want to be reachable, you can skip this — the session will
 work anonymously, and you can register later with set_alias() if you
-change your mind.`
+change your mind.
+
+After register succeeds, subscribe to the inbox stream with the Monitor
+tool so new-message events wake this session even when you're idle. This
+is the dedicated wake path — no Stop-hook shim required:
+
+  Monitor({
+    description: 'switchboard inbox',
+    persistent: true,
+    command: 'while :; do curl -sN http://127.0.0.1:9876/monitor?cc_session_id=${cc_session_id} || true; sleep 5; done',
+  })
+
+Each line on the stream becomes a notification:
+  hello <alias>             -> baseline on connect, no action needed
+  inbox <N> <alias>         -> unread waiting; call mcp__switchboard__read_messages
+  heartbeat <iso-ts>        -> keep-alive; ignore
+
+The \`while :; do ... sleep 5; done\` wrapper auto-reconnects if the daemon
+restarts. Skip subscribing only if you're staying anonymous.`
 
   return {
     hookSpecificOutput: {

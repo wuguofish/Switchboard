@@ -26,3 +26,18 @@ test('buildHookOutput mentions anonymous fallback', () => {
   const out = buildHookOutput(input)
   expect(out!.hookSpecificOutput.additionalContext).toMatch(/anonymously|anonymous/i)
 })
+
+test('buildHookOutput teaches the Monitor-tool subscription path', () => {
+  const input = JSON.stringify({ session_id: 'cc-monitor-teach' })
+  const out = buildHookOutput(input)
+  const ctx = out!.hookSpecificOutput.additionalContext
+  // The instructions must reference the Monitor tool, the /monitor endpoint,
+  // the cc_session_id (so Claude can't be tempted to subscribe to someone
+  // else's stream), and the three event verbs a subscriber must understand.
+  expect(ctx).toContain('Monitor')
+  expect(ctx).toContain('/monitor?cc_session_id=cc-monitor-teach')
+  expect(ctx).toContain('hello')
+  expect(ctx).toContain('inbox')
+  expect(ctx).toContain('heartbeat')
+  expect(ctx).toContain('read_messages')
+})

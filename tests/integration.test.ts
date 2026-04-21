@@ -485,3 +485,202 @@ test('released session row stays queryable by id (messages FK preserved)', async
   expect(readParsed.messages[0].sender_id).toBe(senderId)
   await recipient.close()
 })
+
+// --- /monitor chunked-stream endpoint ---
+
+const MONITOR_URL = `http://127.0.0.1:${TEST_PORT}/monitor`
+
+/**
+ * Read lines from a chunked text stream until either `predicate` returns a
+ * value or `timeoutMs` elapses. Returns the collected lines so assertions
+ * can inspect them. Aborts the request on timeout / match so the server
+ * tears down its waiter.
+ */
+async function collectLines(
+  url: string,
+  predicate: (lines: string[]) => boolean,
+  timeoutMs = 3_000,
+): Promise<{ lines: string[]; timedOut: boolean }> {
+  const controller = new AbortController()
+  const lines: string[] = []
+  let timedOut = false
+
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+
+  try {
+    const resp = await fetch(url, { signal: controller.signal })
+    if (!resp.ok) {
+      clearTimeout(timer)
+      return { lines: [resp.status + ''], timedOut: false }
+    }
+    const reader = resp.body!.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n')
+      buffer = parts.pop()!
+      for (const p of parts) if (p) lines.push(p)
+      if (predicate(lines)) {
+        controller.abort()
+        break
+      }
+    }
+  } catch (e) {
+    // AbortError is expected when we stop early
+  } finally {
+    clearTimeout(timer)
+  }
+  return { lines, timedOut }
+}
+
+test('/monitor returns no-session for an unknown cc_session_id', async () => {
+  const resp = await fetch(`${MONITOR_URL}?cc_session_id=cc-nope`)
+  expect(resp.status).toBe(404)
+  const body = await resp.json()
+  expect(body.status).toBe('no-session')
+})
+
+test('/monitor rejects when cc_session_id is missing', async () => {
+  const resp = await fetch(MONITOR_URL)
+  expect(resp.status).toBe(400)
+})
+
+test('/monitor emits "hello <alias>" on connect when inbox is empty', async () => {
+  const recipient = await makeClient('mon-hello')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'mon-hello', cc_session_id: 'cc-mon-hello' },
+  })
+
+  const { lines } = await collectLines(
+    `${MONITOR_URL}?cc_session_id=cc-mon-hello`,
+    (ls) => ls.length >= 1,
+  )
+  expect(lines[0]).toBe('hello mon-hello')
+
+  await recipient.close()
+})
+
+test('/monitor emits "inbox N <alias>" immediately when unread already waiting', async () => {
+  const sender = await makeClient('mon-sender-imm')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'mon-snd-imm', cc_session_id: 'cc-mon-snd-imm' },
+  })
+  const recipient = await makeClient('mon-rcp-imm')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'mon-rcp-imm', cc_session_id: 'cc-mon-rcp-imm' },
+  })
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'mon-rcp-imm', message: 'pre-queued' },
+  })
+
+  const { lines } = await collectLines(
+    `${MONITOR_URL}?cc_session_id=cc-mon-rcp-imm`,
+    (ls) => ls.length >= 1,
+  )
+  expect(lines[0]).toBe('inbox 1 mon-rcp-imm')
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('/monitor emits a new "inbox" line when a send arrives mid-stream', async () => {
+  const recipient = await makeClient('mon-rcp-late')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'mon-rcp-late', cc_session_id: 'cc-mon-rcp-late' },
+  })
+
+  const linesPromise = collectLines(
+    `${MONITOR_URL}?cc_session_id=cc-mon-rcp-late`,
+    (ls) => ls.some((l) => l.startsWith('inbox ')),
+    4_000,
+  )
+
+  // Give the stream a moment to emit the initial "hello" before we send.
+  await new Promise((r) => setTimeout(r, 100))
+
+  const sender = await makeClient('mon-snd-late')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'mon-snd-late', cc_session_id: 'cc-mon-snd-late' },
+  })
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'mon-rcp-late', message: 'hi there' },
+  })
+
+  const { lines } = await linesPromise
+  expect(lines[0]).toBe('hello mon-rcp-late')
+  const inboxLine = lines.find((l) => l.startsWith('inbox '))
+  expect(inboxLine).toBe('inbox 1 mon-rcp-late')
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('/monitor fires on broadcast as well as direct send', async () => {
+  const recipient = await makeClient('mon-rcp-bcast')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'mon-rcp-bcast', cc_session_id: 'cc-mon-rcp-bcast' },
+  })
+
+  const linesPromise = collectLines(
+    `${MONITOR_URL}?cc_session_id=cc-mon-rcp-bcast`,
+    (ls) => ls.some((l) => l.startsWith('inbox ')),
+    4_000,
+  )
+
+  await new Promise((r) => setTimeout(r, 100))
+
+  const sender = await makeClient('mon-snd-bcast')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'mon-snd-bcast', cc_session_id: 'cc-mon-snd-bcast' },
+  })
+  await sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'hi everyone' },
+  })
+
+  const { lines } = await linesPromise
+  expect(lines.find((l) => l.startsWith('inbox '))).toMatch(/^inbox \d+ mon-rcp-bcast$/)
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('/monitor abort releases the waiter so cancelAll isn\'t stuck on shutdown', async () => {
+  // This test primarily guards against a regression where /monitor leaks
+  // waiters — if the AbortSignal wasn't wired through, handle.stop() in
+  // afterEach would hang. We just exercise open+close.
+  const recipient = await makeClient('mon-abort')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'mon-abort', cc_session_id: 'cc-mon-abort' },
+  })
+
+  const controller = new AbortController()
+  const resp = await fetch(`${MONITOR_URL}?cc_session_id=cc-mon-abort`, {
+    signal: controller.signal,
+  })
+  expect(resp.status).toBe(200)
+
+  // read first line then abort
+  const reader = resp.body!.getReader()
+  const { value } = await reader.read()
+  expect(new TextDecoder().decode(value)).toContain('hello mon-abort')
+  controller.abort()
+
+  await recipient.close()
+})
