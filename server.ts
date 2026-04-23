@@ -498,7 +498,15 @@ export async function startServer(opts: {
    *   hello <alias>            -> fired once on connect when inbox is empty
    *   inbox <n> <alias>        -> fired once on connect if already unread, and
    *                               every time a new message arrives for this cc
-   *   heartbeat <iso-ts>       -> fired on 240s idle to beat Bun's idleTimeout
+   *
+   * Idle keep-alive: every 240s we write a single space byte (no newline)
+   * so the TCP connection stays warm against Bun's 255s idleTimeout, but
+   * Monitor — which is line-buffered — does not emit a notification. Once
+   * every HEARTBEAT_LINE_EVERY (~32 min) we *do* emit a real
+   * `heartbeat <iso-ts>` line, so subscribed sessions get an occasional
+   * time tick to ground them in real time without being woken every 4 min.
+   * Earlier versions emitted the line every 240s, which woke every
+   * connected session every four minutes for nothing.
    *
    * Unlike /poll (one-shot long-poll that the shim loops), /monitor is
    * persistent — one HTTP connection for the lifetime of the session. The
@@ -533,6 +541,14 @@ export async function startServer(opts: {
             return true
           } catch { return false }
         }
+        // Single byte, no newline — keeps the socket warm without emitting
+        // a Monitor-tool line (subscribers stay asleep).
+        const writeKeepalive = (): boolean => {
+          try {
+            controller.enqueue(encoder.encode(' '))
+            return true
+          } catch { return false }
+        }
 
         // Opening the stream counts as activity; retention should not sweep us.
         updateLastActivity(db, sessionId)
@@ -547,17 +563,30 @@ export async function startServer(opts: {
           write(`hello ${alias}`)
         }
 
-        // Event loop: block on waiter, emit one line per resolution,
-        // re-subscribe. Heartbeat when waiter resolves by timeout so Bun's
-        // idleTimeout (255s) doesn't cut the connection.
+        // Event loop: block on waiter, emit one line on real activity,
+        // re-subscribe. On waiter timeout (no new messages within
+        // HEARTBEAT_MS) write a silent keep-alive byte so Bun's idleTimeout
+        // doesn't cut us and idle subscribers don't wake. Every
+        // HEARTBEAT_LINE_EVERY ticks (~32 min) emit a visible heartbeat
+        // line instead, so subscribed sessions get an occasional ground-truth
+        // timestamp without being pinged every 4 min.
         const HEARTBEAT_MS = 240_000
+        const HEARTBEAT_LINE_EVERY = 8
+        let silentTicks = 0
         while (!req.signal.aborted) {
           await waiters.wait(sessionId, ccSessionId, HEARTBEAT_MS, req.signal)
           if (req.signal.aborted) break
           const count = countUnreadBySessionId(db, sessionId)
-          const ok = count > 0
-            ? write(`inbox ${count} ${alias}`)
-            : write(`heartbeat ${new Date().toISOString()}`)
+          let ok: boolean
+          if (count > 0) {
+            ok = write(`inbox ${count} ${alias}`)
+            silentTicks = 0
+          } else if (++silentTicks >= HEARTBEAT_LINE_EVERY) {
+            ok = write(`heartbeat ${new Date().toISOString()}`)
+            silentTicks = 0
+          } else {
+            ok = writeKeepalive()
+          }
           if (!ok) break
           updateLastActivity(db, sessionId)
         }

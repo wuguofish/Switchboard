@@ -48,7 +48,11 @@ is the dedicated wake path — no Stop-hook shim required:
 Each line on the stream becomes a notification:
   hello <alias>             -> baseline on connect, no action needed
   inbox <N> <alias>         -> unread waiting; call mcp__switchboard__read_messages
-  heartbeat <iso-ts>        -> keep-alive; ignore
+  heartbeat <iso-ts>        -> ~32-min time tick; just a clock signal, no
+                               action needed (don't reply with "Heartbeat OK")
+
+The 240s TCP keep-alive is a single space byte without a newline, so the
+Monitor tool stays silent between heartbeat lines.
 
 The \`while :; do ... sleep 5; done\` wrapper auto-reconnects if the daemon
 restarts. Skip subscribing only if you're staying anonymous.`
