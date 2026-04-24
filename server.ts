@@ -582,7 +582,10 @@ export async function startServer(opts: {
             ok = write(`inbox ${count} ${alias}`)
             silentTicks = 0
           } else if (++silentTicks >= HEARTBEAT_LINE_EVERY) {
-            ok = write(`heartbeat ${new Date().toISOString()}`)
+            // Asia/Taipei (+08:00) — matches the rest of the API surface
+            // (DB stores UTC, human-facing lines / API responses are
+            // converted via toTaipeiISOString — see CLAUDE.md "Time").
+            ok = write(`heartbeat ${toTaipeiISOString(new Date().toISOString())}`)
             silentTicks = 0
           } else {
             ok = writeKeepalive()
