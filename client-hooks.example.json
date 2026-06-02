@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "bun C:/path/to/Switchboard/hook-session-start.ts"
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/path/to/Switchboard/poller-shim.ps1",
+        "async": true,
+        "asyncRewake": true
+      }]
+    }]
+  }
+}
