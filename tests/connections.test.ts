@@ -23,6 +23,17 @@ test('unregister removes session', () => {
   expect(registry.isOnline('uuid-1')).toBe(false)
 })
 
+test('unregister with an older callback preserves the replacement connection', () => {
+  const older = () => {}
+  const current = () => {}
+  registry.register('uuid-1', older)
+  registry.register('uuid-1', current)
+
+  registry.unregister('uuid-1', older)
+
+  expect(registry.isOnline('uuid-1')).toBe(true)
+})
+
 test('pushNotification invokes callback for online target', () => {
   const pushed: any[] = []
   registry.register('uuid-1', (payload) => { pushed.push(payload) })
@@ -40,6 +51,7 @@ test('pushNotification returns false when callback throws (connection broken)', 
   registry.register('uuid-1', () => { throw new Error('broken') })
   const ok = registry.pushNotification('uuid-1', { sender_alias: 'alice' })
   expect(ok).toBe(false)
+  expect(registry.isOnline('uuid-1')).toBe(false)
 })
 
 test('listOnline returns all registered session_ids', () => {

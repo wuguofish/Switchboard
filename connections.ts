@@ -14,7 +14,8 @@ export class ConnectionRegistry {
     this.connections.set(session_id, callback)
   }
 
-  unregister(session_id: string): void {
+  unregister(session_id: string, callback?: PushCallback): void {
+    if (callback && this.connections.get(session_id) !== callback) return
     this.connections.delete(session_id)
   }
 
@@ -29,6 +30,9 @@ export class ConnectionRegistry {
       cb(payload)
       return true
     } catch (err) {
+      if (this.connections.get(session_id) === cb) {
+        this.connections.delete(session_id)
+      }
       process.stderr.write(`switchboard: push failed for ${session_id}: ${err}\n`)
       return false
     }

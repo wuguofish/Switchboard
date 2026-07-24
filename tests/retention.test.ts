@@ -3,19 +3,35 @@ import { openDatabase, createSession, findSessionByAlias, releaseStaleActiveSess
 import { ConnectionRegistry } from '../connections'
 import { startRetentionLoop } from '../retention'
 
-test('retention sessionsTick releases stale sessions on initial run', () => {
+test('retention sessionsTick releases sessions whose lease expired over 24 hours ago', () => {
   const db = openDatabase(':memory:')
   const registry = new ConnectionRegistry()
 
   const stale = createSession(db, { alias: 'ghost' })
-  // Backdate so stale threshold (5 min in retention.ts) is exceeded.
-  const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString()
-  db.query('UPDATE sessions SET last_activity = ? WHERE id = ?').run(tenMinAgo, stale)
+  const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60_000).toISOString()
+  db.query('UPDATE sessions SET last_activity = ? WHERE id = ?').run(twoDaysAgo, stale)
 
   const handle = startRetentionLoop(db, registry)
   try {
     // startRetentionLoop runs tick synchronously once on start.
     expect(findSessionByAlias(db, 'ghost')).toBeNull()
+  } finally {
+    handle.stop()
+    db.close()
+  }
+})
+
+test('retention sessionsTick preserves a lease that expired less than 24 hours ago', () => {
+  const db = openDatabase(':memory:')
+  const registry = new ConnectionRegistry()
+  const recent = createSession(db, { alias: 'recently-offline' })
+  const oneHourAgo = new Date(Date.now() - 60 * 60_000).toISOString()
+  db.query('UPDATE sessions SET last_activity = ?, last_seen_at = ? WHERE id = ?')
+    .run(oneHourAgo, oneHourAgo, recent)
+
+  const handle = startRetentionLoop(db, registry)
+  try {
+    expect(findSessionByAlias(db, 'recently-offline')?.id).toBe(recent)
   } finally {
     handle.stop()
     db.close()

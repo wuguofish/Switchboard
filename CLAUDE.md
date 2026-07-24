@@ -90,7 +90,7 @@ Phase 2 的 `switchboard-role.txt` 已刪除（靜態 config signal 不再需要
 
 ### Troubleshooting
 
-- **Session 沒被自動喚醒** → 確認 Claude 在第一輪有呼叫 `register(role, cc_session_id)`；DB 裡 `SELECT * FROM sessions WHERE cc_session_id = 'xxx'` 應該看到 active row
+- **Session 沒被自動喚醒** → 確認 Claude 在第一輪有呼叫 `register(role, cc_session_id)`；DB 裡 `SELECT * FROM sessions WHERE client_kind = 'claude_code' AND client_session_id = 'xxx'` 應該看到 active row
 - **Role collision** → 另一個 active session 正在用同樣的 role。換名字或等對方 disconnect
 - **Orphan poller** → shim 啟動時往上 walk parent chain 找 `claude.exe`（或 `node.exe`），用它的 pid 當 liveness target，而**不是** immediate parent（那是 bash.exe，會 wait shim child 結束所以永遠活）。Claude Code 死 → shim 下個 loop tick 檢查 claude.exe pid 失敗 → exit 0。舊版 `bun poller.ts` 同樣有 parent-pid check，失靈時 fallback 24 小時 TTL
 - **Shim 堆積（同一 cc_session_id 多個 shim 同時 polling）** → 每個 turn Stop hook 都會 fire 新 shim；新 shim 啟動時讀 `<state_dir>/switchboard-shim-<cc_session_id>.lock`，殺掉舊 shim 後寫入自己 pid。所以每個 cc 最多一個 shim 活著

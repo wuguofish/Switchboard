@@ -18,12 +18,14 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, updateLastActivity, releaseSession, reactivateSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
-import { ConnectionRegistry } from './connections'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
+import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
+import type { BroadcastScope, ClientKind, SessionRow } from './types'
+import { isSessionOnline } from './online'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -32,6 +34,78 @@ export interface ServerHandle {
 interface SessionEntry {
   transport: WebStandardStreamableHTTPServerTransport
   mcpServer: Server
+}
+
+const CLIENT_KINDS: readonly ClientKind[] = ['claude_code', 'codex', 'external']
+const BROADCAST_SCOPES: readonly BroadcastScope[] = ['all', 'same_kind', 'same_cwd']
+
+class RequestValidationError extends Error {}
+
+function requireBroadcastScope(value: unknown): BroadcastScope {
+  if (value === undefined) return 'all'
+  if (
+    typeof value !== 'string' ||
+    !BROADCAST_SCOPES.includes(value as BroadcastScope)
+  ) {
+    throw new Error(`scope must be one of: ${BROADCAST_SCOPES.join(', ')}`)
+  }
+  return value as BroadcastScope
+}
+
+function matchesBroadcastScope(
+  sender: SessionRow,
+  recipient: SessionRow,
+  scope: BroadcastScope,
+): boolean {
+  if (scope === 'all') return true
+  if (scope === 'same_kind') {
+    return recipient.client_kind === sender.client_kind
+  }
+  return (
+    sender.cwd !== null &&
+    recipient.cwd !== null &&
+    recipient.cwd === sender.cwd
+  )
+}
+
+function requireJsonObject(body: unknown): Record<string, unknown> {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new RequestValidationError('request body must be a JSON object')
+  }
+  return body as Record<string, unknown>
+}
+
+function requireNonEmptyString(
+  body: Record<string, unknown>,
+  field: string,
+): string {
+  const value = body[field]
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new RequestValidationError(
+      `${field} is required and must be a non-empty string`,
+    )
+  }
+  return value.trim()
+}
+
+function requireClientKind(body: Record<string, unknown>): ClientKind {
+  const value = body.client_kind
+  if (typeof value !== 'string' || !CLIENT_KINDS.includes(value as ClientKind)) {
+    throw new RequestValidationError(
+      `client_kind must be one of: ${CLIENT_KINDS.join(', ')}`,
+    )
+  }
+  return value as ClientKind
+}
+
+function requireGeneration(body: Record<string, unknown>): number {
+  const value = body.generation
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new RequestValidationError(
+      'generation is required and must be a positive integer',
+    )
+  }
+  return value as number
 }
 
 export async function startServer(opts: {
@@ -43,20 +117,6 @@ export async function startServer(opts: {
   const retention = startRetentionLoop(db, registry)
   const waiters = new UnreadWaiterRegistry()
 
-  // "recipient can be auto-woken" — true iff a curl shim is currently
-  // long-polling /poll for this cc_session_id. A shim in /poll guarantees
-  // the daemon will push the message the moment insertMessage completes.
-  //
-  // Previously this also fell back to poller.ts's state-file check
-  // (legacy bun-based poller). That was removed because: (1) the shim
-  // doesn't write state files, so on a stale file the pid may have been
-  // reused by an unrelated process, yielding false positives; (2) the
-  // in-memory polling set is the truthful signal.
-  const canAutoWake = (ccSessionId: string | null | undefined): boolean => {
-    if (!ccSessionId) return false
-    return waiters.isPolling(ccSessionId)
-  }
-
   const getOrCreateExternalSender = (alias: string): string => {
     const existing = findSessionByAlias(db, alias)
     if (existing) {
@@ -64,6 +124,92 @@ export async function startServer(opts: {
       return existing.id
     }
     return createSession(db, { alias, cc_session_id: null })
+  }
+
+  async function parseJsonBody(req: Request): Promise<Record<string, unknown>> {
+    let parsed: unknown
+    try {
+      parsed = await req.json()
+    } catch {
+      throw new RequestValidationError('invalid JSON body')
+    }
+    return requireJsonObject(parsed)
+  }
+
+  async function handleRegister(req: Request): Promise<Response> {
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+
+    try {
+      const body = await parseJsonBody(req)
+      const alias = requireNonEmptyString(body, 'alias')
+      const client_kind = requireClientKind(body)
+      const client_session_id = requireNonEmptyString(body, 'client_session_id')
+      const cwd = requireNonEmptyString(body, 'cwd')
+      const session = registerClientSession(db, {
+        alias,
+        client_kind,
+        client_session_id,
+        cwd,
+      })
+      return Response.json({
+        session_id: session.id,
+        alias: session.alias,
+        generation: session.generation,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof RequestValidationError) {
+        return Response.json({ error: message }, { status: 400 })
+      }
+      if (message.startsWith('alias already taken:')) {
+        return Response.json({ error: message }, { status: 409 })
+      }
+      return Response.json({ error: 'internal server error' }, { status: 500 })
+    }
+  }
+
+  async function handleUnregister(req: Request): Promise<Response> {
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+
+    try {
+      const body = await parseJsonBody(req)
+      const client_kind = requireClientKind(body)
+      const client_session_id = requireNonEmptyString(body, 'client_session_id')
+      const generation = requireGeneration(body)
+      const result = unregisterClientSession(db, {
+        client_kind,
+        client_session_id,
+        generation,
+      })
+
+      if (result === 'not_found') {
+        return Response.json({ error: 'session not found' }, { status: 404 })
+      }
+      if (result === 'generation_mismatch') {
+        const current = findAnySessionByClientSessionId(
+          db,
+          client_kind,
+          client_session_id,
+        )
+        return Response.json(
+          {
+            error: `generation mismatch: current generation is ${current?.generation ?? 'unknown'}`,
+          },
+          { status: 409 },
+        )
+      }
+      return Response.json({ status: result })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof RequestValidationError) {
+        return Response.json({ error: message }, { status: 400 })
+      }
+      return Response.json({ error: 'internal server error' }, { status: 500 })
+    }
   }
 
   async function handleExternalSend(req: Request): Promise<Response> {
@@ -106,7 +252,8 @@ export async function startServer(opts: {
       const recipient = findSessionById(db, targetId)
       return Response.json({
         message_id,
-        delivered_notification: pushed && canAutoWake(recipient?.cc_session_id),
+        delivered_notification:
+          pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
       })
     } catch (e) {
       return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 })
@@ -130,6 +277,8 @@ export async function startServer(opts: {
   function createMcpSession(): WebStandardStreamableHTTPServerTransport {
     // Current switchboard session ID for this MCP session (set by register tool)
     let currentSwitchboardId: string | null = null
+    let currentGeneration: number | null = null
+    let currentPushCallback: PushCallback | null = null
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
@@ -147,8 +296,12 @@ export async function startServer(opts: {
         mcpSessionToSwitchboard.delete(mcpSessionId)
       }
       if (currentSwitchboardId) {
-        releaseSession(db, currentSwitchboardId)
-        registry.unregister(currentSwitchboardId)
+        if (currentPushCallback) {
+          registry.unregister(currentSwitchboardId, currentPushCallback)
+        }
+        if (currentGeneration !== null) {
+          releaseSessionIfGeneration(db, currentSwitchboardId, currentGeneration)
+        }
       }
     }
 
@@ -213,10 +366,20 @@ export async function startServer(opts: {
         },
         {
           name: 'broadcast',
-          description: 'Send to all currently registered sessions (except self).',
+          description: 'Broadcast to active sessions selected by scope (except self).',
           inputSchema: {
             type: 'object' as const,
-            properties: { message: { type: 'string' } },
+            properties: {
+              message: { type: 'string' },
+              scope: {
+                type: 'string',
+                enum: BROADCAST_SCOPES,
+                default: 'all',
+                description:
+                  'all: every active session; same_kind: sender client_kind; ' +
+                  'same_cwd: equal non-NULL cwd.',
+              },
+            },
             required: ['message'],
           },
         },
@@ -261,41 +424,19 @@ export async function startServer(opts: {
         const cc_session_id = (argsObj.cc_session_id as string | undefined) ?? null
 
         let sessionId: string
+        let generation: number
 
         if (cc_session_id) {
-          // Phase 2.5 path: idempotent by cc_session_id.
-          // Use findAnySessionByCcSessionId to also find released rows so a
-          // reconnecting session can reactivate its original row.
-          const existing = findAnySessionByCcSessionId(db, cc_session_id)
-          if (existing) {
-            sessionId = existing.id
-            const isReleased = existing.released_at != null
-            if (isReleased) {
-              // Row was released on disconnect — reactivate it with the requested alias.
-              // Check for alias collision against other currently-active rows.
-              const targetAlias = role ?? existing.alias
-              if (targetAlias !== null) {
-                const conflict = findSessionByAlias(db, targetAlias)
-                if (conflict && conflict.id !== sessionId) {
-                  throw new Error(`alias already taken: ${targetAlias}`)
-                }
-              }
-              reactivateSession(db, sessionId, targetAlias)
-            } else if (role !== null && role !== existing.alias) {
-              // Active row — treat as a rename; throws AliasCollisionError if taken
-              setAliasWithCollisionCheck(db, sessionId, role)
-            }
-            updateLastActivity(db, sessionId)
-          } else {
-            // New session: validate role collision before insert
-            if (role !== null) {
-              const conflict = findSessionByAlias(db, role)
-              if (conflict) {
-                throw new Error(`alias already taken: ${role}`)
-              }
-            }
-            sessionId = createSession(db, { alias: role, cc_session_id })
-          }
+          // Durable Claude Code identities share the same generation-aware
+          // upsert semantics as HTTP peers. The MCP response shape remains
+          // unchanged for backward compatibility.
+          const registered = registerClientSession(db, {
+            alias: role,
+            client_kind: 'claude_code',
+            client_session_id: cc_session_id,
+          })
+          sessionId = registered.id
+          generation = registered.generation
         } else {
           // Phase 1 fallback path: no cc_session_id means every call is a fresh session
           if (role !== null) {
@@ -305,14 +446,16 @@ export async function startServer(opts: {
             }
           }
           sessionId = createSession(db, { alias: role, cc_session_id: null })
+          generation = findSessionById(db, sessionId)!.generation
         }
 
         currentSwitchboardId = sessionId
+        currentGeneration = generation
         if (transport.sessionId) {
           mcpSessionToSwitchboard.set(transport.sessionId, sessionId)
         }
 
-        registry.register(sessionId, (payload) => {
+        const pushCallback: PushCallback = (payload) => {
           mcpServer
             .notification({
               method: 'notifications/switchboard/new_message',
@@ -324,14 +467,13 @@ export async function startServer(opts: {
               // Drop the leaked registry entry so list_sessions stops
               // reporting this session as online; retention will release
               // the DB row on its next tick.
-              registry.unregister(sessionId)
+              registry.unregister(sessionId, pushCallback)
             })
-        })
+        }
+        currentPushCallback = pushCallback
+        registry.register(sessionId, pushCallback)
 
-        const finalAlias =
-          cc_session_id && role === null
-            ? findSessionById(db, sessionId)?.alias ?? null
-            : role
+        const finalAlias = findSessionById(db, sessionId)?.alias ?? null
         const anonymous = finalAlias === null
         const responseBody: Record<string, unknown> = {
           session_id: sessionId,
@@ -395,18 +537,14 @@ export async function startServer(opts: {
         // returns immediately with SWITCHBOARD INBOX. Safe to call even if
         // no waiter exists.
         waiters.notify(targetId)
-        // delivered_notification promises "the recipient will notice this
-        // without user intervention" — that requires a live transport
-        // (pushed) and a live auto-wake path (bun poller state file OR an
-        // active curl long-poll). Anonymous / Phase 1 recipients with no
-        // cc_session_id always get false — the honest answer.
         const recipient = findSessionById(db, targetId)
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
               message_id,
-              delivered_notification: pushed && canAutoWake(recipient?.cc_session_id),
+              delivered_notification:
+                pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
             }),
           }],
         }
@@ -414,24 +552,41 @@ export async function startServer(opts: {
 
       if (name === 'broadcast') {
         if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
-        const message = (args as Record<string, unknown>)?.message as string
+        const argsObj = (args as Record<string, unknown>) ?? {}
+        const message = argsObj.message as string
+        const scope = requireBroadcastScope(argsObj.scope)
         const sender = findSessionById(db, currentSwitchboardId)
+        if (!sender) throw new Error('registered sender session not found')
+        const recipients = listAllSessions(db).filter((recipient) => (
+          recipient.id !== currentSwitchboardId &&
+          recipient.released_at === null &&
+          matchesBroadcastScope(sender, recipient, scope) &&
+          (
+            recipient.client_kind !== 'codex' ||
+            isSessionOnline(recipient, registry, waiters)
+          )
+        ))
         const { broadcast_id, recipient_count, recipient_ids } = insertBroadcast(db, {
           sender_id: currentSwitchboardId,
+          recipient_ids: recipients.map((recipient) => recipient.id),
           content: message,
         })
         // Wake every long-poll waiter that just got a new message row.
         waiters.notifyMany(recipient_ids)
-        const onlineIds = registry.listOnline().filter(id => id !== currentSwitchboardId)
         let notified_count = 0
-        for (const id of onlineIds) {
+        for (const id of recipient_ids) {
           const pushed = registry.pushNotification(id, {
             sender_alias: sender?.alias ?? null,
             sender_id: currentSwitchboardId,
             is_broadcast: true,
           })
           const recipient = findSessionById(db, id)
-          if (pushed && canAutoWake(recipient?.cc_session_id)) notified_count++
+          if (
+            pushed ||
+            (recipient ? isSessionOnline(recipient, registry, waiters) : false)
+          ) {
+            notified_count++
+          }
         }
         return {
           content: [{
@@ -451,6 +606,7 @@ export async function startServer(opts: {
             id: m.id,
             sender_id: m.sender_id,
             sender_alias: senderRow?.alias ?? null,
+            reply_to: m.reply_to,
             content: m.content,
             created_at: toTaipeiISOString(m.created_at),
             is_broadcast: m.broadcast_id !== null,
@@ -466,7 +622,7 @@ export async function startServer(opts: {
         const result = all.map(s => ({
           session_id: s.id,
           alias: s.alias,
-          online: registry.isOnline(s.id),
+          online: isSessionOnline(s, registry, waiters),
           created_at: toTaipeiISOString(s.created_at),
           last_activity: toTaipeiISOString(s.last_activity),
         }))
@@ -490,15 +646,28 @@ export async function startServer(opts: {
             content: [{ type: 'text', text: JSON.stringify({ status: 'already_offline' }) }],
           }
         }
-        const releasedAlias = findSessionById(db, currentSwitchboardId)?.alias ?? null
-        releaseSession(db, currentSwitchboardId)
-        registry.unregister(currentSwitchboardId)
+        // Generation guard: if a newer transport re-registered this identity,
+        // a stale transport's explicit unregister must not release the new
+        // generation's row — mirror the transport.onclose cleanup semantics.
+        if (currentPushCallback) {
+          registry.unregister(currentSwitchboardId, currentPushCallback)
+        }
+        const priorAlias = findSessionById(db, currentSwitchboardId)?.alias ?? null
+        const released =
+          currentGeneration !== null &&
+          releaseSessionIfGeneration(db, currentSwitchboardId, currentGeneration)
         currentSwitchboardId = null
+        currentGeneration = null
+        currentPushCallback = null
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ status: 'released', released_alias: releasedAlias }),
+              text: JSON.stringify(
+                released
+                  ? { status: 'released', released_alias: priorAlias }
+                  : { status: 'stale_ignored', released_alias: null },
+              ),
             },
           ],
         }
@@ -516,7 +685,7 @@ export async function startServer(opts: {
   }
 
   /**
-   * GET /poll?cc_session_id=X&timeout_s=N
+   * GET /poll?client_kind=K&client_session_id=X&timeout_s=N
    *
    * Long-poll endpoint for Stop-hook shim scripts. Replaces bun poller.ts —
    * the shim calls this and blocks on the daemon instead of running its own
@@ -534,19 +703,48 @@ export async function startServer(opts: {
       return new Response('Method Not Allowed', { status: 405 })
     }
     const ccSessionId = url.searchParams.get('cc_session_id')
-    if (!ccSessionId) {
-      return new Response('Missing cc_session_id', { status: 400 })
+    const canonicalSessionId = url.searchParams.get('client_session_id')
+    const canonicalKind = url.searchParams.get('client_kind')
+    if (ccSessionId && (canonicalSessionId || canonicalKind)) {
+      return new Response(
+        'Use either cc_session_id or client_kind + client_session_id',
+        { status: 400 },
+      )
+    }
+
+    let clientKind: ClientKind
+    let clientSessionId: string
+    if (ccSessionId) {
+      clientKind = 'claude_code'
+      clientSessionId = ccSessionId
+    } else {
+      if (!canonicalSessionId) {
+        return new Response('Missing client_session_id', { status: 400 })
+      }
+      if (!canonicalKind) {
+        return new Response('Missing client_kind', { status: 400 })
+      }
+      if (!CLIENT_KINDS.includes(canonicalKind as ClientKind)) {
+        return new Response(
+          `Invalid client_kind; expected one of: ${CLIENT_KINDS.join(', ')}`,
+          { status: 400 },
+        )
+      }
+      clientKind = canonicalKind as ClientKind
+      clientSessionId = canonicalSessionId
     }
     const timeoutRaw = url.searchParams.get('timeout_s') ?? '240'
     const parsed = parseInt(timeoutRaw, 10)
     const timeoutS = Math.min(Math.max(Number.isFinite(parsed) ? parsed : 240, 1), 250)
 
-    const session = findSessionByCcSessionId(db, ccSessionId)
+    const session = findSessionByClientSessionId(db, clientKind, clientSessionId)
     if (!session || !session.alias) {
       return Response.json({ status: 'no-session' })
     }
 
-    // A live curl long-poll counts as activity for retention purposes.
+    // Every valid poll renews the client's lease, including immediate unread
+    // responses that never enter the waiter registry.
+    updateLastSeen(db, session.id)
     updateLastActivity(db, session.id)
 
     const initial = countUnreadBySessionId(db, session.id)
@@ -559,7 +757,13 @@ export async function startServer(opts: {
       })
     }
 
-    await waiters.wait(session.id, ccSessionId, timeoutS * 1000, req.signal)
+    await waiters.wait(
+      session.id,
+      clientKind,
+      clientSessionId,
+      timeoutS * 1000,
+      req.signal,
+    )
     // Re-check: the waiter may have resolved because of a new message, a
     // timeout, or a client abort. Only the first case yields status=unread.
     const final = countUnreadBySessionId(db, session.id)
@@ -595,9 +799,8 @@ export async function startServer(opts: {
    *
    * Unlike /poll (one-shot long-poll that the shim loops), /monitor is
    * persistent — one HTTP connection for the lifetime of the session. The
-   * side effect of calling waiters.wait() here is that `canAutoWake` sees
-   * this cc_session_id as polling, so sender-side `delivered_notification`
-   * stays honest.
+   * side effect of calling waiters.wait() here is that the shared online
+   * predicate sees this Claude Code identity as polling.
    */
   async function handleMonitor(req: Request, url: URL): Promise<Response> {
     if (req.method !== 'GET') {
@@ -659,7 +862,13 @@ export async function startServer(opts: {
         const HEARTBEAT_LINE_EVERY = 30
         let silentTicks = 0
         while (!req.signal.aborted) {
-          await waiters.wait(sessionId, ccSessionId, HEARTBEAT_MS, req.signal)
+          await waiters.wait(
+            sessionId,
+            'claude_code',
+            ccSessionId,
+            HEARTBEAT_MS,
+            req.signal,
+          )
           if (req.signal.aborted) break
           const count = countUnreadBySessionId(db, sessionId)
           let ok: boolean
@@ -718,6 +927,14 @@ export async function startServer(opts: {
 
       if (url.pathname === '/external/send') {
         return handleExternalSend(req)
+      }
+
+      if (url.pathname === '/register') {
+        return handleRegister(req)
+      }
+
+      if (url.pathname === '/unregister') {
+        return handleUnregister(req)
       }
 
       if (url.pathname !== '/mcp') {

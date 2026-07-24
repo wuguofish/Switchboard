@@ -1,14 +1,20 @@
 // All shared types for switchboard. No runtime code here.
 
 export type SessionId = string  // UUID
+export type ClientKind = 'claude_code' | 'codex' | 'external'
+export type BroadcastScope = 'all' | 'same_kind' | 'same_cwd'
 
 export interface SessionRow {
   id: SessionId
   alias: string | null
-  cc_session_id?: string | null
+  client_kind: ClientKind
+  client_session_id: string | null
+  cwd: string | null
   created_at: string    // ISO 8601 UTC
   last_activity: string // ISO 8601 UTC
-  released_at?: string | null // ISO 8601 UTC; NULL means active
+  last_seen_at: string | null // ISO 8601 UTC
+  generation: number
+  released_at: string | null // ISO 8601 UTC; NULL means active
 }
 
 export interface MessageRow {
@@ -16,6 +22,7 @@ export interface MessageRow {
   sender_id: SessionId
   recipient_id: SessionId
   broadcast_id: string | null
+  reply_to: string | null
   content: string
   created_at: string   // ISO 8601 UTC
   read_at: string | null
@@ -33,6 +40,7 @@ export interface MessagePublic {
   id: string
   sender_id: SessionId
   sender_alias: string | null
+  reply_to: string | null
   content: string
   created_at: string   // ISO 8601 Asia/Taipei (API response)
   is_broadcast: boolean

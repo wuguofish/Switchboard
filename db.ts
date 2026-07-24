@@ -3,32 +3,80 @@ import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
-import type { SessionRow, MessageRow } from './types'
+import type { ClientKind, SessionRow, MessageRow } from './types'
 import { nowUtc } from './time'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+function tableExists(db: Database, table: string): boolean {
+  return db
+    .query<{ name: string }, [string]>(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`,
+    )
+    .get(table) != null
+}
+
+function columnNames(db: Database, table: string): Set<string> {
+  return new Set(
+    db
+      .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+      .all()
+      .map((column) => column.name),
+  )
+}
+
+function migrateSchema(db: Database): void {
+  if (!tableExists(db, 'sessions')) return
+
+  db.transaction(() => {
+    const sessionColumns = columnNames(db, 'sessions')
+
+    if (sessionColumns.has('cc_session_id') && !sessionColumns.has('client_session_id')) {
+      db.exec('ALTER TABLE sessions RENAME COLUMN cc_session_id TO client_session_id')
+      sessionColumns.delete('cc_session_id')
+      sessionColumns.add('client_session_id')
+    }
+    if (!sessionColumns.has('client_session_id')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN client_session_id TEXT')
+      sessionColumns.add('client_session_id')
+    }
+    if (!sessionColumns.has('client_kind')) {
+      db.exec(`ALTER TABLE sessions ADD COLUMN client_kind TEXT NOT NULL DEFAULT 'claude_code'`)
+    }
+    if (!sessionColumns.has('cwd')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN cwd TEXT')
+    }
+    if (!sessionColumns.has('last_seen_at')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN last_seen_at TEXT')
+    }
+    if (!sessionColumns.has('generation')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1')
+    }
+    if (!sessionColumns.has('released_at')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN released_at TEXT')
+    }
+
+    db.exec('DROP INDEX IF EXISTS idx_sessions_cc_session_id_active')
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_client_identity_active
+      ON sessions(client_kind, client_session_id)
+      WHERE client_session_id IS NOT NULL AND released_at IS NULL
+    `)
+
+    if (tableExists(db, 'messages')) {
+      const messageColumns = columnNames(db, 'messages')
+      if (!messageColumns.has('reply_to')) {
+        db.exec('ALTER TABLE messages ADD COLUMN reply_to TEXT')
+      }
+    }
+  })()
+}
 
 export function openDatabase(path: string): Database {
   const db = new Database(path)
   db.exec('PRAGMA foreign_keys = ON')
   db.exec('PRAGMA journal_mode = WAL')
-
-  // Migration guard: if sessions table exists but missing Phase 2.5 columns,
-  // drop sessions + messages (they will be rebuilt from schema.sql).
-  const tableExists = db
-    .query<{ name: string }, [string]>(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
-    .get('sessions')
-  if (tableExists) {
-    const cols = db.query<{ name: string }, []>(`PRAGMA table_info(sessions)`).all()
-    const colNames = new Set(cols.map((c) => c.name))
-    const needsMigration = !colNames.has('cc_session_id') || !colNames.has('released_at')
-    if (needsMigration) {
-      db.transaction(() => {
-        db.exec(`DROP TABLE IF EXISTS messages`)
-        db.exec(`DROP TABLE IF EXISTS sessions`)
-      })()
-    }
-  }
+  migrateSchema(db)
 
   const schemaPath = join(__dirname, 'schema.sql')
   const schema = readFileSync(schemaPath, 'utf8')
@@ -40,28 +88,73 @@ export function createSession(
   db: Database,
   opts: { alias: string | null; cc_session_id?: string | null },
 ): string {
+  return createClientSession(db, {
+    alias: opts.alias,
+    client_kind: 'claude_code',
+    client_session_id: opts.cc_session_id,
+  })
+}
+
+export function createClientSession(
+  db: Database,
+  opts: {
+    alias: string | null
+    client_kind: ClientKind
+    client_session_id?: string | null
+    cwd?: string | null
+  },
+): string {
   const id = randomUUID()
   const now = nowUtc()
   db.query(`
-    INSERT INTO sessions (id, alias, cc_session_id, created_at, last_activity, released_at)
-    VALUES (?, ?, ?, ?, ?, NULL)
-  `).run(id, opts.alias, opts.cc_session_id ?? null, now, now)
+    INSERT INTO sessions (
+      id, alias, client_kind, client_session_id, cwd,
+      created_at, last_activity, last_seen_at, generation, released_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL)
+  `).run(
+    id,
+    opts.alias,
+    opts.client_kind,
+    opts.client_session_id ?? null,
+    opts.cwd ?? null,
+    now,
+    now,
+  )
   return id
 }
 
 export function findSessionById(db: Database, id: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
-    'SELECT id, alias, cc_session_id, created_at, last_activity FROM sessions WHERE id = ?'
+    `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
+            last_activity, last_seen_at, generation, released_at
+     FROM sessions
+     WHERE id = ?`,
   ).get(id)
   return row ?? null
 }
 
 export function findSessionByAlias(db: Database, alias: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
-    `SELECT id, alias, cc_session_id, created_at, last_activity
+    `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
+            last_activity, last_seen_at, generation, released_at
      FROM sessions
      WHERE alias = ? AND released_at IS NULL`,
   ).get(alias)
+  return row ?? null
+}
+
+export function findSessionByClientSessionId(
+  db: Database,
+  client_kind: ClientKind,
+  client_session_id: string,
+): SessionRow | null {
+  const row = db.query<SessionRow, [ClientKind, string]>(
+    `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
+            last_activity, last_seen_at, generation, released_at
+     FROM sessions
+     WHERE client_kind = ? AND client_session_id = ? AND released_at IS NULL`,
+  ).get(client_kind, client_session_id)
   return row ?? null
 }
 
@@ -69,34 +162,148 @@ export function findSessionByCcSessionId(
   db: Database,
   cc_session_id: string,
 ): SessionRow | null {
-  const row = db.query<SessionRow, [string]>(
-    `SELECT id, alias, cc_session_id, created_at, last_activity
-     FROM sessions
-     WHERE cc_session_id = ? AND released_at IS NULL`,
-  ).get(cc_session_id)
-  return row ?? null
+  return findSessionByClientSessionId(db, 'claude_code', cc_session_id)
 }
 
 /**
  * Like findSessionByCcSessionId but also returns released rows.
  * Used by register to reactivate a row after disconnect.
  */
+export function findAnySessionByClientSessionId(
+  db: Database,
+  client_kind: ClientKind,
+  client_session_id: string,
+): SessionRow | null {
+  const row = db.query<SessionRow, [ClientKind, string]>(
+    `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
+            last_activity, last_seen_at, generation, released_at
+     FROM sessions
+     WHERE client_kind = ? AND client_session_id = ?
+     ORDER BY (released_at IS NULL) DESC, generation DESC, created_at DESC
+     LIMIT 1`,
+  ).get(client_kind, client_session_id)
+  return row ?? null
+}
+
 export function findAnySessionByCcSessionId(
   db: Database,
   cc_session_id: string,
 ): SessionRow | null {
-  const row = db.query<SessionRow, [string]>(
-    `SELECT id, alias, cc_session_id, created_at, last_activity, released_at
-     FROM sessions
-     WHERE cc_session_id = ?`,
-  ).get(cc_session_id)
-  return row ?? null
+  return findAnySessionByClientSessionId(db, 'claude_code', cc_session_id)
+}
+
+export interface RegisterClientSessionInput {
+  alias: string | null
+  client_kind: ClientKind
+  client_session_id: string
+  cwd?: string | null
+}
+
+/**
+ * Register a durable client identity. Existing active or released rows are
+ * reused and receive a fresh generation so delayed lifecycle requests from an
+ * older client instance cannot affect the new one.
+ */
+export function registerClientSession(
+  db: Database,
+  input: RegisterClientSessionInput,
+): SessionRow {
+  return db.transaction(() => {
+    const existing = findAnySessionByClientSessionId(
+      db,
+      input.client_kind,
+      input.client_session_id,
+    )
+
+    if (!existing) {
+      if (input.alias !== null) {
+        const conflict = findSessionByAlias(db, input.alias)
+        if (conflict) {
+          throw new Error(`alias already taken: ${input.alias}`)
+        }
+      }
+      const id = createClientSession(db, input)
+      return findSessionById(db, id)!
+    }
+
+    const targetAlias = input.alias ?? existing.alias
+    if (targetAlias !== null) {
+      const conflict = findSessionByAlias(db, targetAlias)
+      if (conflict && conflict.id !== existing.id) {
+        throw new Error(`alias already taken: ${targetAlias}`)
+      }
+    }
+
+    const now = nowUtc()
+    db.query(`
+      UPDATE sessions
+      SET alias = ?,
+          cwd = CASE WHEN ? THEN ? ELSE cwd END,
+          last_activity = ?,
+          generation = generation + 1,
+          released_at = NULL
+      WHERE id = ?
+    `).run(
+      targetAlias,
+      input.cwd !== undefined ? 1 : 0,
+      input.cwd ?? null,
+      now,
+      existing.id,
+    )
+    return findSessionById(db, existing.id)!
+  })()
+}
+
+export type UnregisterClientSessionResult =
+  | 'released'
+  | 'already_released'
+  | 'not_found'
+  | 'generation_mismatch'
+
+export function unregisterClientSession(
+  db: Database,
+  input: {
+    client_kind: ClientKind
+    client_session_id: string
+    generation: number
+  },
+): UnregisterClientSessionResult {
+  return db.transaction(() => {
+    const existing = findAnySessionByClientSessionId(
+      db,
+      input.client_kind,
+      input.client_session_id,
+    )
+    if (!existing) return 'not_found'
+    if (existing.generation !== input.generation) return 'generation_mismatch'
+    if (existing.released_at !== null) return 'already_released'
+
+    const result = db.query(`
+      UPDATE sessions
+      SET alias = NULL, released_at = ?
+      WHERE id = ? AND generation = ? AND released_at IS NULL
+    `).run(nowUtc(), existing.id, input.generation)
+    return Number(result.changes) === 1 ? 'released' : 'generation_mismatch'
+  })()
 }
 
 export function releaseSession(db: Database, id: string): void {
   db.query(
     `UPDATE sessions SET alias = NULL, released_at = ? WHERE id = ?`,
   ).run(nowUtc(), id)
+}
+
+export function releaseSessionIfGeneration(
+  db: Database,
+  id: string,
+  generation: number,
+): boolean {
+  const result = db.query(
+    `UPDATE sessions
+     SET alias = NULL, released_at = ?
+     WHERE id = ? AND generation = ? AND released_at IS NULL`,
+  ).run(nowUtc(), id, generation)
+  return Number(result.changes) === 1
 }
 
 export function reactivateSession(db: Database, id: string, alias: string | null): void {
@@ -112,6 +319,11 @@ export function updateLastActivity(db: Database, id: string): void {
     .run(nowUtc(), id)
 }
 
+export function updateLastSeen(db: Database, id: string): void {
+  db.query('UPDATE sessions SET last_seen_at = ? WHERE id = ?')
+    .run(nowUtc(), id)
+}
+
 export function setAlias(db: Database, id: string, newAlias: string): void {
   db.query('UPDATE sessions SET alias = ?, released_at = NULL WHERE id = ?').run(newAlias, id)
 }
@@ -120,6 +332,7 @@ export interface InsertMessageInput {
   sender_id: string
   recipient_id: string
   broadcast_id: string | null
+  reply_to?: string | null
   content: string
 }
 
@@ -127,15 +340,25 @@ export function insertMessage(db: Database, input: InsertMessageInput): string {
   const id = randomUUID()
   const now = nowUtc()
   db.query(`
-    INSERT INTO messages (id, sender_id, recipient_id, broadcast_id, content, created_at, read_at)
-    VALUES (?, ?, ?, ?, ?, ?, NULL)
-  `).run(id, input.sender_id, input.recipient_id, input.broadcast_id, input.content, now)
+    INSERT INTO messages (
+      id, sender_id, recipient_id, broadcast_id, reply_to, content, created_at, read_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    id,
+    input.sender_id,
+    input.recipient_id,
+    input.broadcast_id,
+    input.reply_to ?? null,
+    input.content,
+    now,
+  )
   return id
 }
 
 export function fetchUnreadForRecipient(db: Database, recipient_id: string): MessageRow[] {
   return db.query<MessageRow, [string]>(`
-    SELECT id, sender_id, recipient_id, broadcast_id, content, created_at, read_at
+    SELECT id, sender_id, recipient_id, broadcast_id, reply_to, content, created_at, read_at
     FROM messages
     WHERE recipient_id = ? AND read_at IS NULL
     ORDER BY created_at ASC
@@ -153,6 +376,7 @@ export function markMessagesRead(db: Database, messageIds: string[]): void {
 
 export interface BroadcastInput {
   sender_id: string
+  recipient_ids: string[]
   content: string
 }
 
@@ -164,26 +388,25 @@ export interface BroadcastDbResult {
 
 export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastDbResult {
   const broadcast_id = randomUUID()
-  const recipients = db.query<{ id: string }, [string]>(
-    'SELECT id FROM sessions WHERE id != ? AND released_at IS NULL'
-  ).all(input.sender_id)
 
   const now = nowUtc()
   const stmt = db.query(`
-    INSERT INTO messages (id, sender_id, recipient_id, broadcast_id, content, created_at, read_at)
-    VALUES (?, ?, ?, ?, ?, ?, NULL)
+    INSERT INTO messages (
+      id, sender_id, recipient_id, broadcast_id, reply_to, content, created_at, read_at
+    )
+    VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)
   `)
-  const insertTx = db.transaction((rows: typeof recipients) => {
-    for (const r of rows) {
-      stmt.run(randomUUID(), input.sender_id, r.id, broadcast_id, input.content, now)
+  const insertTx = db.transaction((recipientIds: string[]) => {
+    for (const recipientId of recipientIds) {
+      stmt.run(randomUUID(), input.sender_id, recipientId, broadcast_id, input.content, now)
     }
   })
-  insertTx(recipients)
+  insertTx(input.recipient_ids)
 
   return {
     broadcast_id,
-    recipient_count: recipients.length,
-    recipient_ids: recipients.map((r) => r.id),
+    recipient_count: input.recipient_ids.length,
+    recipient_ids: input.recipient_ids,
   }
 }
 
@@ -215,7 +438,10 @@ export function recallMessage(db: Database, input: RecallInput): number {
 
 export function listAllSessions(db: Database): SessionRow[] {
   return db.query<SessionRow, []>(
-    'SELECT id, alias, created_at, last_activity FROM sessions ORDER BY created_at ASC'
+    `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
+            last_activity, last_seen_at, generation, released_at
+     FROM sessions
+     ORDER BY created_at ASC`,
   ).all()
 }
 
@@ -239,9 +465,8 @@ export function deleteExpiredMessages(db: Database): number {
 /**
  * Release sessions that look orphaned: alive in DB (released_at IS NULL) but
  * either (a) not currently connected to any transport, and (b) no activity
- * within staleThresholdMs. Both conditions must hold — the connection check
- * protects legitimately-idle live sessions, the time check protects against
- * registry leaks that might falsely list a dead transport as connected.
+ * within staleThresholdMs. The later of lease renewal and general activity is
+ * used, so a fresh re-register is not discarded because of an older lease.
  *
  * @param connectedIds session IDs currently present in ConnectionRegistry
  * @returns IDs of sessions that were released by this call
@@ -256,7 +481,11 @@ export function releaseStaleActiveSessions(
     .query<{ id: string }, [string]>(
       `SELECT id FROM sessions
        WHERE released_at IS NULL
-         AND last_activity < ?`,
+         AND CASE
+           WHEN last_seen_at IS NOT NULL AND last_seen_at > last_activity
+             THEN last_seen_at
+           ELSE last_activity
+         END < ?`,
     )
     .all(cutoff)
   const connected = new Set(connectedIds)

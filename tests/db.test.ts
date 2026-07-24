@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -56,6 +56,23 @@ test('updateLastActivity changes last_activity but not created_at', async () => 
   expect(after.last_activity > before.last_activity).toBe(true)
 })
 
+test('updateLastSeen renews the session lease without changing last_activity', async () => {
+  const id = createClientSession(db, {
+    alias: 'lease-client',
+    client_kind: 'codex',
+    client_session_id: 'lease-id',
+  })
+  const before = findSessionById(db, id)!
+  await Bun.sleep(10)
+
+  updateLastSeen(db, id)
+
+  const after = findSessionById(db, id)!
+  expect(after.last_seen_at).not.toBeNull()
+  expect(Date.parse(after.last_seen_at!)).toBeGreaterThan(Date.parse(before.created_at))
+  expect(after.last_activity).toBe(before.last_activity)
+})
+
 test('insertMessage + fetchUnread round trip (1-to-1)', () => {
   const alice = createSession(db, { alias: 'alice' })
   const bob = createSession(db, { alias: 'bob' })
@@ -103,30 +120,41 @@ test('fetchUnread excludes already-read messages', () => {
   expect(fetchUnreadForRecipient(db, b)).toHaveLength(0)
 })
 
-test('insertBroadcast fans out to all sessions except sender', () => {
+test('insertBroadcast fans out to the caller-selected recipients', () => {
   const sender = createSession(db, { alias: 'sender' })
   const r1 = createSession(db, { alias: 'r1' })
   const r2 = createSession(db, { alias: 'r2' })
+  const excluded = createSession(db, { alias: 'excluded' })
 
-  const result = insertBroadcast(db, { sender_id: sender, content: 'hello all' })
+  const result = insertBroadcast(db, {
+    sender_id: sender,
+    recipient_ids: [r1, r2],
+    content: 'hello selected recipients',
+  })
 
   expect(result.recipient_count).toBe(2)
   expect(result.broadcast_id).toBeTruthy()
 
   const r1Msgs = fetchUnreadForRecipient(db, r1)
   const r2Msgs = fetchUnreadForRecipient(db, r2)
+  const excludedMsgs = fetchUnreadForRecipient(db, excluded)
   const senderMsgs = fetchUnreadForRecipient(db, sender)
 
   expect(r1Msgs).toHaveLength(1)
   expect(r2Msgs).toHaveLength(1)
+  expect(excludedMsgs).toHaveLength(0)
   expect(senderMsgs).toHaveLength(0)
   expect(r1Msgs[0].broadcast_id).toBe(result.broadcast_id)
   expect(r1Msgs[0].broadcast_id).toBe(r2Msgs[0].broadcast_id)
 })
 
-test('insertBroadcast with no other sessions returns zero recipient_count', () => {
+test('insertBroadcast with an empty recipient list returns zero recipient_count', () => {
   const sender = createSession(db, { alias: 'only' })
-  const result = insertBroadcast(db, { sender_id: sender, content: 'lonely' })
+  const result = insertBroadcast(db, {
+    sender_id: sender,
+    recipient_ids: [],
+    content: 'lonely',
+  })
   expect(result.recipient_count).toBe(0)
 })
 
@@ -151,7 +179,11 @@ test('recallMessage on broadcast deletes all copies', () => {
   const sender = createSession(db, { alias: 's' })
   const r1 = createSession(db, { alias: 'r1' })
   const r2 = createSession(db, { alias: 'r2' })
-  const { broadcast_id } = insertBroadcast(db, { sender_id: sender, content: 'group' })
+  const { broadcast_id } = insertBroadcast(db, {
+    sender_id: sender,
+    recipient_ids: [r1, r2],
+    content: 'group',
+  })
   const oneCopy = fetchUnreadForRecipient(db, r1)[0]
 
   const recalled = recallMessage(db, { message_id: oneCopy.id, caller_id: sender })
@@ -207,18 +239,27 @@ test('deleteExpiredMessages keeps unread messages regardless of age', () => {
   expect(remaining).toHaveLength(1)
 })
 
-test('openDatabase drops old Phase 1 sessions table if cc_session_id column missing', () => {
+test('migration upgrades Phase 2.5 schema without losing data', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'switchboard-migration-'))
-  const dbPath = join(tmp, 'phase1.db')
+  const dbPath = join(tmp, 'phase2-5.db')
 
   const rawDb = new Database(dbPath)
+  rawDb.exec('PRAGMA foreign_keys = ON')
   rawDb.exec(`
     CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
-        alias TEXT UNIQUE,
+        alias TEXT,
+        cc_session_id TEXT,
         created_at TEXT NOT NULL,
-        last_activity TEXT NOT NULL
+        last_activity TEXT NOT NULL,
+        released_at TEXT
     );
+    CREATE UNIQUE INDEX idx_sessions_alias_active
+        ON sessions(alias)
+        WHERE alias IS NOT NULL AND released_at IS NULL;
+    CREATE UNIQUE INDEX idx_sessions_cc_session_id_active
+        ON sessions(cc_session_id)
+        WHERE cc_session_id IS NOT NULL AND released_at IS NULL;
     CREATE TABLE messages (
         id TEXT PRIMARY KEY,
         sender_id TEXT NOT NULL,
@@ -226,32 +267,258 @@ test('openDatabase drops old Phase 1 sessions table if cc_session_id column miss
         broadcast_id TEXT,
         content TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        read_at TEXT
+        read_at TEXT,
+        FOREIGN KEY (sender_id) REFERENCES sessions(id),
+        FOREIGN KEY (recipient_id) REFERENCES sessions(id)
     );
   `)
-  rawDb.exec(`INSERT INTO sessions (id, alias, created_at, last_activity) VALUES ('old-id', 'old-alias', '2026-04-16T00:00:00Z', '2026-04-16T00:00:00Z')`)
+  rawDb.exec(`
+    INSERT INTO sessions
+      (id, alias, cc_session_id, created_at, last_activity, released_at)
+    VALUES
+      ('active-id', 'active-alias', 'shared-client-id', '2026-04-16T00:00:00Z', '2026-04-16T01:00:00Z', NULL),
+      ('released-id', NULL, 'released-client-id', '2026-04-15T00:00:00Z', '2026-04-15T01:00:00Z', '2026-04-16T02:00:00Z');
+    INSERT INTO messages
+      (id, sender_id, recipient_id, broadcast_id, content, created_at, read_at)
+    VALUES
+      ('message-id', 'released-id', 'active-id', NULL, 'keep me', '2026-04-16T03:00:00Z', NULL);
+  `)
   rawDb.close()
 
-  const db = openDatabase(dbPath)
-  const cols = db.query<{ name: string }, []>(`PRAGMA table_info(sessions)`).all()
-  const colNames = cols.map((c) => c.name)
-  expect(colNames).toContain('cc_session_id')
-  expect(colNames).toContain('released_at')
-  const rows = db.query('SELECT id FROM sessions').all()
-  expect(rows).toHaveLength(0)
-  db.close()
+  const migrated = openDatabase(dbPath)
+  const sessionColumns = migrated
+    .query<{ name: string }, []>(`PRAGMA table_info(sessions)`)
+    .all()
+    .map((column) => column.name)
+  expect(sessionColumns).toContain('client_kind')
+  expect(sessionColumns).toContain('client_session_id')
+  expect(sessionColumns).toContain('cwd')
+  expect(sessionColumns).toContain('last_seen_at')
+  expect(sessionColumns).toContain('generation')
+  expect(sessionColumns).not.toContain('cc_session_id')
+
+  const sessions = migrated.query<{
+    id: string
+    alias: string | null
+    client_kind: string
+    client_session_id: string | null
+    created_at: string
+    last_activity: string
+    released_at: string | null
+    cwd: string | null
+    last_seen_at: string | null
+    generation: number
+  }, []>(`
+    SELECT id, alias, client_kind, client_session_id, created_at,
+           last_activity, released_at, cwd, last_seen_at, generation
+    FROM sessions
+    ORDER BY id
+  `).all()
+  expect(sessions).toEqual([
+    {
+      id: 'active-id',
+      alias: 'active-alias',
+      client_kind: 'claude_code',
+      client_session_id: 'shared-client-id',
+      created_at: '2026-04-16T00:00:00Z',
+      last_activity: '2026-04-16T01:00:00Z',
+      released_at: null,
+      cwd: null,
+      last_seen_at: null,
+      generation: 1,
+    },
+    {
+      id: 'released-id',
+      alias: null,
+      client_kind: 'claude_code',
+      client_session_id: 'released-client-id',
+      created_at: '2026-04-15T00:00:00Z',
+      last_activity: '2026-04-15T01:00:00Z',
+      released_at: '2026-04-16T02:00:00Z',
+      cwd: null,
+      last_seen_at: null,
+      generation: 1,
+    },
+  ])
+
+  const message = migrated.query<{
+    id: string
+    sender_id: string
+    recipient_id: string
+    content: string
+    reply_to: string | null
+  }, []>(`
+    SELECT id, sender_id, recipient_id, content, reply_to
+    FROM messages
+  `).get()
+  expect(message).toEqual({
+    id: 'message-id',
+    sender_id: 'released-id',
+    recipient_id: 'active-id',
+    content: 'keep me',
+    reply_to: null,
+  })
+
+  migrated.query(`
+    INSERT INTO sessions
+      (id, alias, client_kind, client_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run('codex-id', 'codex-alias', 'codex', 'shared-client-id', '2026-04-16T04:00:00Z', '2026-04-16T04:00:00Z')
+  expect(() => migrated.query(`
+    INSERT INTO sessions
+      (id, alias, client_kind, client_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run('duplicate-id', 'duplicate-alias', 'claude_code', 'shared-client-id', '2026-04-16T05:00:00Z', '2026-04-16T05:00:00Z')).toThrow()
+  migrated.query(`
+    INSERT INTO sessions
+      (id, alias, client_kind, client_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run('reused-id', 'reused-alias', 'claude_code', 'released-client-id', '2026-04-16T06:00:00Z', '2026-04-16T06:00:00Z')
+
+  migrated.close()
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('registerClientSession upserts identity and increments generation', () => {
+  const first = registerClientSession(db, {
+    alias: 'codex-one',
+    client_kind: 'codex',
+    client_session_id: 'thread-123',
+    cwd: '/workspace/one',
+  })
+  expect(first.generation).toBe(1)
+
+  const second = registerClientSession(db, {
+    alias: 'codex-two',
+    client_kind: 'codex',
+    client_session_id: 'thread-123',
+    cwd: '/workspace/two',
+  })
+  expect(second.id).toBe(first.id)
+  expect(second.alias).toBe('codex-two')
+  expect(second.cwd).toBe('/workspace/two')
+  expect(second.generation).toBe(2)
+
+  releaseSession(db, first.id)
+  const third = registerClientSession(db, {
+    alias: 'codex-three',
+    client_kind: 'codex',
+    client_session_id: 'thread-123',
+    cwd: '/workspace/three',
+  })
+  expect(third.id).toBe(first.id)
+  expect(third.released_at).toBeNull()
+  expect(third.generation).toBe(3)
+})
+
+test('registerClientSession prefers the active row over released identity history', () => {
+  const releasedId = createClientSession(db, {
+    alias: 'old-instance',
+    client_kind: 'codex',
+    client_session_id: 'identity-with-history',
+  })
+  releaseSession(db, releasedId)
+  const activeId = createClientSession(db, {
+    alias: 'current-instance',
+    client_kind: 'codex',
+    client_session_id: 'identity-with-history',
+  })
+
+  const registered = registerClientSession(db, {
+    alias: 'renamed-current-instance',
+    client_kind: 'codex',
+    client_session_id: 'identity-with-history',
+    cwd: '/workspace',
+  })
+  expect(registered.id).toBe(activeId)
+  expect(registered.generation).toBe(2)
+  expect(findSessionById(db, releasedId)?.released_at).not.toBeNull()
+})
+
+test('unregisterClientSession rejects a stale generation without releasing active row', () => {
+  const first = registerClientSession(db, {
+    alias: 'generation-one',
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    cwd: '/workspace',
+  })
+  const second = registerClientSession(db, {
+    alias: 'generation-two',
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    cwd: '/workspace',
+  })
+
+  expect(unregisterClientSession(db, {
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    generation: first.generation,
+  })).toBe('generation_mismatch')
+  expect(findSessionById(db, second.id)?.released_at).toBeNull()
+
+  expect(unregisterClientSession(db, {
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    generation: second.generation,
+  })).toBe('released')
+  expect(unregisterClientSession(db, {
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    generation: second.generation,
+  })).toBe('already_released')
+})
+
+test('client session helpers use client_kind as an identity namespace', () => {
+  const claude = createClientSession(db, {
+    alias: 'claude-peer',
+    client_kind: 'claude_code',
+    client_session_id: 'shared-id',
+    cwd: '/workspace/claude',
+  })
+  const codex = createClientSession(db, {
+    alias: 'codex-peer',
+    client_kind: 'codex',
+    client_session_id: 'shared-id',
+    cwd: '/workspace/codex',
+  })
+
+  expect(findSessionByClientSessionId(db, 'claude_code', 'shared-id')?.id).toBe(claude)
+  expect(findSessionByClientSessionId(db, 'codex', 'shared-id')?.id).toBe(codex)
+  expect(findSessionByClientSessionId(db, 'external', 'shared-id')).toBeNull()
+  expect(findSessionById(db, codex)?.cwd).toBe('/workspace/codex')
+})
+
+test('insertMessage stores nullable reply_to', () => {
+  const sender = createSession(db, { alias: 'reply-sender' })
+  const recipient = createSession(db, { alias: 'reply-recipient' })
+  const root = insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'root',
+  })
+  insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'reply',
+    reply_to: root,
+  })
+
+  const messages = fetchUnreadForRecipient(db, recipient)
+  expect(messages.map((message) => message.reply_to)).toEqual([null, root])
 })
 
 test('createSession accepts optional cc_session_id', () => {
   const db = openDatabase(':memory:')
   const id = createSession(db, { alias: 'my-role', cc_session_id: 'cc-abc-123' })
   const row = db
-    .query<{ id: string; cc_session_id: string | null }, [string]>(
-      `SELECT id, cc_session_id FROM sessions WHERE id = ?`,
+    .query<{ id: string; client_kind: string; client_session_id: string | null }, [string]>(
+      `SELECT id, client_kind, client_session_id FROM sessions WHERE id = ?`,
     )
     .get(id)
-  expect(row?.cc_session_id).toBe('cc-abc-123')
+  expect(row?.client_kind).toBe('claude_code')
+  expect(row?.client_session_id).toBe('cc-abc-123')
   db.close()
 })
 
@@ -384,4 +651,18 @@ test('releaseStaleActiveSessions frees alias for re-use', () => {
   const second = createSession(db, { alias: 'shared-name' })
   expect(second).not.toBe(first)
   expect(findSessionByAlias(db, 'shared-name')?.id).toBe(second)
+})
+
+test('releaseStaleActiveSessions uses last_seen_at when a lease has been renewed', () => {
+  const id = createClientSession(db, {
+    alias: 'leased',
+    client_kind: 'codex',
+    client_session_id: 'leased-id',
+  })
+  backdateLastActivity(db, id, 48 * 60 * 60_000)
+  db.query('UPDATE sessions SET last_seen_at = ? WHERE id = ?')
+    .run(new Date().toISOString(), id)
+
+  expect(releaseStaleActiveSessions(db, [], 24 * 60 * 60_000)).toEqual([])
+  expect(findSessionByAlias(db, 'leased')?.id).toBe(id)
 })

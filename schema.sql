@@ -1,25 +1,30 @@
 CREATE TABLE IF NOT EXISTS sessions (
-    id            TEXT PRIMARY KEY,
-    alias         TEXT,
-    cc_session_id TEXT,
-    created_at    TEXT NOT NULL,
-    last_activity TEXT NOT NULL,
-    released_at   TEXT
+    id                TEXT PRIMARY KEY,
+    alias             TEXT,
+    client_kind       TEXT NOT NULL DEFAULT 'claude_code',
+    client_session_id TEXT,
+    cwd               TEXT,
+    created_at        TEXT NOT NULL,
+    last_activity     TEXT NOT NULL,
+    last_seen_at      TEXT,
+    generation        INTEGER NOT NULL DEFAULT 1,
+    released_at       TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_alias_active
     ON sessions(alias)
     WHERE alias IS NOT NULL AND released_at IS NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_cc_session_id_active
-    ON sessions(cc_session_id)
-    WHERE cc_session_id IS NOT NULL AND released_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_client_identity_active
+    ON sessions(client_kind, client_session_id)
+    WHERE client_session_id IS NOT NULL AND released_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS messages (
     id            TEXT PRIMARY KEY,
     sender_id     TEXT NOT NULL,
     recipient_id  TEXT NOT NULL,
     broadcast_id  TEXT,
+    reply_to      TEXT,
     content       TEXT NOT NULL,
     created_at    TEXT NOT NULL,
     read_at       TEXT,

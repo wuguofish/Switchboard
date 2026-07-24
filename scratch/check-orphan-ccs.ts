@@ -7,6 +7,10 @@ const ids = [
   '90d5a83d-27f3-4a38-b51f-81dbc7ef63a4',
 ]
 for (const cc of ids) {
-  const rows = db.query('SELECT id, alias, cc_session_id, last_activity, released_at FROM sessions WHERE cc_session_id = ?').all(cc)
+  const rows = db.query(`
+    SELECT id, alias, client_session_id, last_activity, released_at
+    FROM sessions
+    WHERE client_kind = 'claude_code' AND client_session_id = ?
+  `).all(cc)
   console.log(cc, JSON.stringify(rows))
 }

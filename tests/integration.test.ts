@@ -81,11 +81,9 @@ test('send 1-to-1: recipient gets message on read_messages', async () => {
   })
   const sendParsed = JSON.parse((sendResult.content as any[])[0].text)
   expect(typeof sendParsed.message_id).toBe('string')
-  // Phase 1 recipient (registered without cc_session_id) has no poller
-  // process, so delivered_notification is false — the message still lands
-  // in the DB and shows up on read_messages below, which is the real
-  // correctness signal. See poller.isPollerAlive for the semantics.
-  expect(sendParsed.delivered_notification).toBe(false)
+  // A successful MCP push is now sufficient for delivered_notification,
+  // even when this legacy anonymous identity has no poller lease.
+  expect(sendParsed.delivered_notification).toBe(true)
 
   const readResult = await recipient.callTool({ name: 'read_messages', arguments: {} })
   const readParsed = JSON.parse((readResult.content as any[])[0].text)
@@ -130,6 +128,198 @@ test('broadcast fans out to all other sessions', async () => {
   await sender.close()
   await r1.close()
   await r2.close()
+})
+
+test('broadcast tool advertises all, same_kind, and same_cwd scopes with all as default', async () => {
+  const client = await makeClient('bcast-schema')
+  const tools = await client.listTools()
+  const broadcast = tools.tools.find((tool) => tool.name === 'broadcast')
+  const scope = (broadcast?.inputSchema.properties as any)?.scope
+
+  expect(scope.enum).toEqual(['all', 'same_kind', 'same_cwd'])
+  expect(scope.default).toBe('all')
+
+  await client.close()
+})
+
+for (const testCase of [
+  {
+    scope: 'all',
+    queuedKind: 'external',
+    queuedCwd: '/workspace/other',
+    onlineCodexDelivered: true,
+    recipientCount: 2,
+    notifiedCount: 1,
+  },
+  {
+    scope: 'same_kind',
+    queuedKind: 'claude_code',
+    queuedCwd: '/workspace/other',
+    onlineCodexDelivered: false,
+    recipientCount: 1,
+    notifiedCount: 0,
+  },
+  {
+    scope: 'same_cwd',
+    queuedKind: 'external',
+    queuedCwd: '/workspace/shared',
+    onlineCodexDelivered: true,
+    recipientCount: 2,
+    notifiedCount: 1,
+  },
+] as const) {
+  test(`broadcast scope=${testCase.scope} filters recipients and never queues offline codex`, async () => {
+    const senderIdentity = `scope-sender-${testCase.scope}`
+    await postJson(REGISTER_URL, {
+      alias: `scope-sender-${testCase.scope}`,
+      client_kind: 'claude_code',
+      client_session_id: senderIdentity,
+      cwd: '/workspace/shared',
+    })
+    const sender = await makeClient(`scope-sender-mcp-${testCase.scope}`)
+    await sender.callTool({
+      name: 'register',
+      arguments: {
+        role: `scope-sender-${testCase.scope}`,
+        cc_session_id: senderIdentity,
+      },
+    })
+
+    const onlineCodexId = `online-codex-${testCase.scope}`
+    const offlineCodexId = `offline-codex-${testCase.scope}`
+    await postJson(REGISTER_URL, {
+      alias: onlineCodexId,
+      client_kind: 'codex',
+      client_session_id: onlineCodexId,
+      cwd: '/workspace/shared',
+    })
+    await postJson(REGISTER_URL, {
+      alias: offlineCodexId,
+      client_kind: 'codex',
+      client_session_id: offlineCodexId,
+      cwd: '/workspace/shared',
+    })
+    await postJson(REGISTER_URL, {
+      alias: `queued-${testCase.scope}`,
+      client_kind: testCase.queuedKind,
+      client_session_id: `queued-${testCase.scope}`,
+      cwd: testCase.queuedCwd,
+    })
+
+    const onlinePoll = fetch(
+      `${POLL_URL}?client_kind=codex&client_session_id=${onlineCodexId}&timeout_s=1`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    const result = JSON.parse(((await sender.callTool({
+      name: 'broadcast',
+      arguments: {
+        message: `scope ${testCase.scope}`,
+        scope: testCase.scope,
+      },
+    })).content as any[])[0].text)
+    expect(result.recipient_count).toBe(testCase.recipientCount)
+    expect(result.notified_count).toBe(testCase.notifiedCount)
+
+    const onlinePollBody = await (await onlinePoll).json()
+    expect(onlinePollBody.status).toBe(
+      testCase.onlineCodexDelivered ? 'unread' : 'timeout',
+    )
+
+    // An offline codex peer must not receive a mailbox row. Polling only after
+    // the broadcast makes it online too late and must still return timeout.
+    const offlinePoll = await fetch(
+      `${POLL_URL}?client_kind=codex&client_session_id=${offlineCodexId}&timeout_s=1`,
+    )
+    expect((await offlinePoll.json()).status).toBe('timeout')
+
+    // Claude Code and external peers keep the existing durable-mailbox
+    // behavior: they were offline at send time but can read the queued row
+    // when they poll later.
+    const queuedPoll = await fetch(
+      `${POLL_URL}?client_kind=${testCase.queuedKind}` +
+      `&client_session_id=queued-${testCase.scope}&timeout_s=1`,
+    )
+    expect((await queuedPoll.json()).status).toBe('unread')
+
+    await sender.close()
+  })
+}
+
+test('broadcast scope=same_cwd does not match any recipient when sender cwd is NULL', async () => {
+  const sender = await makeClient('null-cwd-sender')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'null-cwd-sender', cc_session_id: 'null-cwd-sender' },
+  })
+  await postJson(REGISTER_URL, {
+    alias: 'non-null-cwd-recipient',
+    client_kind: 'external',
+    client_session_id: 'non-null-cwd-recipient',
+    cwd: '/workspace/shared',
+  })
+
+  const result = JSON.parse(((await sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'NULL cwd never matches', scope: 'same_cwd' },
+  })).content as any[])[0].text)
+  expect(result.recipient_count).toBe(0)
+  expect(result.notified_count).toBe(0)
+
+  await sender.close()
+})
+
+test('broadcast scope=same_cwd excludes a NULL recipient cwd when sender cwd is non-NULL', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'non-null-cwd-sender',
+    client_kind: 'claude_code',
+    client_session_id: 'non-null-cwd-sender',
+    cwd: '/workspace/shared',
+  })
+  const sender = await makeClient('non-null-cwd-sender-mcp')
+  await sender.callTool({
+    name: 'register',
+    arguments: {
+      role: 'non-null-cwd-sender',
+      cc_session_id: 'non-null-cwd-sender',
+    },
+  })
+  await postJson(REGISTER_URL, {
+    alias: 'null-cwd-recipient',
+    client_kind: 'external',
+    client_session_id: 'null-cwd-recipient',
+    cwd: null,
+  })
+  await postJson(REGISTER_URL, {
+    alias: 'matching-cwd-recipient',
+    client_kind: 'external',
+    client_session_id: 'matching-cwd-recipient',
+    cwd: '/workspace/shared',
+  })
+
+  const result = JSON.parse(((await sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'NULL recipient cwd never matches', scope: 'same_cwd' },
+  })).content as any[])[0].text)
+  expect(result.recipient_count).toBe(1)
+  expect(result.notified_count).toBe(0)
+
+  await sender.close()
+})
+
+test('broadcast rejects a scope outside the advertised enum', async () => {
+  const sender = await makeClient('invalid-scope-sender')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'invalid-scope-sender' },
+  })
+
+  await expect(sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'invalid scope', scope: 'nearby' },
+  })).rejects.toThrow(/scope must be one of/)
+
+  await sender.close()
 })
 
 test('read_messages marks as read (second call returns empty)', async () => {
@@ -298,6 +488,55 @@ test('/poll returns no-session when cc_session_id is unknown', async () => {
   expect(body.status).toBe('no-session')
 })
 
+test('/poll resolves client identity by client_kind namespace', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'poll-codex-shared',
+    client_kind: 'codex',
+    client_session_id: 'poll-shared-id',
+    cwd: '/workspace/codex',
+  })
+  const claude = await makeClient('poll-claude-shared')
+  await claude.callTool({
+    name: 'register',
+    arguments: { role: 'poll-claude-shared', cc_session_id: 'poll-shared-id' },
+  })
+
+  const codexPoll = fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=poll-shared-id&timeout_s=5`,
+  )
+  await new Promise((r) => setTimeout(r, 80))
+
+  const sender = await makeClient('poll-kind-sender')
+  await sender.callTool({ name: 'register', arguments: { role: 'poll-kind-sender' } })
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'poll-codex-shared', message: 'codex only' },
+  })
+
+  const body = await (await codexPoll).json()
+  expect(body.status).toBe('unread')
+  expect(body.alias).toBe('poll-codex-shared')
+
+  await sender.close()
+  await claude.close()
+})
+
+test('/poll validates canonical client identity parameters', async () => {
+  const missingKind = await fetch(`${POLL_URL}?client_session_id=some-id&timeout_s=1`)
+  expect(missingKind.status).toBe(400)
+  expect(await missingKind.text()).toContain('client_kind')
+
+  const invalidKind = await fetch(
+    `${POLL_URL}?client_kind=other&client_session_id=some-id&timeout_s=1`,
+  )
+  expect(invalidKind.status).toBe(400)
+
+  const ambiguous = await fetch(
+    `${POLL_URL}?cc_session_id=some-id&client_kind=codex&client_session_id=some-id&timeout_s=1`,
+  )
+  expect(ambiguous.status).toBe(400)
+})
+
 test('/poll returns unread immediately when messages are already waiting', async () => {
   const sender = await makeClient('poll-sender-imm')
   await sender.callTool({
@@ -392,16 +631,58 @@ test('send to a recipient currently long-polling reports delivered_notification:
   await recipient.close()
 })
 
+test('/poll renews a lease used by list_sessions and delivered_notification', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'leased-codex',
+    client_kind: 'codex',
+    client_session_id: 'leased-codex-id',
+    cwd: '/workspace',
+  })
+
+  const observer = await makeClient('lease-observer')
+  await observer.callTool({ name: 'register', arguments: { role: 'lease-observer' } })
+  const before = JSON.parse(((await observer.callTool({
+    name: 'list_sessions',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(before.find((s: any) => s.alias === 'leased-codex')?.online).toBe(false)
+
+  const poll = fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=leased-codex-id&timeout_s=1`,
+  )
+  await new Promise((r) => setTimeout(r, 80))
+  const during = JSON.parse(((await observer.callTool({
+    name: 'list_sessions',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(during.find((s: any) => s.alias === 'leased-codex')?.online).toBe(true)
+  await poll
+
+  const send = JSON.parse(((await observer.callTool({
+    name: 'send',
+    arguments: { to: 'leased-codex', message: 'lease wake' },
+  })).content as any[])[0].text)
+  expect(send.delivered_notification).toBe(true)
+
+  const broadcast = JSON.parse(((await observer.callTool({
+    name: 'broadcast',
+    arguments: { message: 'lease broadcast' },
+  })).content as any[])[0].text)
+  expect(broadcast.recipient_count).toBe(1)
+  expect(broadcast.notified_count).toBe(1)
+
+  await observer.close()
+})
+
 test('delivered_notification is false when only a legacy state file exists (no live /poll)', async () => {
-  // Regression: canAutoWake used to also trust poller.ts's state file, so a
-  // stale file whose pid had been reused as an unrelated process would make
-  // delivered_notification falsely report true. The shim does not write
-  // state files, so we now only trust waiters.isPolling. This test guards
-  // against re-introducing the fallback.
+  // Regression: canAutoWake used to trust poller.ts's state file, so a stale
+  // file whose pid had been reused by another process could report delivery.
+  // The shared online predicate intentionally ignores state files.
   const fs = await import('node:fs')
   const os = await import('node:os')
   const path = await import('node:path')
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-statefile-'))
+  const originalStateDir = process.env.SWITCHBOARD_POLLER_STATE_DIR
   try {
     // Stash a state file pointing at our own (live) pid — the old code path
     // would accept this as "alive".
@@ -409,10 +690,12 @@ test('delivered_notification is false when only a legacy state file exists (no l
     const stateFile = path.join(tmpDir, `switchboard-poller-${ccSessionId}.state`)
     fs.writeFileSync(stateFile, JSON.stringify({ pid: process.pid, cc_session_id: ccSessionId, started_at: new Date().toISOString() }))
 
-    const recipient = await makeClient('legacy-statefile-recip')
-    await recipient.callTool({
-      name: 'register',
-      arguments: { role: 'legacy-rcp', cc_session_id: ccSessionId },
+    process.env.SWITCHBOARD_POLLER_STATE_DIR = tmpDir
+    await postJson(REGISTER_URL, {
+      alias: 'legacy-rcp',
+      client_kind: 'claude_code',
+      client_session_id: ccSessionId,
+      cwd: '/workspace',
     })
 
     const sender = await makeClient('legacy-statefile-sender')
@@ -424,8 +707,12 @@ test('delivered_notification is false when only a legacy state file exists (no l
     expect(sendResult.delivered_notification).toBe(false)
 
     await sender.close()
-    await recipient.close()
   } finally {
+    if (originalStateDir === undefined) {
+      delete process.env.SWITCHBOARD_POLLER_STATE_DIR
+    } else {
+      process.env.SWITCHBOARD_POLLER_STATE_DIR = originalStateDir
+    }
     fs.rmSync(tmpDir, { recursive: true, force: true })
   }
 })
@@ -453,6 +740,76 @@ test('alias is released on disconnect, new client can reclaim the name', async (
   expect(second.alias).toBe('reclaimable')
   expect(second.session_id).not.toBe(first.session_id)
   await c2.close()
+})
+
+test('explicit unregister from an older MCP transport does not release a newer generation', async () => {
+  const oldClient = await makeClient('stale-unreg-old')
+  const oldRegistration = JSON.parse(((await oldClient.callTool({
+    name: 'register',
+    arguments: { role: 'stale-unreg-old', cc_session_id: 'stale-unreg-shared' },
+  })).content as any[])[0].text)
+
+  const newClient = await makeClient('stale-unreg-new')
+  const newRegistration = JSON.parse(((await newClient.callTool({
+    name: 'register',
+    arguments: { role: 'stale-unreg-current', cc_session_id: 'stale-unreg-shared' },
+  })).content as any[])[0].text)
+  expect(newRegistration.session_id).toBe(oldRegistration.session_id)
+
+  // The stale transport actively unregisters — the guard must ignore it.
+  const staleResult = JSON.parse(((await oldClient.callTool({
+    name: 'unregister',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(staleResult.status).toBe('stale_ignored')
+  expect(staleResult.released_alias).toBeNull()
+
+  const sessions = JSON.parse(((await newClient.callTool({
+    name: 'list_sessions',
+    arguments: {},
+  })).content as any[])[0].text)
+  const current = sessions.find((s: any) => s.session_id === newRegistration.session_id)
+  expect(current?.alias).toBe('stale-unreg-current')
+  expect(current?.online).toBe(true)
+
+  // The current generation's own unregister still releases normally.
+  const currentResult = JSON.parse(((await newClient.callTool({
+    name: 'unregister',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(currentResult.status).toBe('released')
+  expect(currentResult.released_alias).toBe('stale-unreg-current')
+
+  await oldClient.close()
+  await newClient.close()
+})
+
+test('closing an older MCP transport does not release a newer generation', async () => {
+  const oldClient = await makeClient('generation-old')
+  const oldRegistration = JSON.parse(((await oldClient.callTool({
+    name: 'register',
+    arguments: { role: 'generation-old', cc_session_id: 'generation-shared' },
+  })).content as any[])[0].text)
+
+  const newClient = await makeClient('generation-new')
+  const newRegistration = JSON.parse(((await newClient.callTool({
+    name: 'register',
+    arguments: { role: 'generation-current', cc_session_id: 'generation-shared' },
+  })).content as any[])[0].text)
+  expect(newRegistration.session_id).toBe(oldRegistration.session_id)
+
+  await oldClient.close()
+  await new Promise((r) => setTimeout(r, 50))
+
+  const sessions = JSON.parse(((await newClient.callTool({
+    name: 'list_sessions',
+    arguments: {},
+  })).content as any[])[0].text)
+  const current = sessions.find((s: any) => s.session_id === newRegistration.session_id)
+  expect(current?.alias).toBe('generation-current')
+  expect(current?.online).toBe(true)
+
+  await newClient.close()
 })
 
 test('released session row stays queryable by id (messages FK preserved)', async () => {
@@ -688,6 +1045,8 @@ test('/monitor abort releases the waiter so cancelAll isn\'t stuck on shutdown',
 // --- local external sender endpoint ---
 
 const EXTERNAL_SEND_URL = `http://127.0.0.1:${TEST_PORT}/external/send`
+const REGISTER_URL = `http://127.0.0.1:${TEST_PORT}/register`
+const UNREGISTER_URL = `http://127.0.0.1:${TEST_PORT}/unregister`
 
 test('/external/send delivers and wakes a registered Claude Code session', async () => {
   const recipient = await makeClient('external-recip')
@@ -724,4 +1083,188 @@ test('/external/send delivers and wakes a registered Claude Code session', async
   expect(readParsed.messages[0].sender_alias).toBe('codex')
 
   await recipient.close()
+})
+
+async function postJson(url: string, body: unknown): Promise<Response> {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+test('HTTP register upserts active and released peer sessions with increasing generation', async () => {
+  const firstResp = await postJson(REGISTER_URL, {
+    alias: 'http-codex-one',
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    cwd: '/workspace/one',
+  })
+  expect(firstResp.status).toBe(200)
+  const first = await firstResp.json()
+  expect(first).toEqual({
+    session_id: expect.any(String),
+    alias: 'http-codex-one',
+    generation: 1,
+  })
+
+  const secondResp = await postJson(REGISTER_URL, {
+    alias: 'http-codex-two',
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    cwd: '/workspace/two',
+  })
+  expect(secondResp.status).toBe(200)
+  const second = await secondResp.json()
+  expect(second).toEqual({
+    session_id: first.session_id,
+    alias: 'http-codex-two',
+    generation: 2,
+  })
+
+  const releaseResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    generation: second.generation,
+  })
+  expect(releaseResp.status).toBe(200)
+  expect(await releaseResp.json()).toEqual({ status: 'released' })
+
+  const thirdResp = await postJson(REGISTER_URL, {
+    alias: 'http-codex-three',
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    cwd: '/workspace/three',
+  })
+  expect(thirdResp.status).toBe(200)
+  const third = await thirdResp.json()
+  expect(third).toEqual({
+    session_id: first.session_id,
+    alias: 'http-codex-three',
+    generation: 3,
+  })
+})
+
+test('HTTP unregister rejects stale generation without killing the current instance', async () => {
+  const first = await (await postJson(REGISTER_URL, {
+    alias: 'stale-token-one',
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    cwd: '/workspace',
+  })).json()
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'stale-token-current',
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    cwd: '/workspace',
+  })).json()
+
+  const staleResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    generation: first.generation,
+  })
+  expect(staleResp.status).toBe(409)
+  expect(await staleResp.json()).toEqual({
+    error: 'generation mismatch: current generation is 2',
+  })
+
+  const currentResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    generation: current.generation,
+  })
+  expect(currentResp.status).toBe(200)
+  expect(await currentResp.json()).toEqual({ status: 'released' })
+})
+
+test('HTTP register reports an active alias conflict', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'http-taken-alias',
+    client_kind: 'codex',
+    client_session_id: 'alias-owner',
+    cwd: '/workspace',
+  })
+
+  const conflictResp = await postJson(REGISTER_URL, {
+    alias: 'http-taken-alias',
+    client_kind: 'external',
+    client_session_id: 'alias-contender',
+    cwd: '/workspace',
+  })
+  expect(conflictResp.status).toBe(409)
+  expect(await conflictResp.json()).toEqual({
+    error: 'alias already taken: http-taken-alias',
+  })
+})
+
+test('HTTP register validates JSON, required fields, and client_kind', async () => {
+  const invalidJson = await fetch(REGISTER_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{',
+  })
+  expect(invalidJson.status).toBe(400)
+  expect(await invalidJson.json()).toEqual({ error: 'invalid JSON body' })
+
+  const invalidCases: Array<{ body: unknown; error: string }> = [
+    { body: [], error: 'request body must be a JSON object' },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', cwd: '/workspace' },
+      error: 'alias is required and must be a non-empty string',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'other', client_session_id: 'thread', cwd: '/workspace' },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { alias: 'peer', client_session_id: 'thread', cwd: '/workspace' },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'codex', client_session_id: '   ', cwd: '/workspace' },
+      error: 'client_session_id is required and must be a non-empty string',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'codex', client_session_id: 'thread', cwd: '' },
+      error: 'cwd is required and must be a non-empty string',
+    },
+  ]
+
+  for (const invalidCase of invalidCases) {
+    const resp = await postJson(REGISTER_URL, invalidCase.body)
+    expect(resp.status).toBe(400)
+    expect(await resp.json()).toEqual({ error: invalidCase.error })
+  }
+})
+
+test('HTTP unregister validates identity and generation fields', async () => {
+  const invalidCases: Array<{ body: unknown; error: string }> = [
+    {
+      body: { client_kind: 'other', client_session_id: 'thread', generation: 1 },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: '', generation: 1 },
+      error: 'client_session_id is required and must be a non-empty string',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 0 },
+      error: 'generation is required and must be a positive integer',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread' },
+      error: 'generation is required and must be a positive integer',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 1.5 },
+      error: 'generation is required and must be a positive integer',
+    },
+  ]
+
+  for (const invalidCase of invalidCases) {
+    const resp = await postJson(UNREGISTER_URL, invalidCase.body)
+    expect(resp.status).toBe(400)
+    expect(await resp.json()).toEqual({ error: invalidCase.error })
+  }
 })
