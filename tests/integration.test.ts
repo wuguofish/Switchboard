@@ -688,6 +688,8 @@ test('/monitor abort releases the waiter so cancelAll isn\'t stuck on shutdown',
 // --- local external sender endpoint ---
 
 const EXTERNAL_SEND_URL = `http://127.0.0.1:${TEST_PORT}/external/send`
+const REGISTER_URL = `http://127.0.0.1:${TEST_PORT}/register`
+const UNREGISTER_URL = `http://127.0.0.1:${TEST_PORT}/unregister`
 
 test('/external/send delivers and wakes a registered Claude Code session', async () => {
   const recipient = await makeClient('external-recip')
@@ -724,4 +726,188 @@ test('/external/send delivers and wakes a registered Claude Code session', async
   expect(readParsed.messages[0].sender_alias).toBe('codex')
 
   await recipient.close()
+})
+
+async function postJson(url: string, body: unknown): Promise<Response> {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+test('HTTP register upserts active and released peer sessions with increasing generation', async () => {
+  const firstResp = await postJson(REGISTER_URL, {
+    alias: 'http-codex-one',
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    cwd: '/workspace/one',
+  })
+  expect(firstResp.status).toBe(200)
+  const first = await firstResp.json()
+  expect(first).toEqual({
+    session_id: expect.any(String),
+    alias: 'http-codex-one',
+    generation: 1,
+  })
+
+  const secondResp = await postJson(REGISTER_URL, {
+    alias: 'http-codex-two',
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    cwd: '/workspace/two',
+  })
+  expect(secondResp.status).toBe(200)
+  const second = await secondResp.json()
+  expect(second).toEqual({
+    session_id: first.session_id,
+    alias: 'http-codex-two',
+    generation: 2,
+  })
+
+  const releaseResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    generation: second.generation,
+  })
+  expect(releaseResp.status).toBe(200)
+  expect(await releaseResp.json()).toEqual({ status: 'released' })
+
+  const thirdResp = await postJson(REGISTER_URL, {
+    alias: 'http-codex-three',
+    client_kind: 'codex',
+    client_session_id: 'codex-thread-1',
+    cwd: '/workspace/three',
+  })
+  expect(thirdResp.status).toBe(200)
+  const third = await thirdResp.json()
+  expect(third).toEqual({
+    session_id: first.session_id,
+    alias: 'http-codex-three',
+    generation: 3,
+  })
+})
+
+test('HTTP unregister rejects stale generation without killing the current instance', async () => {
+  const first = await (await postJson(REGISTER_URL, {
+    alias: 'stale-token-one',
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    cwd: '/workspace',
+  })).json()
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'stale-token-current',
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    cwd: '/workspace',
+  })).json()
+
+  const staleResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    generation: first.generation,
+  })
+  expect(staleResp.status).toBe(409)
+  expect(await staleResp.json()).toEqual({
+    error: 'generation mismatch: current generation is 2',
+  })
+
+  const currentResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'external',
+    client_session_id: 'external-thread-1',
+    generation: current.generation,
+  })
+  expect(currentResp.status).toBe(200)
+  expect(await currentResp.json()).toEqual({ status: 'released' })
+})
+
+test('HTTP register reports an active alias conflict', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'http-taken-alias',
+    client_kind: 'codex',
+    client_session_id: 'alias-owner',
+    cwd: '/workspace',
+  })
+
+  const conflictResp = await postJson(REGISTER_URL, {
+    alias: 'http-taken-alias',
+    client_kind: 'external',
+    client_session_id: 'alias-contender',
+    cwd: '/workspace',
+  })
+  expect(conflictResp.status).toBe(409)
+  expect(await conflictResp.json()).toEqual({
+    error: 'alias already taken: http-taken-alias',
+  })
+})
+
+test('HTTP register validates JSON, required fields, and client_kind', async () => {
+  const invalidJson = await fetch(REGISTER_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{',
+  })
+  expect(invalidJson.status).toBe(400)
+  expect(await invalidJson.json()).toEqual({ error: 'invalid JSON body' })
+
+  const invalidCases: Array<{ body: unknown; error: string }> = [
+    { body: [], error: 'request body must be a JSON object' },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', cwd: '/workspace' },
+      error: 'alias is required and must be a non-empty string',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'other', client_session_id: 'thread', cwd: '/workspace' },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { alias: 'peer', client_session_id: 'thread', cwd: '/workspace' },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'codex', client_session_id: '   ', cwd: '/workspace' },
+      error: 'client_session_id is required and must be a non-empty string',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'codex', client_session_id: 'thread', cwd: '' },
+      error: 'cwd is required and must be a non-empty string',
+    },
+  ]
+
+  for (const invalidCase of invalidCases) {
+    const resp = await postJson(REGISTER_URL, invalidCase.body)
+    expect(resp.status).toBe(400)
+    expect(await resp.json()).toEqual({ error: invalidCase.error })
+  }
+})
+
+test('HTTP unregister validates identity and generation fields', async () => {
+  const invalidCases: Array<{ body: unknown; error: string }> = [
+    {
+      body: { client_kind: 'other', client_session_id: 'thread', generation: 1 },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: '', generation: 1 },
+      error: 'client_session_id is required and must be a non-empty string',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 0 },
+      error: 'generation is required and must be a positive integer',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread' },
+      error: 'generation is required and must be a positive integer',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 1.5 },
+      error: 'generation is required and must be a positive integer',
+    },
+  ]
+
+  for (const invalidCase of invalidCases) {
+    const resp = await postJson(UNREGISTER_URL, invalidCase.body)
+    expect(resp.status).toBe(400)
+    expect(await resp.json()).toEqual({ error: invalidCase.error })
+  }
 })

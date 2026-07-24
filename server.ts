@@ -18,12 +18,13 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, updateLastActivity, releaseSession, reactivateSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, releaseSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
 import { ConnectionRegistry } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
+import type { ClientKind } from './types'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -32,6 +33,50 @@ export interface ServerHandle {
 interface SessionEntry {
   transport: WebStandardStreamableHTTPServerTransport
   mcpServer: Server
+}
+
+const CLIENT_KINDS: readonly ClientKind[] = ['claude_code', 'codex', 'external']
+
+class RequestValidationError extends Error {}
+
+function requireJsonObject(body: unknown): Record<string, unknown> {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new RequestValidationError('request body must be a JSON object')
+  }
+  return body as Record<string, unknown>
+}
+
+function requireNonEmptyString(
+  body: Record<string, unknown>,
+  field: string,
+): string {
+  const value = body[field]
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new RequestValidationError(
+      `${field} is required and must be a non-empty string`,
+    )
+  }
+  return value.trim()
+}
+
+function requireClientKind(body: Record<string, unknown>): ClientKind {
+  const value = body.client_kind
+  if (typeof value !== 'string' || !CLIENT_KINDS.includes(value as ClientKind)) {
+    throw new RequestValidationError(
+      `client_kind must be one of: ${CLIENT_KINDS.join(', ')}`,
+    )
+  }
+  return value as ClientKind
+}
+
+function requireGeneration(body: Record<string, unknown>): number {
+  const value = body.generation
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new RequestValidationError(
+      'generation is required and must be a positive integer',
+    )
+  }
+  return value as number
 }
 
 export async function startServer(opts: {
@@ -64,6 +109,92 @@ export async function startServer(opts: {
       return existing.id
     }
     return createSession(db, { alias, cc_session_id: null })
+  }
+
+  async function parseJsonBody(req: Request): Promise<Record<string, unknown>> {
+    let parsed: unknown
+    try {
+      parsed = await req.json()
+    } catch {
+      throw new RequestValidationError('invalid JSON body')
+    }
+    return requireJsonObject(parsed)
+  }
+
+  async function handleRegister(req: Request): Promise<Response> {
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+
+    try {
+      const body = await parseJsonBody(req)
+      const alias = requireNonEmptyString(body, 'alias')
+      const client_kind = requireClientKind(body)
+      const client_session_id = requireNonEmptyString(body, 'client_session_id')
+      const cwd = requireNonEmptyString(body, 'cwd')
+      const session = registerClientSession(db, {
+        alias,
+        client_kind,
+        client_session_id,
+        cwd,
+      })
+      return Response.json({
+        session_id: session.id,
+        alias: session.alias,
+        generation: session.generation,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof RequestValidationError) {
+        return Response.json({ error: message }, { status: 400 })
+      }
+      if (message.startsWith('alias already taken:')) {
+        return Response.json({ error: message }, { status: 409 })
+      }
+      return Response.json({ error: 'internal server error' }, { status: 500 })
+    }
+  }
+
+  async function handleUnregister(req: Request): Promise<Response> {
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+
+    try {
+      const body = await parseJsonBody(req)
+      const client_kind = requireClientKind(body)
+      const client_session_id = requireNonEmptyString(body, 'client_session_id')
+      const generation = requireGeneration(body)
+      const result = unregisterClientSession(db, {
+        client_kind,
+        client_session_id,
+        generation,
+      })
+
+      if (result === 'not_found') {
+        return Response.json({ error: 'session not found' }, { status: 404 })
+      }
+      if (result === 'generation_mismatch') {
+        const current = findAnySessionByClientSessionId(
+          db,
+          client_kind,
+          client_session_id,
+        )
+        return Response.json(
+          {
+            error: `generation mismatch: current generation is ${current?.generation ?? 'unknown'}`,
+          },
+          { status: 409 },
+        )
+      }
+      return Response.json({ status: result })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof RequestValidationError) {
+        return Response.json({ error: message }, { status: 400 })
+      }
+      return Response.json({ error: 'internal server error' }, { status: 500 })
+    }
   }
 
   async function handleExternalSend(req: Request): Promise<Response> {
@@ -263,39 +394,14 @@ export async function startServer(opts: {
         let sessionId: string
 
         if (cc_session_id) {
-          // Phase 2.5 path: idempotent by cc_session_id.
-          // Use findAnySessionByCcSessionId to also find released rows so a
-          // reconnecting session can reactivate its original row.
-          const existing = findAnySessionByCcSessionId(db, cc_session_id)
-          if (existing) {
-            sessionId = existing.id
-            const isReleased = existing.released_at != null
-            if (isReleased) {
-              // Row was released on disconnect — reactivate it with the requested alias.
-              // Check for alias collision against other currently-active rows.
-              const targetAlias = role ?? existing.alias
-              if (targetAlias !== null) {
-                const conflict = findSessionByAlias(db, targetAlias)
-                if (conflict && conflict.id !== sessionId) {
-                  throw new Error(`alias already taken: ${targetAlias}`)
-                }
-              }
-              reactivateSession(db, sessionId, targetAlias)
-            } else if (role !== null && role !== existing.alias) {
-              // Active row — treat as a rename; throws AliasCollisionError if taken
-              setAliasWithCollisionCheck(db, sessionId, role)
-            }
-            updateLastActivity(db, sessionId)
-          } else {
-            // New session: validate role collision before insert
-            if (role !== null) {
-              const conflict = findSessionByAlias(db, role)
-              if (conflict) {
-                throw new Error(`alias already taken: ${role}`)
-              }
-            }
-            sessionId = createSession(db, { alias: role, cc_session_id })
-          }
+          // Durable Claude Code identities share the same generation-aware
+          // upsert semantics as HTTP peers. The MCP response shape remains
+          // unchanged for backward compatibility.
+          sessionId = registerClientSession(db, {
+            alias: role,
+            client_kind: 'claude_code',
+            client_session_id: cc_session_id,
+          }).id
         } else {
           // Phase 1 fallback path: no cc_session_id means every call is a fresh session
           if (role !== null) {
@@ -328,10 +434,7 @@ export async function startServer(opts: {
             })
         })
 
-        const finalAlias =
-          cc_session_id && role === null
-            ? findSessionById(db, sessionId)?.alias ?? null
-            : role
+        const finalAlias = findSessionById(db, sessionId)?.alias ?? null
         const anonymous = finalAlias === null
         const responseBody: Record<string, unknown> = {
           session_id: sessionId,
@@ -719,6 +822,14 @@ export async function startServer(opts: {
 
       if (url.pathname === '/external/send') {
         return handleExternalSend(req)
+      }
+
+      if (url.pathname === '/register') {
+        return handleRegister(req)
+      }
+
+      if (url.pathname === '/unregister') {
+        return handleUnregister(req)
       }
 
       if (url.pathname !== '/mcp') {

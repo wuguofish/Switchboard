@@ -49,6 +49,9 @@ function migrateSchema(db: Database): void {
     if (!sessionColumns.has('last_seen_at')) {
       db.exec('ALTER TABLE sessions ADD COLUMN last_seen_at TEXT')
     }
+    if (!sessionColumns.has('generation')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1')
+    }
     if (!sessionColumns.has('released_at')) {
       db.exec('ALTER TABLE sessions ADD COLUMN released_at TEXT')
     }
@@ -106,9 +109,9 @@ export function createClientSession(
   db.query(`
     INSERT INTO sessions (
       id, alias, client_kind, client_session_id, cwd,
-      created_at, last_activity, last_seen_at, released_at
+      created_at, last_activity, last_seen_at, generation, released_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL)
   `).run(
     id,
     opts.alias,
@@ -124,7 +127,7 @@ export function createClientSession(
 export function findSessionById(db: Database, id: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, released_at
+            last_activity, last_seen_at, generation, released_at
      FROM sessions
      WHERE id = ?`,
   ).get(id)
@@ -134,7 +137,7 @@ export function findSessionById(db: Database, id: string): SessionRow | null {
 export function findSessionByAlias(db: Database, alias: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, released_at
+            last_activity, last_seen_at, generation, released_at
      FROM sessions
      WHERE alias = ? AND released_at IS NULL`,
   ).get(alias)
@@ -148,7 +151,7 @@ export function findSessionByClientSessionId(
 ): SessionRow | null {
   const row = db.query<SessionRow, [ClientKind, string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, released_at
+            last_activity, last_seen_at, generation, released_at
      FROM sessions
      WHERE client_kind = ? AND client_session_id = ? AND released_at IS NULL`,
   ).get(client_kind, client_session_id)
@@ -173,9 +176,11 @@ export function findAnySessionByClientSessionId(
 ): SessionRow | null {
   const row = db.query<SessionRow, [ClientKind, string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, released_at
+            last_activity, last_seen_at, generation, released_at
      FROM sessions
-     WHERE client_kind = ? AND client_session_id = ?`,
+     WHERE client_kind = ? AND client_session_id = ?
+     ORDER BY (released_at IS NULL) DESC, generation DESC, created_at DESC
+     LIMIT 1`,
   ).get(client_kind, client_session_id)
   return row ?? null
 }
@@ -185,6 +190,101 @@ export function findAnySessionByCcSessionId(
   cc_session_id: string,
 ): SessionRow | null {
   return findAnySessionByClientSessionId(db, 'claude_code', cc_session_id)
+}
+
+export interface RegisterClientSessionInput {
+  alias: string | null
+  client_kind: ClientKind
+  client_session_id: string
+  cwd?: string | null
+}
+
+/**
+ * Register a durable client identity. Existing active or released rows are
+ * reused and receive a fresh generation so delayed lifecycle requests from an
+ * older client instance cannot affect the new one.
+ */
+export function registerClientSession(
+  db: Database,
+  input: RegisterClientSessionInput,
+): SessionRow {
+  return db.transaction(() => {
+    const existing = findAnySessionByClientSessionId(
+      db,
+      input.client_kind,
+      input.client_session_id,
+    )
+
+    if (!existing) {
+      if (input.alias !== null) {
+        const conflict = findSessionByAlias(db, input.alias)
+        if (conflict) {
+          throw new Error(`alias already taken: ${input.alias}`)
+        }
+      }
+      const id = createClientSession(db, input)
+      return findSessionById(db, id)!
+    }
+
+    const targetAlias = input.alias ?? existing.alias
+    if (targetAlias !== null) {
+      const conflict = findSessionByAlias(db, targetAlias)
+      if (conflict && conflict.id !== existing.id) {
+        throw new Error(`alias already taken: ${targetAlias}`)
+      }
+    }
+
+    const now = nowUtc()
+    db.query(`
+      UPDATE sessions
+      SET alias = ?,
+          cwd = CASE WHEN ? THEN ? ELSE cwd END,
+          last_activity = ?,
+          generation = generation + 1,
+          released_at = NULL
+      WHERE id = ?
+    `).run(
+      targetAlias,
+      input.cwd !== undefined ? 1 : 0,
+      input.cwd ?? null,
+      now,
+      existing.id,
+    )
+    return findSessionById(db, existing.id)!
+  })()
+}
+
+export type UnregisterClientSessionResult =
+  | 'released'
+  | 'already_released'
+  | 'not_found'
+  | 'generation_mismatch'
+
+export function unregisterClientSession(
+  db: Database,
+  input: {
+    client_kind: ClientKind
+    client_session_id: string
+    generation: number
+  },
+): UnregisterClientSessionResult {
+  return db.transaction(() => {
+    const existing = findAnySessionByClientSessionId(
+      db,
+      input.client_kind,
+      input.client_session_id,
+    )
+    if (!existing) return 'not_found'
+    if (existing.generation !== input.generation) return 'generation_mismatch'
+    if (existing.released_at !== null) return 'already_released'
+
+    const result = db.query(`
+      UPDATE sessions
+      SET alias = NULL, released_at = ?
+      WHERE id = ? AND generation = ? AND released_at IS NULL
+    `).run(nowUtc(), existing.id, input.generation)
+    return Number(result.changes) === 1 ? 'released' : 'generation_mismatch'
+  })()
 }
 
 export function releaseSession(db: Database, id: string): void {
@@ -323,7 +423,7 @@ export function recallMessage(db: Database, input: RecallInput): number {
 export function listAllSessions(db: Database): SessionRow[] {
   return db.query<SessionRow, []>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, released_at
+            last_activity, last_seen_at, generation, released_at
      FROM sessions
      ORDER BY created_at ASC`,
   ).all()

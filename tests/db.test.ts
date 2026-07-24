@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -262,6 +262,7 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
   expect(sessionColumns).toContain('client_session_id')
   expect(sessionColumns).toContain('cwd')
   expect(sessionColumns).toContain('last_seen_at')
+  expect(sessionColumns).toContain('generation')
   expect(sessionColumns).not.toContain('cc_session_id')
 
   const sessions = migrated.query<{
@@ -274,9 +275,10 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
     released_at: string | null
     cwd: string | null
     last_seen_at: string | null
+    generation: number
   }, []>(`
     SELECT id, alias, client_kind, client_session_id, created_at,
-           last_activity, released_at, cwd, last_seen_at
+           last_activity, released_at, cwd, last_seen_at, generation
     FROM sessions
     ORDER BY id
   `).all()
@@ -291,6 +293,7 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
       released_at: null,
       cwd: null,
       last_seen_at: null,
+      generation: 1,
     },
     {
       id: 'released-id',
@@ -302,6 +305,7 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
       released_at: '2026-04-16T02:00:00Z',
       cwd: null,
       last_seen_at: null,
+      generation: 1,
     },
   ])
 
@@ -341,6 +345,95 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
 
   migrated.close()
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('registerClientSession upserts identity and increments generation', () => {
+  const first = registerClientSession(db, {
+    alias: 'codex-one',
+    client_kind: 'codex',
+    client_session_id: 'thread-123',
+    cwd: '/workspace/one',
+  })
+  expect(first.generation).toBe(1)
+
+  const second = registerClientSession(db, {
+    alias: 'codex-two',
+    client_kind: 'codex',
+    client_session_id: 'thread-123',
+    cwd: '/workspace/two',
+  })
+  expect(second.id).toBe(first.id)
+  expect(second.alias).toBe('codex-two')
+  expect(second.cwd).toBe('/workspace/two')
+  expect(second.generation).toBe(2)
+
+  releaseSession(db, first.id)
+  const third = registerClientSession(db, {
+    alias: 'codex-three',
+    client_kind: 'codex',
+    client_session_id: 'thread-123',
+    cwd: '/workspace/three',
+  })
+  expect(third.id).toBe(first.id)
+  expect(third.released_at).toBeNull()
+  expect(third.generation).toBe(3)
+})
+
+test('registerClientSession prefers the active row over released identity history', () => {
+  const releasedId = createClientSession(db, {
+    alias: 'old-instance',
+    client_kind: 'codex',
+    client_session_id: 'identity-with-history',
+  })
+  releaseSession(db, releasedId)
+  const activeId = createClientSession(db, {
+    alias: 'current-instance',
+    client_kind: 'codex',
+    client_session_id: 'identity-with-history',
+  })
+
+  const registered = registerClientSession(db, {
+    alias: 'renamed-current-instance',
+    client_kind: 'codex',
+    client_session_id: 'identity-with-history',
+    cwd: '/workspace',
+  })
+  expect(registered.id).toBe(activeId)
+  expect(registered.generation).toBe(2)
+  expect(findSessionById(db, releasedId)?.released_at).not.toBeNull()
+})
+
+test('unregisterClientSession rejects a stale generation without releasing active row', () => {
+  const first = registerClientSession(db, {
+    alias: 'generation-one',
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    cwd: '/workspace',
+  })
+  const second = registerClientSession(db, {
+    alias: 'generation-two',
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    cwd: '/workspace',
+  })
+
+  expect(unregisterClientSession(db, {
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    generation: first.generation,
+  })).toBe('generation_mismatch')
+  expect(findSessionById(db, second.id)?.released_at).toBeNull()
+
+  expect(unregisterClientSession(db, {
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    generation: second.generation,
+  })).toBe('released')
+  expect(unregisterClientSession(db, {
+    client_kind: 'codex',
+    client_session_id: 'thread-generation',
+    generation: second.generation,
+  })).toBe('already_released')
 })
 
 test('client session helpers use client_kind as an identity namespace', () => {

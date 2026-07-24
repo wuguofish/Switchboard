@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at        TEXT NOT NULL,
     last_activity     TEXT NOT NULL,
     last_seen_at      TEXT,
+    generation        INTEGER NOT NULL DEFAULT 1,
     released_at       TEXT
 );
 
