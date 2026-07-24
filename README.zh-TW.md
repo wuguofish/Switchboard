@@ -223,7 +223,7 @@ Monitor({
 
 觸發規則值得內化：
 - 別人 `send(to=你)` 會喚醒你。
-- 別人 `broadcast`（包含你；也就是所有非 released 且非 sender 的 session）會喚醒你。
+- 別人的 `broadcast` 只有在所選 scope 包含你的 session 時才會喚醒你。
 - *你自己* 的 `send` / `broadcast` **不會**喚醒自己——server 端會排除 sender。
 - 別人之間的 1-to-1 不會洩進你的 stream。
 

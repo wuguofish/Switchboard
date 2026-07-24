@@ -230,7 +230,7 @@ The `while … sleep 5` wrapper auto-reconnects if the daemon restarts or the TC
 
 Trigger rules worth internalising:
 - A direct `send(to=you)` wakes you.
-- A `broadcast` that includes you (every non-released session except the sender) wakes you.
+- A `broadcast` wakes you only when its selected scope includes your session.
 - *Your own* `send` / `broadcast` does **not** wake you — the sender is excluded on the server side.
 - Other sessions' 1-to-1 traffic never leaks onto your stream.
 
