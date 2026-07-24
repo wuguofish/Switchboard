@@ -150,12 +150,21 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `register` | `role?`, `cc_session_id?` | `{session_id, alias, anonymous}` |
 | `set_alias` | `alias` | `{old_alias, new_alias}` |
 | `send` | `to`, `message` | `{message_id, delivered_notification}` |
-| `broadcast` | `message` | `{broadcast_id, recipient_count, notified_count}` |
+| `broadcast` | `message`, `scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}` |
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
+| `unregister` | — | `{status, released_alias}` — `status` is `released`, `stale_ignored` (a newer generation re-registered this identity; nothing was released), or `already_offline` |
 
-`to` accepts either an alias or a session UUID. `delivered_notification` is true when the recipient has either a live `/poll` long-poll *or* an active `/monitor` subscription — the in-memory polling set covers both wake paths. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+`to` accepts either an alias or a session UUID. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+
+`broadcast` accepts an optional `scope` (default `all`, preserving legacy calls):
+
+- `all` — every active session except the sender
+- `same_kind` — sessions sharing the sender's `client_kind`, across cwds
+- `same_cwd` — sessions sharing the sender's registered `cwd`, across kinds; if either side's cwd is NULL there is no match
+
+Codex-kind recipients are only written to when they are online at insert time — offline Codex peers accumulate **no** broadcast backlog. Claude Code and external recipients keep durable offline mailboxes. `recipient_count` and `notified_count` are both derived from the same filtered recipient set.
 
 ## HTTP endpoints
 
@@ -165,7 +174,22 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
   `{ "to": "<alias-or-session-id>", "message": "...", "from": "codex" }`.
   `from` is optional and defaults to `codex`. Returns
   `{message_id, delivered_notification}`.
-- `GET /poll?cc_session_id=<uuid>&timeout_s=<1..250>` — long-poll for unread mail. Returns JSON:
+- `POST /register` — HTTP registration for peers that hold no MCP connection
+  (e.g. the codex-bridge waker). JSON body:
+  `{ "alias": "...", "client_kind": "claude_code"|"codex"|"external", "client_session_id": "<stable-instance-id>", "cwd": "/abs/path" }`.
+  Idempotent upsert keyed on `(client_kind, client_session_id)`; re-registering
+  reactivates the row and bumps its generation. Returns
+  `{session_id, alias, generation}`; 400 on validation errors, 409 on alias
+  collision.
+- `POST /unregister` — graceful peer sign-off. JSON body:
+  `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`.
+  The generation must match the current row — a delayed unregister from an
+  older instance cannot release a newer one (409). Returns
+  `{status: "released" | "already_released"}`, 404 when unknown.
+- `GET /poll?client_kind=<kind>&client_session_id=<id>&timeout_s=<1..250>` —
+  canonical long-poll for unread mail. Every call also renews the caller's
+  lease (`last_seen_at`). The legacy form `?cc_session_id=<uuid>` remains
+  supported as an alias for `client_kind=claude_code`. Returns JSON:
   - `{status: "unread", count, alias, message}` — Stop-hook shim exits 2
   - `{status: "timeout"}` — shim re-dials
   - `{status: "no-session"}` — alias is gone; shim exits 0
@@ -222,10 +246,41 @@ The `SessionStart` hook injects the Claude Code session id into each session, an
 
 Without `cc_session_id`, registration still succeeds (Phase 1 fallback) but every call creates a fresh row.
 
+## Bidirectional peers: identity, generation, lease
+
+Sessions are generalized beyond Claude Code:
+
+- **`client_kind`** namespaces identities: `claude_code`, `codex`, `external`.
+  The unique-identity index is `(client_kind, client_session_id)`, so a Codex
+  instance id can never collide with a Claude Code session id.
+- **Stable identity, not thread identity.** A peer's `client_session_id` is a
+  durable instance UUID (for the Codex waker it persists in
+  `~/.codex/waker-instance-id`). Conversation thread ids are client-side state
+  and never enter the database.
+- **Generation guard.** Every re-register bumps the row's generation. All
+  release paths — HTTP `/unregister`, the MCP `unregister` tool, and MCP
+  transport cleanup on disconnect — are generation-checked, so a stale
+  instance's late sign-off can never evict the live one.
+- **Lease-based online.** `online = live MCP connection OR an active
+  /poll(/monitor) wait OR a valid lease`. Each `/poll` renews `last_seen_at`;
+  the lease TTL is five minutes (one 250 s long-poll plus reconnect slack).
+  Graceful exits unregister by generation; crashes simply let the lease
+  expire. Message truth remains `read_at` — wakes are best-effort doorbells.
+
+**Known limitation (tracked follow-up):** Switchboard does not yet expose a
+generation/identity-guarded HTTP endpoint for peers to read and mark their
+messages. The companion Codex waker (codex-bridge) therefore degrades to a
+deduplicated unread notification and does not read SQLite directly.
+
 ## Retention & cleanup
 
 - Messages marked read are deleted after 7 days.
-- Sessions that look orphaned — no active MCP connection *and* no activity for 5+ minutes — are released on the next retention tick (every minute), freeing their aliases.
+- Sessions whose lease has been stale for over 24 hours — no MCP connection,
+  no polling, no lease renewal — are released by the retention sweep (every
+  2 hours), freeing their aliases. A crashed session that never fired
+  `transport.onclose` can therefore hold its alias for up to ~26 hours; the
+  same identity can always reclaim its row immediately via idempotent
+  re-register.
 - The Stop-hook shim self-terminates when its Claude Code parent dies, so no orphan poller outlives its session. Transient daemon errors (restart, TCP blip, 5xx) back off and retry rather than exiting, so a brief outage does not leave the session unreachable until the next Claude Code turn. The legacy `bun poller.ts` fallback does the same parent-pid check via `process.kill(ppid, 0)`.
 
 ## Security
@@ -247,11 +302,12 @@ bunx tsc --noEmit        # type check
 
 ```
 main.ts                  # daemon entry
-server.ts                # MCP tool handlers + /poll + /monitor + Bun.serve wiring
-db.ts                    # SQLite helpers (sessions, messages, retention queries)
-schema.sql               # DB schema with Phase 2.5 columns
+server.ts                # MCP tool handlers + /register + /unregister + /poll + /monitor + Bun.serve wiring
+db.ts                    # SQLite helpers (sessions, messages, generation-aware upsert, retention queries)
+schema.sql               # DB schema (client_kind / client_session_id / cwd / last_seen_at / generation / reply_to)
+online.ts                # shared online predicate: MCP connection OR polling OR valid lease
 connections.ts           # in-memory ConnectionRegistry for push callbacks
-waiters.ts               # UnreadWaiterRegistry — shared by /poll and /monitor
+waiters.ts               # UnreadWaiterRegistry — kind-qualified, shared by /poll and /monitor
 retention.ts             # periodic expired-message + stale-session cleanup
 aliases.ts               # alias collision handling + target resolution
 poller.ts                # legacy bun-based Stop-hook poller (fallback)

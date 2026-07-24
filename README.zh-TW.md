@@ -149,12 +149,21 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
 | `register` | `role?`、`cc_session_id?` | `{session_id, alias, anonymous}` |
 | `set_alias` | `alias` | `{old_alias, new_alias}` |
 | `send` | `to`、`message` | `{message_id, delivered_notification}` |
-| `broadcast` | `message` | `{broadcast_id, recipient_count, notified_count}` |
+| `broadcast` | `message`、`scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}` |
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
+| `unregister` | — | `{status, released_alias}`——`status` 為 `released`、`stale_ignored`（同一 identity 已被更新世代重新註冊，未釋放任何東西）或 `already_offline` |
 
-`to` 可以是 alias 或 session UUID。`delivered_notification` 只要收件人當下有 active 的 `/poll` long-poll *或* `/monitor` 訂閱就會回 true——in-memory 的 polling set 涵蓋兩條 wake path。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
+`to` 可以是 alias 或 session UUID。`delivered_notification` 在訊息經由活的 MCP 連線推送成功、*或*收件人依下方 lease/polling 判定為在線時回 true。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
+
+`broadcast` 可帶選填的 `scope`（預設 `all`，舊呼叫行為不變）：
+
+- `all`——除寄件人外的全部 active session
+- `same_kind`——與寄件人同 `client_kind`，跨 cwd
+- `same_cwd`——與寄件人註冊的 `cwd` 相同，跨 kind；任一方 cwd 為 NULL 即不匹配
+
+`client_kind` 為 codex 的收件人**只有在線時才寫入訊息列**——離線的 Codex peer 不累積任何廣播積壓；Claude Code 與 external 收件人維持離線也入列、上線再讀。`recipient_count` 與 `notified_count` 都以同一份過濾後的收件清單計算。
 
 ## HTTP endpoints
 
@@ -163,7 +172,17 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
   codex-bridge 在背景 job 完成後通知 Claude Code。JSON body：
   `{ "to": "<alias-or-session-id>", "message": "...", "from": "codex" }`
  ；`from` 可省略，預設 `codex`。回傳 `{message_id, delivered_notification}`。
-- `GET /poll?cc_session_id=<uuid>&timeout_s=<1..250>` — long-poll 等待新訊息，回 JSON：
+- `POST /register` — 給不持 MCP 連線的 peer（例如 codex-bridge 的 waker）用的 HTTP 註冊。JSON body：
+  `{ "alias": "...", "client_kind": "claude_code"|"codex"|"external", "client_session_id": "<穩定的 instance id>", "cwd": "/絕對路徑" }`。
+  以 `(client_kind, client_session_id)` 冪等 upsert；重複註冊會重新啟用該列並遞增 generation。回傳
+  `{session_id, alias, generation}`；驗證錯誤回 400、alias 衝突回 409。
+- `POST /unregister` — peer 優雅下線。JSON body：
+  `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`。
+  generation 必須與現值相符——舊 instance 遲到的下線請求動不了新 instance（409）。回傳
+  `{status: "released" | "already_released"}`，查無此 identity 回 404。
+- `GET /poll?client_kind=<kind>&client_session_id=<id>&timeout_s=<1..250>` —
+  正式版 long-poll 等待新訊息，每次呼叫同時為呼叫者續租 lease（更新 `last_seen_at`）。
+  舊格式 `?cc_session_id=<uuid>` 仍支援，等同 `client_kind=claude_code`。回 JSON：
   - `{status: "unread", count, alias, message}` — Stop-hook shim 應 `exit 2`
   - `{status: "timeout"}` — shim 重新撥接
   - `{status: "no-session"}` — alias 消失；shim `exit 0`
@@ -220,10 +239,32 @@ Monitor({
 
 不帶 `cc_session_id` 也能 register（Phase 1 fallback），只是每次都建新 row。
 
+## 雙邊 peer：identity、generation、lease
+
+session 已一般化，不再是 Claude Code 專屬：
+
+- **`client_kind` 命名空間**：`claude_code`、`codex`、`external`。identity 唯一索引為
+  `(client_kind, client_session_id)`，Codex 的 instance id 永遠不會跟 Claude Code 的 session id 撞衫。
+- **穩定 identity，不是 thread identity**。peer 的 `client_session_id` 是持久的 instance UUID
+  （Codex waker 存在 `~/.codex/waker-instance-id`）；對話 thread id 屬 client 端狀態，絕不進資料庫。
+- **generation guard**：每次重新註冊遞增 generation。所有釋放路徑——HTTP `/unregister`、
+  MCP `unregister` 工具、MCP transport 斷線清理——都檢查 generation，舊 instance 遲到的
+  下線動作不可能誤殺活著的新 instance。
+- **lease 制 online**：`online = 活的 MCP 連線 OR 進行中的 /poll(/monitor) OR 有效 lease`。
+  每次 `/poll` 更新 `last_seen_at`；lease TTL 為 5 分鐘（涵蓋一次 250 秒 long-poll 加重連緩衝）。
+  優雅退出走 generation unregister；crash 就讓 lease 自然過期。訊息的真相永遠是
+  `read_at`——喚醒只是 best-effort 的門鈴。
+
+**已知限制（列管後續項目）**：Switchboard 尚未提供以 generation/identity 驗證身分的
+HTTP 讀信端點供 peer 讀取並標記自己的訊息。codex-bridge 的 Codex waker 因此降級為
+去重後的 unread 通知，且不直接讀 SQLite。
+
 ## 保留 & 清理
 
 - 已讀訊息 7 天後自動刪除。
-- 看起來孤兒的 session（沒 MCP 連線 *且* 5+ 分鐘沒活動）會在下一次保留 tick（每分鐘一次）被 release，alias 讓出。
+- lease 過期超過 24 小時的 session（沒 MCP 連線、沒 polling、沒續租）由保留巡檢
+  （每 2 小時一次）補蓋 released_at、讓出 alias。crash 且沒觸發 `transport.onclose` 的
+  session 因此最長可能占用 alias 約 26 小時；同一 identity 隨時可透過冪等重新註冊立即取回自己的列。
 - Stop-hook shim 偵測到 Claude Code parent 死了就自我了斷，不會留下 orphan poller。暫時性 daemon 錯誤（重啟、TCP 閃斷、5xx）會 backoff retry 而不退出，短暫 outage 不會讓 session 到下次 turn 才能接收訊息。舊版 `bun poller.ts` fallback 同樣用 `process.kill(ppid, 0)` 做 parent-pid check。
 
 ## 安全
@@ -245,11 +286,12 @@ bunx tsc --noEmit        # type check
 
 ```
 main.ts                  # daemon 入口
-server.ts                # MCP 工具 handler + /poll + /monitor + Bun.serve
-db.ts                    # SQLite helper（session、訊息、保留查詢）
-schema.sql               # Phase 2.5 欄位的 schema
+server.ts                # MCP 工具 handler + /register + /unregister + /poll + /monitor + Bun.serve
+db.ts                    # SQLite helper（session、訊息、generation-aware upsert、保留查詢）
+schema.sql               # schema（client_kind / client_session_id / cwd / last_seen_at / generation / reply_to）
+online.ts                # 共用 online 判定：MCP 連線 OR polling OR 有效 lease
 connections.ts           # in-memory ConnectionRegistry，管 push callback
-waiters.ts               # UnreadWaiterRegistry，/poll 和 /monitor 共用
+waiters.ts               # UnreadWaiterRegistry，kind-qualified，/poll 和 /monitor 共用
 retention.ts             # 定期清過期訊息 + 孤兒 session
 aliases.ts               # alias 碰撞處理 + 目標解析
 poller.ts                # 舊版 bun 實作的 Stop-hook poller（fallback）
