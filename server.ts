@@ -595,9 +595,16 @@ export async function startServer(opts: {
             content: [{ type: 'text', text: JSON.stringify({ status: 'already_offline' }) }],
           }
         }
-        const releasedAlias = findSessionById(db, currentSwitchboardId)?.alias ?? null
-        releaseSession(db, currentSwitchboardId)
-        registry.unregister(currentSwitchboardId)
+        // Generation guard: if a newer transport re-registered this identity,
+        // a stale transport's explicit unregister must not release the new
+        // generation's row — mirror the transport.onclose cleanup semantics.
+        if (currentPushCallback) {
+          registry.unregister(currentSwitchboardId, currentPushCallback)
+        }
+        const priorAlias = findSessionById(db, currentSwitchboardId)?.alias ?? null
+        const released =
+          currentGeneration !== null &&
+          releaseSessionIfGeneration(db, currentSwitchboardId, currentGeneration)
         currentSwitchboardId = null
         currentGeneration = null
         currentPushCallback = null
@@ -605,7 +612,11 @@ export async function startServer(opts: {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ status: 'released', released_alias: releasedAlias }),
+              text: JSON.stringify(
+                released
+                  ? { status: 'released', released_alias: priorAlias }
+                  : { status: 'stale_ignored', released_alias: null },
+              ),
             },
           ],
         }

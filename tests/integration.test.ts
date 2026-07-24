@@ -550,6 +550,48 @@ test('alias is released on disconnect, new client can reclaim the name', async (
   await c2.close()
 })
 
+test('explicit unregister from an older MCP transport does not release a newer generation', async () => {
+  const oldClient = await makeClient('stale-unreg-old')
+  const oldRegistration = JSON.parse(((await oldClient.callTool({
+    name: 'register',
+    arguments: { role: 'stale-unreg-old', cc_session_id: 'stale-unreg-shared' },
+  })).content as any[])[0].text)
+
+  const newClient = await makeClient('stale-unreg-new')
+  const newRegistration = JSON.parse(((await newClient.callTool({
+    name: 'register',
+    arguments: { role: 'stale-unreg-current', cc_session_id: 'stale-unreg-shared' },
+  })).content as any[])[0].text)
+  expect(newRegistration.session_id).toBe(oldRegistration.session_id)
+
+  // The stale transport actively unregisters — the guard must ignore it.
+  const staleResult = JSON.parse(((await oldClient.callTool({
+    name: 'unregister',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(staleResult.status).toBe('stale_ignored')
+  expect(staleResult.released_alias).toBeNull()
+
+  const sessions = JSON.parse(((await newClient.callTool({
+    name: 'list_sessions',
+    arguments: {},
+  })).content as any[])[0].text)
+  const current = sessions.find((s: any) => s.session_id === newRegistration.session_id)
+  expect(current?.alias).toBe('stale-unreg-current')
+  expect(current?.online).toBe(true)
+
+  // The current generation's own unregister still releases normally.
+  const currentResult = JSON.parse(((await newClient.callTool({
+    name: 'unregister',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(currentResult.status).toBe('released')
+  expect(currentResult.released_alias).toBe('stale-unreg-current')
+
+  await oldClient.close()
+  await newClient.close()
+})
+
 test('closing an older MCP transport does not release a newer generation', async () => {
   const oldClient = await makeClient('generation-old')
   const oldRegistration = JSON.parse(((await oldClient.callTool({
