@@ -18,13 +18,14 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, releaseSession, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
-import { ConnectionRegistry } from './connections'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, releaseSession, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
+import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
 import type { ClientKind } from './types'
+import { isSessionOnline } from './online'
 
 export interface ServerHandle {
   stop(): Promise<void>
@@ -87,20 +88,6 @@ export async function startServer(opts: {
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
   const waiters = new UnreadWaiterRegistry()
-
-  // "recipient can be auto-woken" — true iff a curl shim is currently
-  // long-polling /poll for this cc_session_id. A shim in /poll guarantees
-  // the daemon will push the message the moment insertMessage completes.
-  //
-  // Previously this also fell back to poller.ts's state-file check
-  // (legacy bun-based poller). That was removed because: (1) the shim
-  // doesn't write state files, so on a stale file the pid may have been
-  // reused by an unrelated process, yielding false positives; (2) the
-  // in-memory polling set is the truthful signal.
-  const canAutoWake = (ccSessionId: string | null | undefined): boolean => {
-    if (!ccSessionId) return false
-    return waiters.isPolling(ccSessionId)
-  }
 
   const getOrCreateExternalSender = (alias: string): string => {
     const existing = findSessionByAlias(db, alias)
@@ -237,7 +224,8 @@ export async function startServer(opts: {
       const recipient = findSessionById(db, targetId)
       return Response.json({
         message_id,
-        delivered_notification: pushed && canAutoWake(recipient?.client_session_id),
+        delivered_notification:
+          pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
       })
     } catch (e) {
       return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 })
@@ -261,6 +249,8 @@ export async function startServer(opts: {
   function createMcpSession(): WebStandardStreamableHTTPServerTransport {
     // Current switchboard session ID for this MCP session (set by register tool)
     let currentSwitchboardId: string | null = null
+    let currentGeneration: number | null = null
+    let currentPushCallback: PushCallback | null = null
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
@@ -278,8 +268,12 @@ export async function startServer(opts: {
         mcpSessionToSwitchboard.delete(mcpSessionId)
       }
       if (currentSwitchboardId) {
-        releaseSession(db, currentSwitchboardId)
-        registry.unregister(currentSwitchboardId)
+        if (currentPushCallback) {
+          registry.unregister(currentSwitchboardId, currentPushCallback)
+        }
+        if (currentGeneration !== null) {
+          releaseSessionIfGeneration(db, currentSwitchboardId, currentGeneration)
+        }
       }
     }
 
@@ -392,16 +386,19 @@ export async function startServer(opts: {
         const cc_session_id = (argsObj.cc_session_id as string | undefined) ?? null
 
         let sessionId: string
+        let generation: number
 
         if (cc_session_id) {
           // Durable Claude Code identities share the same generation-aware
           // upsert semantics as HTTP peers. The MCP response shape remains
           // unchanged for backward compatibility.
-          sessionId = registerClientSession(db, {
+          const registered = registerClientSession(db, {
             alias: role,
             client_kind: 'claude_code',
             client_session_id: cc_session_id,
-          }).id
+          })
+          sessionId = registered.id
+          generation = registered.generation
         } else {
           // Phase 1 fallback path: no cc_session_id means every call is a fresh session
           if (role !== null) {
@@ -411,14 +408,16 @@ export async function startServer(opts: {
             }
           }
           sessionId = createSession(db, { alias: role, cc_session_id: null })
+          generation = findSessionById(db, sessionId)!.generation
         }
 
         currentSwitchboardId = sessionId
+        currentGeneration = generation
         if (transport.sessionId) {
           mcpSessionToSwitchboard.set(transport.sessionId, sessionId)
         }
 
-        registry.register(sessionId, (payload) => {
+        const pushCallback: PushCallback = (payload) => {
           mcpServer
             .notification({
               method: 'notifications/switchboard/new_message',
@@ -430,9 +429,11 @@ export async function startServer(opts: {
               // Drop the leaked registry entry so list_sessions stops
               // reporting this session as online; retention will release
               // the DB row on its next tick.
-              registry.unregister(sessionId)
+              registry.unregister(sessionId, pushCallback)
             })
-        })
+        }
+        currentPushCallback = pushCallback
+        registry.register(sessionId, pushCallback)
 
         const finalAlias = findSessionById(db, sessionId)?.alias ?? null
         const anonymous = finalAlias === null
@@ -498,18 +499,14 @@ export async function startServer(opts: {
         // returns immediately with SWITCHBOARD INBOX. Safe to call even if
         // no waiter exists.
         waiters.notify(targetId)
-        // delivered_notification promises "the recipient will notice this
-        // without user intervention" — that requires a live transport
-        // (pushed) and a live auto-wake path (bun poller state file OR an
-        // active curl long-poll). Anonymous / Phase 1 recipients with no
-        // cc_session_id always get false — the honest answer.
         const recipient = findSessionById(db, targetId)
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
               message_id,
-              delivered_notification: pushed && canAutoWake(recipient?.client_session_id),
+              delivered_notification:
+                pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
             }),
           }],
         }
@@ -525,16 +522,20 @@ export async function startServer(opts: {
         })
         // Wake every long-poll waiter that just got a new message row.
         waiters.notifyMany(recipient_ids)
-        const onlineIds = registry.listOnline().filter(id => id !== currentSwitchboardId)
         let notified_count = 0
-        for (const id of onlineIds) {
+        for (const id of recipient_ids) {
           const pushed = registry.pushNotification(id, {
             sender_alias: sender?.alias ?? null,
             sender_id: currentSwitchboardId,
             is_broadcast: true,
           })
           const recipient = findSessionById(db, id)
-          if (pushed && canAutoWake(recipient?.client_session_id)) notified_count++
+          if (
+            pushed ||
+            (recipient ? isSessionOnline(recipient, registry, waiters) : false)
+          ) {
+            notified_count++
+          }
         }
         return {
           content: [{
@@ -570,7 +571,7 @@ export async function startServer(opts: {
         const result = all.map(s => ({
           session_id: s.id,
           alias: s.alias,
-          online: registry.isOnline(s.id),
+          online: isSessionOnline(s, registry, waiters),
           created_at: toTaipeiISOString(s.created_at),
           last_activity: toTaipeiISOString(s.last_activity),
         }))
@@ -598,6 +599,8 @@ export async function startServer(opts: {
         releaseSession(db, currentSwitchboardId)
         registry.unregister(currentSwitchboardId)
         currentSwitchboardId = null
+        currentGeneration = null
+        currentPushCallback = null
         return {
           content: [
             {
@@ -620,7 +623,7 @@ export async function startServer(opts: {
   }
 
   /**
-   * GET /poll?cc_session_id=X&timeout_s=N
+   * GET /poll?client_kind=K&client_session_id=X&timeout_s=N
    *
    * Long-poll endpoint for Stop-hook shim scripts. Replaces bun poller.ts —
    * the shim calls this and blocks on the daemon instead of running its own
@@ -638,19 +641,48 @@ export async function startServer(opts: {
       return new Response('Method Not Allowed', { status: 405 })
     }
     const ccSessionId = url.searchParams.get('cc_session_id')
-    if (!ccSessionId) {
-      return new Response('Missing cc_session_id', { status: 400 })
+    const canonicalSessionId = url.searchParams.get('client_session_id')
+    const canonicalKind = url.searchParams.get('client_kind')
+    if (ccSessionId && (canonicalSessionId || canonicalKind)) {
+      return new Response(
+        'Use either cc_session_id or client_kind + client_session_id',
+        { status: 400 },
+      )
+    }
+
+    let clientKind: ClientKind
+    let clientSessionId: string
+    if (ccSessionId) {
+      clientKind = 'claude_code'
+      clientSessionId = ccSessionId
+    } else {
+      if (!canonicalSessionId) {
+        return new Response('Missing client_session_id', { status: 400 })
+      }
+      if (!canonicalKind) {
+        return new Response('Missing client_kind', { status: 400 })
+      }
+      if (!CLIENT_KINDS.includes(canonicalKind as ClientKind)) {
+        return new Response(
+          `Invalid client_kind; expected one of: ${CLIENT_KINDS.join(', ')}`,
+          { status: 400 },
+        )
+      }
+      clientKind = canonicalKind as ClientKind
+      clientSessionId = canonicalSessionId
     }
     const timeoutRaw = url.searchParams.get('timeout_s') ?? '240'
     const parsed = parseInt(timeoutRaw, 10)
     const timeoutS = Math.min(Math.max(Number.isFinite(parsed) ? parsed : 240, 1), 250)
 
-    const session = findSessionByCcSessionId(db, ccSessionId)
+    const session = findSessionByClientSessionId(db, clientKind, clientSessionId)
     if (!session || !session.alias) {
       return Response.json({ status: 'no-session' })
     }
 
-    // A live curl long-poll counts as activity for retention purposes.
+    // Every valid poll renews the client's lease, including immediate unread
+    // responses that never enter the waiter registry.
+    updateLastSeen(db, session.id)
     updateLastActivity(db, session.id)
 
     const initial = countUnreadBySessionId(db, session.id)
@@ -663,7 +695,13 @@ export async function startServer(opts: {
       })
     }
 
-    await waiters.wait(session.id, ccSessionId, timeoutS * 1000, req.signal)
+    await waiters.wait(
+      session.id,
+      clientKind,
+      clientSessionId,
+      timeoutS * 1000,
+      req.signal,
+    )
     // Re-check: the waiter may have resolved because of a new message, a
     // timeout, or a client abort. Only the first case yields status=unread.
     const final = countUnreadBySessionId(db, session.id)
@@ -699,9 +737,8 @@ export async function startServer(opts: {
    *
    * Unlike /poll (one-shot long-poll that the shim loops), /monitor is
    * persistent — one HTTP connection for the lifetime of the session. The
-   * side effect of calling waiters.wait() here is that `canAutoWake` sees
-   * this cc_session_id as polling, so sender-side `delivered_notification`
-   * stays honest.
+   * side effect of calling waiters.wait() here is that the shared online
+   * predicate sees this Claude Code identity as polling.
    */
   async function handleMonitor(req: Request, url: URL): Promise<Response> {
     if (req.method !== 'GET') {
@@ -763,7 +800,13 @@ export async function startServer(opts: {
         const HEARTBEAT_LINE_EVERY = 30
         let silentTicks = 0
         while (!req.signal.aborted) {
-          await waiters.wait(sessionId, ccSessionId, HEARTBEAT_MS, req.signal)
+          await waiters.wait(
+            sessionId,
+            'claude_code',
+            ccSessionId,
+            HEARTBEAT_MS,
+            req.signal,
+          )
           if (req.signal.aborted) break
           const count = countUnreadBySessionId(db, sessionId)
           let ok: boolean

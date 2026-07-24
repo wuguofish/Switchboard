@@ -6,9 +6,11 @@
  *
  * Two things are tracked:
  *   1. per-session waiter callbacks (notify-on-new-message)
- *   2. the set of cc_session_ids currently inside /poll (liveness signal
- *      for delivered_notification — an alternative to reading state files)
+ *   2. kind-qualified client identities currently inside /poll (liveness
+ *      signal for online/delivery status)
  */
+
+import type { ClientKind } from './types'
 
 export interface Waiter {
   resolve: () => void
@@ -16,7 +18,11 @@ export interface Waiter {
 
 export class UnreadWaiterRegistry {
   private waiters = new Map<string, Set<Waiter>>()
-  private polling = new Set<string>()
+  private polling = new Map<string, number>()
+
+  private pollingKey(clientKind: ClientKind, clientSessionId: string): string {
+    return `${clientKind}:${clientSessionId}`
+  }
 
   /**
    * Wait until notify(sessionId) is called, the timer fires, or the caller
@@ -24,18 +30,21 @@ export class UnreadWaiterRegistry {
    * next by re-checking unread counts.
    *
    * @param sessionId switchboard session id to wait on
-   * @param ccSessionId cc_session_id of the caller (for the polling set)
+   * @param clientKind client namespace of the caller
+   * @param clientSessionId stable client identity of the caller
    * @param timeoutMs fallback timeout
    * @param abortSignal optional AbortSignal to break out early (e.g. when
    *        the HTTP client hangs up)
    */
   async wait(
     sessionId: string,
-    ccSessionId: string,
+    clientKind: ClientKind,
+    clientSessionId: string,
     timeoutMs: number,
     abortSignal?: AbortSignal,
   ): Promise<void> {
-    this.polling.add(ccSessionId)
+    const pollingKey = this.pollingKey(clientKind, clientSessionId)
+    this.polling.set(pollingKey, (this.polling.get(pollingKey) ?? 0) + 1)
     try {
       await new Promise<void>((resolve) => {
         const set = this.waiters.get(sessionId) ?? new Set<Waiter>()
@@ -67,7 +76,12 @@ export class UnreadWaiterRegistry {
         }
       })
     } finally {
-      this.polling.delete(ccSessionId)
+      const remaining = (this.polling.get(pollingKey) ?? 1) - 1
+      if (remaining > 0) {
+        this.polling.set(pollingKey, remaining)
+      } else {
+        this.polling.delete(pollingKey)
+      }
     }
   }
 
@@ -83,9 +97,9 @@ export class UnreadWaiterRegistry {
     for (const id of sessionIds) this.notify(id)
   }
 
-  /** True if a curl shim for this cc_session_id is currently long-polling. */
-  isPolling(ccSessionId: string): boolean {
-    return this.polling.has(ccSessionId)
+  /** True if this kind-qualified client identity is currently polling. */
+  isPolling(clientKind: ClientKind, clientSessionId: string): boolean {
+    return this.polling.has(this.pollingKey(clientKind, clientSessionId))
   }
 
   /**

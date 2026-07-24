@@ -293,6 +293,19 @@ export function releaseSession(db: Database, id: string): void {
   ).run(nowUtc(), id)
 }
 
+export function releaseSessionIfGeneration(
+  db: Database,
+  id: string,
+  generation: number,
+): boolean {
+  const result = db.query(
+    `UPDATE sessions
+     SET alias = NULL, released_at = ?
+     WHERE id = ? AND generation = ? AND released_at IS NULL`,
+  ).run(nowUtc(), id, generation)
+  return Number(result.changes) === 1
+}
+
 export function reactivateSession(db: Database, id: string, alias: string | null): void {
   // Clears released_at and restores alias so the row is "active" again.
   // Called when a cc_session_id reconnects to a previously released session.
@@ -303,6 +316,11 @@ export function reactivateSession(db: Database, id: string, alias: string | null
 
 export function updateLastActivity(db: Database, id: string): void {
   db.query('UPDATE sessions SET last_activity = ? WHERE id = ?')
+    .run(nowUtc(), id)
+}
+
+export function updateLastSeen(db: Database, id: string): void {
+  db.query('UPDATE sessions SET last_seen_at = ? WHERE id = ?')
     .run(nowUtc(), id)
 }
 
@@ -449,9 +467,8 @@ export function deleteExpiredMessages(db: Database): number {
 /**
  * Release sessions that look orphaned: alive in DB (released_at IS NULL) but
  * either (a) not currently connected to any transport, and (b) no activity
- * within staleThresholdMs. Both conditions must hold — the connection check
- * protects legitimately-idle live sessions, the time check protects against
- * registry leaks that might falsely list a dead transport as connected.
+ * within staleThresholdMs. The later of lease renewal and general activity is
+ * used, so a fresh re-register is not discarded because of an older lease.
  *
  * @param connectedIds session IDs currently present in ConnectionRegistry
  * @returns IDs of sessions that were released by this call
@@ -466,7 +483,11 @@ export function releaseStaleActiveSessions(
     .query<{ id: string }, [string]>(
       `SELECT id FROM sessions
        WHERE released_at IS NULL
-         AND last_activity < ?`,
+         AND CASE
+           WHEN last_seen_at IS NOT NULL AND last_seen_at > last_activity
+             THEN last_seen_at
+           ELSE last_activity
+         END < ?`,
     )
     .all(cutoff)
   const connected = new Set(connectedIds)

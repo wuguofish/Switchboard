@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -54,6 +54,23 @@ test('updateLastActivity changes last_activity but not created_at', async () => 
   const after = findSessionById(db, id)!
   expect(after.created_at).toBe(before.created_at)
   expect(after.last_activity > before.last_activity).toBe(true)
+})
+
+test('updateLastSeen renews the session lease without changing last_activity', async () => {
+  const id = createClientSession(db, {
+    alias: 'lease-client',
+    client_kind: 'codex',
+    client_session_id: 'lease-id',
+  })
+  const before = findSessionById(db, id)!
+  await Bun.sleep(10)
+
+  updateLastSeen(db, id)
+
+  const after = findSessionById(db, id)!
+  expect(after.last_seen_at).not.toBeNull()
+  expect(Date.parse(after.last_seen_at!)).toBeGreaterThan(Date.parse(before.created_at))
+  expect(after.last_activity).toBe(before.last_activity)
 })
 
 test('insertMessage + fetchUnread round trip (1-to-1)', () => {
@@ -619,4 +636,18 @@ test('releaseStaleActiveSessions frees alias for re-use', () => {
   const second = createSession(db, { alias: 'shared-name' })
   expect(second).not.toBe(first)
   expect(findSessionByAlias(db, 'shared-name')?.id).toBe(second)
+})
+
+test('releaseStaleActiveSessions uses last_seen_at when a lease has been renewed', () => {
+  const id = createClientSession(db, {
+    alias: 'leased',
+    client_kind: 'codex',
+    client_session_id: 'leased-id',
+  })
+  backdateLastActivity(db, id, 48 * 60 * 60_000)
+  db.query('UPDATE sessions SET last_seen_at = ? WHERE id = ?')
+    .run(new Date().toISOString(), id)
+
+  expect(releaseStaleActiveSessions(db, [], 24 * 60 * 60_000)).toEqual([])
+  expect(findSessionByAlias(db, 'leased')?.id).toBe(id)
 })
