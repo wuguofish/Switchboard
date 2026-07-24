@@ -106,7 +106,7 @@ export async function startServer(opts: {
       const recipient = findSessionById(db, targetId)
       return Response.json({
         message_id,
-        delivered_notification: pushed && canAutoWake(recipient?.cc_session_id),
+        delivered_notification: pushed && canAutoWake(recipient?.client_session_id),
       })
     } catch (e) {
       return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 })
@@ -406,7 +406,7 @@ export async function startServer(opts: {
             type: 'text',
             text: JSON.stringify({
               message_id,
-              delivered_notification: pushed && canAutoWake(recipient?.cc_session_id),
+              delivered_notification: pushed && canAutoWake(recipient?.client_session_id),
             }),
           }],
         }
@@ -431,7 +431,7 @@ export async function startServer(opts: {
             is_broadcast: true,
           })
           const recipient = findSessionById(db, id)
-          if (pushed && canAutoWake(recipient?.cc_session_id)) notified_count++
+          if (pushed && canAutoWake(recipient?.client_session_id)) notified_count++
         }
         return {
           content: [{
@@ -451,6 +451,7 @@ export async function startServer(opts: {
             id: m.id,
             sender_id: m.sender_id,
             sender_alias: senderRow?.alias ?? null,
+            reply_to: m.reply_to,
             content: m.content,
             created_at: toTaipeiISOString(m.created_at),
             is_broadcast: m.broadcast_id !== null,

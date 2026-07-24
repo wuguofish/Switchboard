@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, releaseSession, updateLastActivity, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -207,18 +207,27 @@ test('deleteExpiredMessages keeps unread messages regardless of age', () => {
   expect(remaining).toHaveLength(1)
 })
 
-test('openDatabase drops old Phase 1 sessions table if cc_session_id column missing', () => {
+test('migration upgrades Phase 2.5 schema without losing data', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'switchboard-migration-'))
-  const dbPath = join(tmp, 'phase1.db')
+  const dbPath = join(tmp, 'phase2-5.db')
 
   const rawDb = new Database(dbPath)
+  rawDb.exec('PRAGMA foreign_keys = ON')
   rawDb.exec(`
     CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
-        alias TEXT UNIQUE,
+        alias TEXT,
+        cc_session_id TEXT,
         created_at TEXT NOT NULL,
-        last_activity TEXT NOT NULL
+        last_activity TEXT NOT NULL,
+        released_at TEXT
     );
+    CREATE UNIQUE INDEX idx_sessions_alias_active
+        ON sessions(alias)
+        WHERE alias IS NOT NULL AND released_at IS NULL;
+    CREATE UNIQUE INDEX idx_sessions_cc_session_id_active
+        ON sessions(cc_session_id)
+        WHERE cc_session_id IS NOT NULL AND released_at IS NULL;
     CREATE TABLE messages (
         id TEXT PRIMARY KEY,
         sender_id TEXT NOT NULL,
@@ -226,32 +235,165 @@ test('openDatabase drops old Phase 1 sessions table if cc_session_id column miss
         broadcast_id TEXT,
         content TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        read_at TEXT
+        read_at TEXT,
+        FOREIGN KEY (sender_id) REFERENCES sessions(id),
+        FOREIGN KEY (recipient_id) REFERENCES sessions(id)
     );
   `)
-  rawDb.exec(`INSERT INTO sessions (id, alias, created_at, last_activity) VALUES ('old-id', 'old-alias', '2026-04-16T00:00:00Z', '2026-04-16T00:00:00Z')`)
+  rawDb.exec(`
+    INSERT INTO sessions
+      (id, alias, cc_session_id, created_at, last_activity, released_at)
+    VALUES
+      ('active-id', 'active-alias', 'shared-client-id', '2026-04-16T00:00:00Z', '2026-04-16T01:00:00Z', NULL),
+      ('released-id', NULL, 'released-client-id', '2026-04-15T00:00:00Z', '2026-04-15T01:00:00Z', '2026-04-16T02:00:00Z');
+    INSERT INTO messages
+      (id, sender_id, recipient_id, broadcast_id, content, created_at, read_at)
+    VALUES
+      ('message-id', 'released-id', 'active-id', NULL, 'keep me', '2026-04-16T03:00:00Z', NULL);
+  `)
   rawDb.close()
 
-  const db = openDatabase(dbPath)
-  const cols = db.query<{ name: string }, []>(`PRAGMA table_info(sessions)`).all()
-  const colNames = cols.map((c) => c.name)
-  expect(colNames).toContain('cc_session_id')
-  expect(colNames).toContain('released_at')
-  const rows = db.query('SELECT id FROM sessions').all()
-  expect(rows).toHaveLength(0)
-  db.close()
+  const migrated = openDatabase(dbPath)
+  const sessionColumns = migrated
+    .query<{ name: string }, []>(`PRAGMA table_info(sessions)`)
+    .all()
+    .map((column) => column.name)
+  expect(sessionColumns).toContain('client_kind')
+  expect(sessionColumns).toContain('client_session_id')
+  expect(sessionColumns).toContain('cwd')
+  expect(sessionColumns).toContain('last_seen_at')
+  expect(sessionColumns).not.toContain('cc_session_id')
+
+  const sessions = migrated.query<{
+    id: string
+    alias: string | null
+    client_kind: string
+    client_session_id: string | null
+    created_at: string
+    last_activity: string
+    released_at: string | null
+    cwd: string | null
+    last_seen_at: string | null
+  }, []>(`
+    SELECT id, alias, client_kind, client_session_id, created_at,
+           last_activity, released_at, cwd, last_seen_at
+    FROM sessions
+    ORDER BY id
+  `).all()
+  expect(sessions).toEqual([
+    {
+      id: 'active-id',
+      alias: 'active-alias',
+      client_kind: 'claude_code',
+      client_session_id: 'shared-client-id',
+      created_at: '2026-04-16T00:00:00Z',
+      last_activity: '2026-04-16T01:00:00Z',
+      released_at: null,
+      cwd: null,
+      last_seen_at: null,
+    },
+    {
+      id: 'released-id',
+      alias: null,
+      client_kind: 'claude_code',
+      client_session_id: 'released-client-id',
+      created_at: '2026-04-15T00:00:00Z',
+      last_activity: '2026-04-15T01:00:00Z',
+      released_at: '2026-04-16T02:00:00Z',
+      cwd: null,
+      last_seen_at: null,
+    },
+  ])
+
+  const message = migrated.query<{
+    id: string
+    sender_id: string
+    recipient_id: string
+    content: string
+    reply_to: string | null
+  }, []>(`
+    SELECT id, sender_id, recipient_id, content, reply_to
+    FROM messages
+  `).get()
+  expect(message).toEqual({
+    id: 'message-id',
+    sender_id: 'released-id',
+    recipient_id: 'active-id',
+    content: 'keep me',
+    reply_to: null,
+  })
+
+  migrated.query(`
+    INSERT INTO sessions
+      (id, alias, client_kind, client_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run('codex-id', 'codex-alias', 'codex', 'shared-client-id', '2026-04-16T04:00:00Z', '2026-04-16T04:00:00Z')
+  expect(() => migrated.query(`
+    INSERT INTO sessions
+      (id, alias, client_kind, client_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run('duplicate-id', 'duplicate-alias', 'claude_code', 'shared-client-id', '2026-04-16T05:00:00Z', '2026-04-16T05:00:00Z')).toThrow()
+  migrated.query(`
+    INSERT INTO sessions
+      (id, alias, client_kind, client_session_id, created_at, last_activity, released_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run('reused-id', 'reused-alias', 'claude_code', 'released-client-id', '2026-04-16T06:00:00Z', '2026-04-16T06:00:00Z')
+
+  migrated.close()
   rmSync(tmp, { recursive: true, force: true })
+})
+
+test('client session helpers use client_kind as an identity namespace', () => {
+  const claude = createClientSession(db, {
+    alias: 'claude-peer',
+    client_kind: 'claude_code',
+    client_session_id: 'shared-id',
+    cwd: '/workspace/claude',
+  })
+  const codex = createClientSession(db, {
+    alias: 'codex-peer',
+    client_kind: 'codex',
+    client_session_id: 'shared-id',
+    cwd: '/workspace/codex',
+  })
+
+  expect(findSessionByClientSessionId(db, 'claude_code', 'shared-id')?.id).toBe(claude)
+  expect(findSessionByClientSessionId(db, 'codex', 'shared-id')?.id).toBe(codex)
+  expect(findSessionByClientSessionId(db, 'external', 'shared-id')).toBeNull()
+  expect(findSessionById(db, codex)?.cwd).toBe('/workspace/codex')
+})
+
+test('insertMessage stores nullable reply_to', () => {
+  const sender = createSession(db, { alias: 'reply-sender' })
+  const recipient = createSession(db, { alias: 'reply-recipient' })
+  const root = insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'root',
+  })
+  insertMessage(db, {
+    sender_id: sender,
+    recipient_id: recipient,
+    broadcast_id: null,
+    content: 'reply',
+    reply_to: root,
+  })
+
+  const messages = fetchUnreadForRecipient(db, recipient)
+  expect(messages.map((message) => message.reply_to)).toEqual([null, root])
 })
 
 test('createSession accepts optional cc_session_id', () => {
   const db = openDatabase(':memory:')
   const id = createSession(db, { alias: 'my-role', cc_session_id: 'cc-abc-123' })
   const row = db
-    .query<{ id: string; cc_session_id: string | null }, [string]>(
-      `SELECT id, cc_session_id FROM sessions WHERE id = ?`,
+    .query<{ id: string; client_kind: string; client_session_id: string | null }, [string]>(
+      `SELECT id, client_kind, client_session_id FROM sessions WHERE id = ?`,
     )
     .get(id)
-  expect(row?.cc_session_id).toBe('cc-abc-123')
+  expect(row?.client_kind).toBe('claude_code')
+  expect(row?.client_session_id).toBe('cc-abc-123')
   db.close()
 })
 

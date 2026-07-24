@@ -169,7 +169,8 @@ export function loadConfigFromHookStdin(
       [string]
     >(
       `SELECT id, alias FROM sessions
-       WHERE cc_session_id = ?
+       WHERE client_kind = 'claude_code'
+         AND client_session_id = ?
          AND released_at IS NULL
          AND alias IS NOT NULL`,
     ).get(ccSessionId)
