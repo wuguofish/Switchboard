@@ -2,6 +2,7 @@
 
 export type SessionId = string  // UUID
 export type ClientKind = 'claude_code' | 'codex' | 'external'
+export type BroadcastScope = 'all' | 'same_kind' | 'same_cwd'
 
 export interface SessionRow {
   id: SessionId

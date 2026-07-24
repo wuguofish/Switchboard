@@ -120,30 +120,41 @@ test('fetchUnread excludes already-read messages', () => {
   expect(fetchUnreadForRecipient(db, b)).toHaveLength(0)
 })
 
-test('insertBroadcast fans out to all sessions except sender', () => {
+test('insertBroadcast fans out to the caller-selected recipients', () => {
   const sender = createSession(db, { alias: 'sender' })
   const r1 = createSession(db, { alias: 'r1' })
   const r2 = createSession(db, { alias: 'r2' })
+  const excluded = createSession(db, { alias: 'excluded' })
 
-  const result = insertBroadcast(db, { sender_id: sender, content: 'hello all' })
+  const result = insertBroadcast(db, {
+    sender_id: sender,
+    recipient_ids: [r1, r2],
+    content: 'hello selected recipients',
+  })
 
   expect(result.recipient_count).toBe(2)
   expect(result.broadcast_id).toBeTruthy()
 
   const r1Msgs = fetchUnreadForRecipient(db, r1)
   const r2Msgs = fetchUnreadForRecipient(db, r2)
+  const excludedMsgs = fetchUnreadForRecipient(db, excluded)
   const senderMsgs = fetchUnreadForRecipient(db, sender)
 
   expect(r1Msgs).toHaveLength(1)
   expect(r2Msgs).toHaveLength(1)
+  expect(excludedMsgs).toHaveLength(0)
   expect(senderMsgs).toHaveLength(0)
   expect(r1Msgs[0].broadcast_id).toBe(result.broadcast_id)
   expect(r1Msgs[0].broadcast_id).toBe(r2Msgs[0].broadcast_id)
 })
 
-test('insertBroadcast with no other sessions returns zero recipient_count', () => {
+test('insertBroadcast with an empty recipient list returns zero recipient_count', () => {
   const sender = createSession(db, { alias: 'only' })
-  const result = insertBroadcast(db, { sender_id: sender, content: 'lonely' })
+  const result = insertBroadcast(db, {
+    sender_id: sender,
+    recipient_ids: [],
+    content: 'lonely',
+  })
   expect(result.recipient_count).toBe(0)
 })
 
@@ -168,7 +179,11 @@ test('recallMessage on broadcast deletes all copies', () => {
   const sender = createSession(db, { alias: 's' })
   const r1 = createSession(db, { alias: 'r1' })
   const r2 = createSession(db, { alias: 'r2' })
-  const { broadcast_id } = insertBroadcast(db, { sender_id: sender, content: 'group' })
+  const { broadcast_id } = insertBroadcast(db, {
+    sender_id: sender,
+    recipient_ids: [r1, r2],
+    content: 'group',
+  })
   const oneCopy = fetchUnreadForRecipient(db, r1)[0]
 
   const recalled = recallMessage(db, { message_id: oneCopy.id, caller_id: sender })

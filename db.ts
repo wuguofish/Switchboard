@@ -376,6 +376,7 @@ export function markMessagesRead(db: Database, messageIds: string[]): void {
 
 export interface BroadcastInput {
   sender_id: string
+  recipient_ids: string[]
   content: string
 }
 
@@ -387,9 +388,6 @@ export interface BroadcastDbResult {
 
 export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastDbResult {
   const broadcast_id = randomUUID()
-  const recipients = db.query<{ id: string }, [string]>(
-    'SELECT id FROM sessions WHERE id != ? AND released_at IS NULL'
-  ).all(input.sender_id)
 
   const now = nowUtc()
   const stmt = db.query(`
@@ -398,17 +396,17 @@ export function insertBroadcast(db: Database, input: BroadcastInput): BroadcastD
     )
     VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)
   `)
-  const insertTx = db.transaction((rows: typeof recipients) => {
-    for (const r of rows) {
-      stmt.run(randomUUID(), input.sender_id, r.id, broadcast_id, input.content, now)
+  const insertTx = db.transaction((recipientIds: string[]) => {
+    for (const recipientId of recipientIds) {
+      stmt.run(randomUUID(), input.sender_id, recipientId, broadcast_id, input.content, now)
     }
   })
-  insertTx(recipients)
+  insertTx(input.recipient_ids)
 
   return {
     broadcast_id,
-    recipient_count: recipients.length,
-    recipient_ids: recipients.map((r) => r.id),
+    recipient_count: input.recipient_ids.length,
+    recipient_ids: input.recipient_ids,
   }
 }
 

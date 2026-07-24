@@ -130,6 +130,198 @@ test('broadcast fans out to all other sessions', async () => {
   await r2.close()
 })
 
+test('broadcast tool advertises all, same_kind, and same_cwd scopes with all as default', async () => {
+  const client = await makeClient('bcast-schema')
+  const tools = await client.listTools()
+  const broadcast = tools.tools.find((tool) => tool.name === 'broadcast')
+  const scope = (broadcast?.inputSchema.properties as any)?.scope
+
+  expect(scope.enum).toEqual(['all', 'same_kind', 'same_cwd'])
+  expect(scope.default).toBe('all')
+
+  await client.close()
+})
+
+for (const testCase of [
+  {
+    scope: 'all',
+    queuedKind: 'external',
+    queuedCwd: '/workspace/other',
+    onlineCodexDelivered: true,
+    recipientCount: 2,
+    notifiedCount: 1,
+  },
+  {
+    scope: 'same_kind',
+    queuedKind: 'claude_code',
+    queuedCwd: '/workspace/other',
+    onlineCodexDelivered: false,
+    recipientCount: 1,
+    notifiedCount: 0,
+  },
+  {
+    scope: 'same_cwd',
+    queuedKind: 'external',
+    queuedCwd: '/workspace/shared',
+    onlineCodexDelivered: true,
+    recipientCount: 2,
+    notifiedCount: 1,
+  },
+] as const) {
+  test(`broadcast scope=${testCase.scope} filters recipients and never queues offline codex`, async () => {
+    const senderIdentity = `scope-sender-${testCase.scope}`
+    await postJson(REGISTER_URL, {
+      alias: `scope-sender-${testCase.scope}`,
+      client_kind: 'claude_code',
+      client_session_id: senderIdentity,
+      cwd: '/workspace/shared',
+    })
+    const sender = await makeClient(`scope-sender-mcp-${testCase.scope}`)
+    await sender.callTool({
+      name: 'register',
+      arguments: {
+        role: `scope-sender-${testCase.scope}`,
+        cc_session_id: senderIdentity,
+      },
+    })
+
+    const onlineCodexId = `online-codex-${testCase.scope}`
+    const offlineCodexId = `offline-codex-${testCase.scope}`
+    await postJson(REGISTER_URL, {
+      alias: onlineCodexId,
+      client_kind: 'codex',
+      client_session_id: onlineCodexId,
+      cwd: '/workspace/shared',
+    })
+    await postJson(REGISTER_URL, {
+      alias: offlineCodexId,
+      client_kind: 'codex',
+      client_session_id: offlineCodexId,
+      cwd: '/workspace/shared',
+    })
+    await postJson(REGISTER_URL, {
+      alias: `queued-${testCase.scope}`,
+      client_kind: testCase.queuedKind,
+      client_session_id: `queued-${testCase.scope}`,
+      cwd: testCase.queuedCwd,
+    })
+
+    const onlinePoll = fetch(
+      `${POLL_URL}?client_kind=codex&client_session_id=${onlineCodexId}&timeout_s=1`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    const result = JSON.parse(((await sender.callTool({
+      name: 'broadcast',
+      arguments: {
+        message: `scope ${testCase.scope}`,
+        scope: testCase.scope,
+      },
+    })).content as any[])[0].text)
+    expect(result.recipient_count).toBe(testCase.recipientCount)
+    expect(result.notified_count).toBe(testCase.notifiedCount)
+
+    const onlinePollBody = await (await onlinePoll).json()
+    expect(onlinePollBody.status).toBe(
+      testCase.onlineCodexDelivered ? 'unread' : 'timeout',
+    )
+
+    // An offline codex peer must not receive a mailbox row. Polling only after
+    // the broadcast makes it online too late and must still return timeout.
+    const offlinePoll = await fetch(
+      `${POLL_URL}?client_kind=codex&client_session_id=${offlineCodexId}&timeout_s=1`,
+    )
+    expect((await offlinePoll.json()).status).toBe('timeout')
+
+    // Claude Code and external peers keep the existing durable-mailbox
+    // behavior: they were offline at send time but can read the queued row
+    // when they poll later.
+    const queuedPoll = await fetch(
+      `${POLL_URL}?client_kind=${testCase.queuedKind}` +
+      `&client_session_id=queued-${testCase.scope}&timeout_s=1`,
+    )
+    expect((await queuedPoll.json()).status).toBe('unread')
+
+    await sender.close()
+  })
+}
+
+test('broadcast scope=same_cwd does not match any recipient when sender cwd is NULL', async () => {
+  const sender = await makeClient('null-cwd-sender')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'null-cwd-sender', cc_session_id: 'null-cwd-sender' },
+  })
+  await postJson(REGISTER_URL, {
+    alias: 'non-null-cwd-recipient',
+    client_kind: 'external',
+    client_session_id: 'non-null-cwd-recipient',
+    cwd: '/workspace/shared',
+  })
+
+  const result = JSON.parse(((await sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'NULL cwd never matches', scope: 'same_cwd' },
+  })).content as any[])[0].text)
+  expect(result.recipient_count).toBe(0)
+  expect(result.notified_count).toBe(0)
+
+  await sender.close()
+})
+
+test('broadcast scope=same_cwd excludes a NULL recipient cwd when sender cwd is non-NULL', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'non-null-cwd-sender',
+    client_kind: 'claude_code',
+    client_session_id: 'non-null-cwd-sender',
+    cwd: '/workspace/shared',
+  })
+  const sender = await makeClient('non-null-cwd-sender-mcp')
+  await sender.callTool({
+    name: 'register',
+    arguments: {
+      role: 'non-null-cwd-sender',
+      cc_session_id: 'non-null-cwd-sender',
+    },
+  })
+  await postJson(REGISTER_URL, {
+    alias: 'null-cwd-recipient',
+    client_kind: 'external',
+    client_session_id: 'null-cwd-recipient',
+    cwd: null,
+  })
+  await postJson(REGISTER_URL, {
+    alias: 'matching-cwd-recipient',
+    client_kind: 'external',
+    client_session_id: 'matching-cwd-recipient',
+    cwd: '/workspace/shared',
+  })
+
+  const result = JSON.parse(((await sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'NULL recipient cwd never matches', scope: 'same_cwd' },
+  })).content as any[])[0].text)
+  expect(result.recipient_count).toBe(1)
+  expect(result.notified_count).toBe(0)
+
+  await sender.close()
+})
+
+test('broadcast rejects a scope outside the advertised enum', async () => {
+  const sender = await makeClient('invalid-scope-sender')
+  await sender.callTool({
+    name: 'register',
+    arguments: { role: 'invalid-scope-sender' },
+  })
+
+  await expect(sender.callTool({
+    name: 'broadcast',
+    arguments: { message: 'invalid scope', scope: 'nearby' },
+  })).rejects.toThrow(/scope must be one of/)
+
+  await sender.close()
+})
+
 test('read_messages marks as read (second call returns empty)', async () => {
   const a = await makeClient('read-a')
   const b = await makeClient('read-b')

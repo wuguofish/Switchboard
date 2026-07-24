@@ -18,13 +18,13 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, releaseSession, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
-import type { ClientKind } from './types'
+import type { BroadcastScope, ClientKind, SessionRow } from './types'
 import { isSessionOnline } from './online'
 
 export interface ServerHandle {
@@ -37,8 +37,36 @@ interface SessionEntry {
 }
 
 const CLIENT_KINDS: readonly ClientKind[] = ['claude_code', 'codex', 'external']
+const BROADCAST_SCOPES: readonly BroadcastScope[] = ['all', 'same_kind', 'same_cwd']
 
 class RequestValidationError extends Error {}
+
+function requireBroadcastScope(value: unknown): BroadcastScope {
+  if (value === undefined) return 'all'
+  if (
+    typeof value !== 'string' ||
+    !BROADCAST_SCOPES.includes(value as BroadcastScope)
+  ) {
+    throw new Error(`scope must be one of: ${BROADCAST_SCOPES.join(', ')}`)
+  }
+  return value as BroadcastScope
+}
+
+function matchesBroadcastScope(
+  sender: SessionRow,
+  recipient: SessionRow,
+  scope: BroadcastScope,
+): boolean {
+  if (scope === 'all') return true
+  if (scope === 'same_kind') {
+    return recipient.client_kind === sender.client_kind
+  }
+  return (
+    sender.cwd !== null &&
+    recipient.cwd !== null &&
+    recipient.cwd === sender.cwd
+  )
+}
 
 function requireJsonObject(body: unknown): Record<string, unknown> {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -338,10 +366,20 @@ export async function startServer(opts: {
         },
         {
           name: 'broadcast',
-          description: 'Send to all currently registered sessions (except self).',
+          description: 'Broadcast to active sessions selected by scope (except self).',
           inputSchema: {
             type: 'object' as const,
-            properties: { message: { type: 'string' } },
+            properties: {
+              message: { type: 'string' },
+              scope: {
+                type: 'string',
+                enum: BROADCAST_SCOPES,
+                default: 'all',
+                description:
+                  'all: every active session; same_kind: sender client_kind; ' +
+                  'same_cwd: equal non-NULL cwd.',
+              },
+            },
             required: ['message'],
           },
         },
@@ -514,10 +552,23 @@ export async function startServer(opts: {
 
       if (name === 'broadcast') {
         if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
-        const message = (args as Record<string, unknown>)?.message as string
+        const argsObj = (args as Record<string, unknown>) ?? {}
+        const message = argsObj.message as string
+        const scope = requireBroadcastScope(argsObj.scope)
         const sender = findSessionById(db, currentSwitchboardId)
+        if (!sender) throw new Error('registered sender session not found')
+        const recipients = listAllSessions(db).filter((recipient) => (
+          recipient.id !== currentSwitchboardId &&
+          recipient.released_at === null &&
+          matchesBroadcastScope(sender, recipient, scope) &&
+          (
+            recipient.client_kind !== 'codex' ||
+            isSessionOnline(recipient, registry, waiters)
+          )
+        ))
         const { broadcast_id, recipient_count, recipient_ids } = insertBroadcast(db, {
           sender_id: currentSwitchboardId,
+          recipient_ids: recipients.map((recipient) => recipient.id),
           content: message,
         })
         // Wake every long-poll waiter that just got a new message row.
