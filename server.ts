@@ -136,6 +136,23 @@ export async function startServer(opts: {
     return requireJsonObject(parsed)
   }
 
+  function readUnreadMessages(sessionId: string) {
+    const unread = fetchUnreadForRecipient(db, sessionId)
+    markMessagesRead(db, unread.map(message => message.id))
+    return unread.map(message => {
+      const sender = findSessionById(db, message.sender_id)
+      return {
+        id: message.id,
+        sender_id: message.sender_id,
+        sender_alias: sender?.alias ?? null,
+        reply_to: message.reply_to,
+        content: message.content,
+        created_at: toTaipeiISOString(message.created_at),
+        is_broadcast: message.broadcast_id !== null,
+      }
+    })
+  }
+
   async function handleRegister(req: Request): Promise<Response> {
     if (req.method !== 'POST') {
       return new Response('Method Not Allowed', { status: 405 })
@@ -203,6 +220,43 @@ export async function startServer(opts: {
         )
       }
       return Response.json({ status: result })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof RequestValidationError) {
+        return Response.json({ error: message }, { status: 400 })
+      }
+      return Response.json({ error: 'internal server error' }, { status: 500 })
+    }
+  }
+
+  async function handleMessageRead(req: Request): Promise<Response> {
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+
+    try {
+      const body = await parseJsonBody(req)
+      const client_kind = requireClientKind(body)
+      const client_session_id = requireNonEmptyString(body, 'client_session_id')
+      const generation = requireGeneration(body)
+      const session = findSessionByClientSessionId(
+        db,
+        client_kind,
+        client_session_id,
+      )
+
+      if (!session) {
+        return Response.json({ error: 'session not found' }, { status: 404 })
+      }
+      if (session.generation !== generation) {
+        return Response.json(
+          {
+            error: `generation mismatch: current generation is ${session.generation}`,
+          },
+          { status: 409 },
+        )
+      }
+      return Response.json({ messages: readUnreadMessages(session.id) })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof RequestValidationError) {
@@ -598,22 +652,13 @@ export async function startServer(opts: {
 
       if (name === 'read_messages') {
         if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
-        const unread = fetchUnreadForRecipient(db, currentSwitchboardId)
-        markMessagesRead(db, unread.map(m => m.id))
-        const messages = unread.map(m => {
-          const senderRow = findSessionById(db, m.sender_id)
-          return {
-            id: m.id,
-            sender_id: m.sender_id,
-            sender_alias: senderRow?.alias ?? null,
-            reply_to: m.reply_to,
-            content: m.content,
-            created_at: toTaipeiISOString(m.created_at),
-            is_broadcast: m.broadcast_id !== null,
-          }
-        })
         return {
-          content: [{ type: 'text', text: JSON.stringify({ messages }) }],
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              messages: readUnreadMessages(currentSwitchboardId),
+            }),
+          }],
         }
       }
 
@@ -935,6 +980,10 @@ export async function startServer(opts: {
 
       if (url.pathname === '/unregister') {
         return handleUnregister(req)
+      }
+
+      if (url.pathname === '/messages/read') {
+        return handleMessageRead(req)
       }
 
       if (url.pathname !== '/mcp') {

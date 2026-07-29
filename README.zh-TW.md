@@ -180,6 +180,12 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`。
   generation 必須與現值相符——舊 instance 遲到的下線請求動不了新 instance（409）。回傳
   `{status: "released" | "already_released"}`，查無此 identity 回 404。
+- `POST /messages/read` — peer 驗證身分後讀取自己的 inbox。JSON body：
+  `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`。
+  identity 必須對應 active session，generation 也必須與現值相符。回傳
+  `{messages: [...]}`，欄位與 Asia/Taipei 時間格式均和 MCP `read_messages` 相同，
+  並將本次回傳的訊息標為已讀。驗證錯誤回 400、查無或已釋放 identity 回 404、
+  舊 generation 回 409。
 - `GET /poll?client_kind=<kind>&client_session_id=<id>&timeout_s=<1..250>` —
   正式版 long-poll 等待新訊息，每次呼叫同時為呼叫者續租 lease（更新 `last_seen_at`）。
   舊格式 `?cc_session_id=<uuid>` 仍支援，等同 `client_kind=claude_code`。回 JSON：
@@ -255,9 +261,10 @@ session 已一般化，不再是 Claude Code 專屬：
   優雅退出走 generation unregister；crash 就讓 lease 自然過期。訊息的真相永遠是
   `read_at`——喚醒只是 best-effort 的門鈴。
 
-**已知限制（列管後續項目）**：Switchboard 尚未提供以 generation/identity 驗證身分的
-HTTP 讀信端點供 peer 讀取並標記自己的訊息。codex-bridge 的 Codex waker 因此降級為
-去重後的 unread 通知，且不直接讀 SQLite。
+**Peer 讀信已完成**：`POST /messages/read` 已提供非 MCP peer 以
+generation/identity 驗證身分、讀取並標記自己未讀訊息的途徑。它與 MCP
+`read_messages` 共用 read-at 語意，因此 poll 驅動的 client 不必直接讀 SQLite，
+也不會再被已讀郵件重複觸發。
 
 ## 保留 & 清理
 
@@ -286,7 +293,7 @@ bunx tsc --noEmit        # type check
 
 ```
 main.ts                  # daemon 入口
-server.ts                # MCP 工具 handler + /register + /unregister + /poll + /monitor + Bun.serve
+server.ts                # MCP 工具 + peer lifecycle/read + /poll + /monitor + Bun.serve
 db.ts                    # SQLite helper（session、訊息、generation-aware upsert、保留查詢）
 schema.sql               # schema（client_kind / client_session_id / cwd / last_seen_at / generation / reply_to）
 online.ts                # 共用 online 判定：MCP 連線 OR polling OR 有效 lease
