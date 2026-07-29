@@ -1,15 +1,16 @@
 # Switchboard 雙邊 Peer 化設計（Codex 完整入網）
 
 - 日期：2026-07-24
-- 狀態：**實作完成，待 PR 整體終檢**（同日五階段交付）
+- 狀態：**實作完成**（五階段交付＋HTTP peer message-read endpoint）
 - 參與：阿童（決策）、阿宇（Claude Code）、小回（Codex）
 - 討論紀錄：codex thread `019f926a-2c4e-78d2-be12-147118a942ab`（`codex resume` 可回看完整往返）
 - 實作 commits：`87eced6`（schema migration）→ `15abe60`（HTTP register/unregister）→
   `09a4d5e`＋`707d6b7`（lease、/poll 一般化、generation guard 全通路）→
   `657acbd`（broadcast scope）；waker 在 codex-bridge repo `cad6583`
-- 後續非阻擋項目：新增由 `client_kind + client_session_id + generation` 驗證身分的
-  HTTP peer message-read endpoint，回傳與 MCP `read_messages` 相同欄位並維持一致的
-  read-at 語意。Codex waker 已預留 full-message adapter；本次 PR 不包含此 endpoint。
+- 已實作 `POST /messages/read`：由
+  `client_kind + client_session_id + generation` 驗證 active session 身分，
+  回傳與 MCP `read_messages` 相同欄位並共用一致的 read-at 語意。
+  Codex waker 可透過既有 full-message adapter 接入，不需直接讀取 SQLite。
 
 ## 背景與目標
 

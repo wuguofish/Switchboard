@@ -1047,6 +1047,7 @@ test('/monitor abort releases the waiter so cancelAll isn\'t stuck on shutdown',
 const EXTERNAL_SEND_URL = `http://127.0.0.1:${TEST_PORT}/external/send`
 const REGISTER_URL = `http://127.0.0.1:${TEST_PORT}/register`
 const UNREGISTER_URL = `http://127.0.0.1:${TEST_PORT}/unregister`
+const MESSAGE_READ_URL = `http://127.0.0.1:${TEST_PORT}/messages/read`
 
 test('/external/send delivers and wakes a registered Claude Code session', async () => {
   const recipient = await makeClient('external-recip')
@@ -1267,4 +1268,201 @@ test('HTTP unregister validates identity and generation fields', async () => {
     expect(resp.status).toBe(400)
     expect(await resp.json()).toEqual({ error: invalidCase.error })
   }
+})
+
+test('HTTP message read validates identity and generation fields', async () => {
+  const invalidCases: Array<{ body: unknown; error: string }> = [
+    {
+      body: { client_kind: 'other', client_session_id: 'thread', generation: 1 },
+      error: 'client_kind must be one of: claude_code, codex, external',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: '', generation: 1 },
+      error: 'client_session_id is required and must be a non-empty string',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 0 },
+      error: 'generation is required and must be a positive integer',
+    },
+  ]
+
+  for (const invalidCase of invalidCases) {
+    const resp = await postJson(MESSAGE_READ_URL, invalidCase.body)
+    expect(resp.status).toBe(400)
+    expect(await resp.json()).toEqual({ error: invalidCase.error })
+  }
+})
+
+test('HTTP message read returns 404 for an unknown or released identity', async () => {
+  const unknownResp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'missing-reader',
+    generation: 1,
+  })
+  expect(unknownResp.status).toBe(404)
+  expect(await unknownResp.json()).toEqual({ error: 'session not found' })
+
+  const registered = await (await postJson(REGISTER_URL, {
+    alias: 'released-reader',
+    client_kind: 'codex',
+    client_session_id: 'released-reader',
+    cwd: '/workspace',
+  })).json()
+  await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'released-reader',
+    generation: registered.generation,
+  })
+
+  const releasedResp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'released-reader',
+    generation: registered.generation,
+  })
+  expect(releasedResp.status).toBe(404)
+  expect(await releasedResp.json()).toEqual({ error: 'session not found' })
+})
+
+test('HTTP message read rejects a stale generation', async () => {
+  const first = await (await postJson(REGISTER_URL, {
+    alias: 'http-reader-old',
+    client_kind: 'codex',
+    client_session_id: 'http-reader-generation',
+    cwd: '/workspace',
+  })).json()
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'http-reader-current',
+    client_kind: 'codex',
+    client_session_id: 'http-reader-generation',
+    cwd: '/workspace',
+  })).json()
+
+  const resp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'http-reader-generation',
+    generation: first.generation,
+  })
+  expect(resp.status).toBe(409)
+  expect(await resp.json()).toEqual({
+    error: `generation mismatch: current generation is ${current.generation}`,
+  })
+})
+
+test('HTTP message read returns unread messages and clears subsequent poll state', async () => {
+  const peer = await (await postJson(REGISTER_URL, {
+    alias: 'http-reader',
+    client_kind: 'codex',
+    client_session_id: 'http-reader-instance',
+    cwd: '/workspace',
+  })).json()
+  const sender = await makeClient('http-read-sender')
+  await sender.callTool({ name: 'register', arguments: { role: 'http-read-sender' } })
+  const sendResult = await sender.callTool({
+    name: 'send',
+    arguments: { to: 'http-reader', message: 'read me over HTTP' },
+  })
+  const sent = JSON.parse((sendResult.content as any[])[0].text)
+
+  const unreadPoll = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=http-reader-instance&timeout_s=1`,
+  )
+  expect(await unreadPoll.json()).toMatchObject({ status: 'unread', count: 1 })
+
+  const readResp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'http-reader-instance',
+    generation: peer.generation,
+  })
+  expect(readResp.status).toBe(200)
+  expect(await readResp.json()).toEqual({
+    messages: [{
+      id: sent.message_id,
+      sender_id: expect.any(String),
+      sender_alias: 'http-read-sender',
+      reply_to: null,
+      content: 'read me over HTTP',
+      created_at: expect.stringMatching(/\+08:00$/),
+      is_broadcast: false,
+    }],
+  })
+
+  const clearedPoll = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=http-reader-instance&timeout_s=1`,
+  )
+  expect(await clearedPoll.json()).toEqual({ status: 'timeout' })
+  await sender.close()
+})
+
+test('HTTP and MCP message reads share read state without duplicate delivery', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'mixed-reader',
+    client_kind: 'claude_code',
+    client_session_id: 'mixed-reader-session',
+    cwd: '/workspace',
+  })
+  const recipient = await makeClient('mixed-read-recipient')
+  await recipient.callTool({
+    name: 'register',
+    arguments: { role: 'mixed-reader', cc_session_id: 'mixed-reader-session' },
+  })
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'mixed-reader',
+    client_kind: 'claude_code',
+    client_session_id: 'mixed-reader-session',
+    cwd: '/workspace',
+  })).json()
+  const sender = await makeClient('mixed-read-sender')
+  await sender.callTool({ name: 'register', arguments: { role: 'mixed-read-sender' } })
+
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'mixed-reader', message: 'HTTP gets this one' },
+  })
+  const httpFirst = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'claude_code',
+    client_session_id: 'mixed-reader-session',
+    generation: current.generation,
+  })
+  expect((await httpFirst.json()).messages.map((message: any) => message.content))
+    .toEqual(['HTTP gets this one'])
+  const mcpAfterHttp = JSON.parse(((
+    await recipient.callTool({ name: 'read_messages', arguments: {} })
+  ).content as any[])[0].text)
+  expect(mcpAfterHttp).toEqual({ messages: [] })
+
+  await sender.callTool({
+    name: 'send',
+    arguments: { to: 'mixed-reader', message: 'MCP gets this one' },
+  })
+  const mcpFirst = JSON.parse(((
+    await recipient.callTool({ name: 'read_messages', arguments: {} })
+  ).content as any[])[0].text)
+  expect(mcpFirst.messages.map((message: any) => message.content))
+    .toEqual(['MCP gets this one'])
+  const httpAfterMcp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'claude_code',
+    client_session_id: 'mixed-reader-session',
+    generation: current.generation,
+  })
+  expect(await httpAfterMcp.json()).toEqual({ messages: [] })
+
+  await sender.close()
+  await recipient.close()
+})
+
+test('HTTP message read returns an empty array for an empty mailbox', async () => {
+  const peer = await (await postJson(REGISTER_URL, {
+    alias: 'empty-http-reader',
+    client_kind: 'external',
+    client_session_id: 'empty-http-reader',
+    cwd: '/workspace',
+  })).json()
+
+  const resp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'external',
+    client_session_id: 'empty-http-reader',
+    generation: peer.generation,
+  })
+  expect(resp.status).toBe(200)
+  expect(await resp.json()).toEqual({ messages: [] })
 })

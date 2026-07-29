@@ -186,6 +186,13 @@ Codex-kind recipients are only written to when they are online at insert time �
   The generation must match the current row — a delayed unregister from an
   older instance cannot release a newer one (409). Returns
   `{status: "released" | "already_released"}`, 404 when unknown.
+- `POST /messages/read` — authenticated peer inbox read. JSON body:
+  `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`.
+  The identity must resolve to an active session and the generation must match.
+  Returns `{messages: [...]}` with the same fields and Asia/Taipei timestamps as
+  MCP `read_messages`, and marks the returned messages read.
+  Validation errors return 400, unknown or released identities return 404, and
+  stale generations return 409.
 - `GET /poll?client_kind=<kind>&client_session_id=<id>&timeout_s=<1..250>` —
   canonical long-poll for unread mail. Every call also renews the caller's
   lease (`last_seen_at`). The legacy form `?cc_session_id=<uuid>` remains
@@ -267,10 +274,10 @@ Sessions are generalized beyond Claude Code:
   Graceful exits unregister by generation; crashes simply let the lease
   expire. Message truth remains `read_at` — wakes are best-effort doorbells.
 
-**Known limitation (tracked follow-up):** Switchboard does not yet expose a
-generation/identity-guarded HTTP endpoint for peers to read and mark their
-messages. The companion Codex waker (codex-bridge) therefore degrades to a
-deduplicated unread notification and does not read SQLite directly.
+**Peer message reads:** `POST /messages/read` now gives non-MCP peers a
+generation/identity-guarded way to fetch and mark their own unread messages.
+It shares the MCP `read_messages` read-at semantics, so poll-driven clients can
+consume the inbox without touching SQLite or retriggering on already-read mail.
 
 ## Retention & cleanup
 
@@ -302,7 +309,7 @@ bunx tsc --noEmit        # type check
 
 ```
 main.ts                  # daemon entry
-server.ts                # MCP tool handlers + /register + /unregister + /poll + /monitor + Bun.serve wiring
+server.ts                # MCP tools + peer lifecycle/read + /poll + /monitor + Bun.serve wiring
 db.ts                    # SQLite helpers (sessions, messages, generation-aware upsert, retention queries)
 schema.sql               # DB schema (client_kind / client_session_id / cwd / last_seen_at / generation / reply_to)
 online.ts                # shared online predicate: MCP connection OR polling OR valid lease
