@@ -477,6 +477,159 @@ test('register without cc_session_id still creates a new session each time (Phas
   await c2.close()
 })
 
+test('register(client_kind, client_session_id) claims an active peer without bumping generation', async () => {
+  const peerResp = await postJson(REGISTER_URL, {
+    alias: 'claim-codex-peer',
+    client_kind: 'codex',
+    client_session_id: 'claim-codex-session',
+    cwd: '/workspace/codex',
+  })
+  expect(peerResp.status).toBe(200)
+  const peer = await peerResp.json()
+  expect(peer.generation).toBe(1)
+
+  const claimant = await makeClient('claim-codex-mcp')
+  const claimed = JSON.parse(((await claimant.callTool({
+    name: 'register',
+    arguments: {
+      client_kind: 'codex',
+      client_session_id: 'claim-codex-session',
+    },
+  })).content as any[])[0].text)
+  expect(claimed).toMatchObject({
+    session_id: peer.session_id,
+    alias: 'claim-codex-peer',
+    anonymous: false,
+  })
+
+  const readResp = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'claim-codex-session',
+    generation: peer.generation,
+  })
+  expect(readResp.status).toBe(200)
+
+  await claimant.close()
+})
+
+test('claimed peer sends with peer alias and receives through the claimed MCP transport', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'claimed-recipient-peer',
+    client_kind: 'codex',
+    client_session_id: 'claimed-recipient-session',
+    cwd: '/workspace/codex',
+  })
+
+  const claimedRecipient = await makeClient('claimed-recipient-mcp')
+  await claimedRecipient.callTool({
+    name: 'register',
+    arguments: {
+      client_kind: 'codex',
+      client_session_id: 'claimed-recipient-session',
+    },
+  })
+  const sender = await makeClient('claimed-sender-mcp')
+  await sender.callTool({ name: 'register', arguments: { role: 'claimed-sender' } })
+
+  const sendToClaimed = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'claimed-recipient-peer', message: 'hello claimed peer' },
+  })).content as any[])[0].text)
+  expect(sendToClaimed.delivered_notification).toBe(true)
+
+  const readClaimed = JSON.parse(((await claimedRecipient.callTool({
+    name: 'read_messages',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(readClaimed.messages).toHaveLength(1)
+  expect(readClaimed.messages[0].content).toBe('hello claimed peer')
+  expect(readClaimed.messages[0].sender_alias).toBe('claimed-sender')
+
+  const claimedSend = await claimedRecipient.callTool({
+    name: 'send',
+    arguments: { to: 'claimed-sender', message: 'from peer alias' },
+  })
+  expect(JSON.parse((claimedSend.content as any[])[0].text).delivered_notification).toBe(true)
+  const senderRead = JSON.parse(((await sender.callTool({
+    name: 'read_messages',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(senderRead.messages[0].sender_alias).toBe('claimed-recipient-peer')
+
+  await sender.close()
+  await claimedRecipient.close()
+})
+
+test('closing or unregistering a claimed peer MCP transport keeps the plugin-owned peer row active', async () => {
+  const peer = await (await postJson(REGISTER_URL, {
+    alias: 'claim-lifecycle-peer',
+    client_kind: 'codex',
+    client_session_id: 'claim-lifecycle-session',
+    cwd: '/workspace/codex',
+  })).json()
+
+  const closer = await makeClient('claim-lifecycle-close')
+  await closer.callTool({
+    name: 'register',
+    arguments: {
+      client_kind: 'codex',
+      client_session_id: 'claim-lifecycle-session',
+    },
+  })
+  await closer.close()
+  await new Promise((r) => setTimeout(r, 50))
+
+  const stillReadable = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'claim-lifecycle-session',
+    generation: peer.generation,
+  })
+  expect(stillReadable.status).toBe(200)
+
+  const unregistering = await makeClient('claim-lifecycle-unregister')
+  await unregistering.callTool({
+    name: 'register',
+    arguments: {
+      client_kind: 'codex',
+      client_session_id: 'claim-lifecycle-session',
+    },
+  })
+  const unregistered = JSON.parse(((await unregistering.callTool({
+    name: 'unregister',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(unregistered).toEqual({ status: 'unbound', released_alias: null })
+
+  const releaseResp = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'claim-lifecycle-session',
+    generation: peer.generation,
+  })
+  expect(releaseResp.status).toBe(200)
+  expect(await releaseResp.json()).toEqual({ status: 'released' })
+  await unregistering.close()
+})
+
+test('register(client_kind, client_session_id, role) rejects mismatched peer alias', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'claim-conflict-peer',
+    client_kind: 'codex',
+    client_session_id: 'claim-conflict-session',
+    cwd: '/workspace/codex',
+  })
+
+  const claimant = await makeClient('claim-conflict-mcp')
+  await expect(claimant.callTool({
+    name: 'register',
+    arguments: {
+      role: 'different-alias',
+      client_kind: 'codex',
+      client_session_id: 'claim-conflict-session',
+    },
+  })).rejects.toThrow()
+  await claimant.close()
+})
+
 // --- /poll long-polling endpoint ---
 
 const POLL_URL = `http://127.0.0.1:${TEST_PORT}/poll`

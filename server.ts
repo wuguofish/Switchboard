@@ -333,6 +333,7 @@ export async function startServer(opts: {
     let currentSwitchboardId: string | null = null
     let currentGeneration: number | null = null
     let currentPushCallback: PushCallback | null = null
+    let currentOwnsLifecycle = true
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
@@ -353,7 +354,7 @@ export async function startServer(opts: {
         if (currentPushCallback) {
           registry.unregister(currentSwitchboardId, currentPushCallback)
         }
-        if (currentGeneration !== null) {
+        if (currentOwnsLifecycle && currentGeneration !== null) {
           releaseSessionIfGeneration(db, currentSwitchboardId, currentGeneration)
         }
       }
@@ -386,6 +387,15 @@ export async function startServer(opts: {
               cc_session_id: {
                 type: 'string',
                 description: 'Optional Claude Code session id (from hook additionalContext). When provided, register becomes idempotent: same cc_session_id returns / updates the same switchboard session row.',
+              },
+              client_kind: {
+                type: 'string',
+                enum: CLIENT_KINDS,
+                description: 'Optional peer client kind to claim an existing HTTP-registered peer row. Must be supplied with client_session_id.',
+              },
+              client_session_id: {
+                type: 'string',
+                description: 'Optional peer client session id to claim an existing HTTP-registered peer row. Must be supplied with client_kind.',
               },
             },
             required: [],
@@ -476,11 +486,39 @@ export async function startServer(opts: {
         const argsObj = (args as Record<string, unknown>) ?? {}
         const role = (argsObj.role as string | undefined) ?? null
         const cc_session_id = (argsObj.cc_session_id as string | undefined) ?? null
+        const clientKindArg = argsObj.client_kind
+        const clientSessionIdArg = argsObj.client_session_id
 
         let sessionId: string
         let generation: number
+        let ownsLifecycle = true
 
-        if (cc_session_id) {
+        if (clientKindArg !== undefined || clientSessionIdArg !== undefined) {
+          if (cc_session_id) {
+            throw new Error('use either cc_session_id or client_kind + client_session_id')
+          }
+          if (typeof clientKindArg !== 'string' || !CLIENT_KINDS.includes(clientKindArg as ClientKind)) {
+            throw new Error(`client_kind must be one of: ${CLIENT_KINDS.join(', ')}`)
+          }
+          if (typeof clientSessionIdArg !== 'string' || clientSessionIdArg.trim() === '') {
+            throw new Error('client_session_id is required and must be a non-empty string')
+          }
+          const claimed = findSessionByClientSessionId(
+            db,
+            clientKindArg as ClientKind,
+            clientSessionIdArg.trim(),
+          )
+          if (!claimed) {
+            throw new Error('session not found for client identity')
+          }
+          if (role !== null && role !== claimed.alias) {
+            throw new Error(`alias mismatch for claimed session: ${claimed.alias ?? '(anonymous)'}`)
+          }
+          sessionId = claimed.id
+          generation = claimed.generation
+          ownsLifecycle = false
+          updateLastActivity(db, sessionId)
+        } else if (cc_session_id) {
           // Durable Claude Code identities share the same generation-aware
           // upsert semantics as HTTP peers. The MCP response shape remains
           // unchanged for backward compatibility.
@@ -505,6 +543,7 @@ export async function startServer(opts: {
 
         currentSwitchboardId = sessionId
         currentGeneration = generation
+        currentOwnsLifecycle = ownsLifecycle
         if (transport.sessionId) {
           mcpSessionToSwitchboard.set(transport.sessionId, sessionId)
         }
@@ -699,20 +738,24 @@ export async function startServer(opts: {
         }
         const priorAlias = findSessionById(db, currentSwitchboardId)?.alias ?? null
         const released =
+          currentOwnsLifecycle &&
           currentGeneration !== null &&
           releaseSessionIfGeneration(db, currentSwitchboardId, currentGeneration)
+        const status = currentOwnsLifecycle
+          ? (released ? 'released' : 'stale_ignored')
+          : 'unbound'
         currentSwitchboardId = null
         currentGeneration = null
         currentPushCallback = null
+        currentOwnsLifecycle = true
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(
-                released
-                  ? { status: 'released', released_alias: priorAlias }
-                  : { status: 'stale_ignored', released_alias: null },
-              ),
+              text: JSON.stringify({
+                status,
+                released_alias: released ? priorAlias : null,
+              }),
             },
           ],
         }
