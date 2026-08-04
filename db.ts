@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
 import type { ClientKind, SessionRow, MessageRow } from './types'
 import { nowUtc } from './time'
+import { LEASE_TTL_MS } from './online'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -51,6 +52,12 @@ function migrateSchema(db: Database): void {
     }
     if (!sessionColumns.has('generation')) {
       db.exec('ALTER TABLE sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1')
+    }
+    if (!sessionColumns.has('owner_token')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN owner_token TEXT')
+    }
+    if (!sessionColumns.has('owner_seen_at')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN owner_seen_at TEXT')
     }
     if (!sessionColumns.has('released_at')) {
       db.exec('ALTER TABLE sessions ADD COLUMN released_at TEXT')
@@ -102,6 +109,7 @@ export function createClientSession(
     client_kind: ClientKind
     client_session_id?: string | null
     cwd?: string | null
+    owner_token?: string | null
   },
 ): string {
   const id = randomUUID()
@@ -109,9 +117,9 @@ export function createClientSession(
   db.query(`
     INSERT INTO sessions (
       id, alias, client_kind, client_session_id, cwd,
-      created_at, last_activity, last_seen_at, generation, released_at
+      created_at, last_activity, last_seen_at, generation, owner_token, owner_seen_at, released_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, NULL)
   `).run(
     id,
     opts.alias,
@@ -120,6 +128,8 @@ export function createClientSession(
     opts.cwd ?? null,
     now,
     now,
+    opts.owner_token ?? null,
+    opts.owner_token ? now : null,
   )
   return id
 }
@@ -127,7 +137,7 @@ export function createClientSession(
 export function findSessionById(db: Database, id: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, generation, released_at
+            last_activity, last_seen_at, generation, owner_token, owner_seen_at, released_at
      FROM sessions
      WHERE id = ?`,
   ).get(id)
@@ -137,7 +147,7 @@ export function findSessionById(db: Database, id: string): SessionRow | null {
 export function findSessionByAlias(db: Database, alias: string): SessionRow | null {
   const row = db.query<SessionRow, [string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, generation, released_at
+            last_activity, last_seen_at, generation, owner_token, owner_seen_at, released_at
      FROM sessions
      WHERE alias = ? AND released_at IS NULL`,
   ).get(alias)
@@ -151,7 +161,7 @@ export function findSessionByClientSessionId(
 ): SessionRow | null {
   const row = db.query<SessionRow, [ClientKind, string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, generation, released_at
+            last_activity, last_seen_at, generation, owner_token, owner_seen_at, released_at
      FROM sessions
      WHERE client_kind = ? AND client_session_id = ? AND released_at IS NULL`,
   ).get(client_kind, client_session_id)
@@ -176,7 +186,7 @@ export function findAnySessionByClientSessionId(
 ): SessionRow | null {
   const row = db.query<SessionRow, [ClientKind, string]>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, generation, released_at
+            last_activity, last_seen_at, generation, owner_token, owner_seen_at, released_at
      FROM sessions
      WHERE client_kind = ? AND client_session_id = ?
      ORDER BY (released_at IS NULL) DESC, generation DESC, created_at DESC
@@ -197,6 +207,24 @@ export interface RegisterClientSessionInput {
   client_kind: ClientKind
   client_session_id: string
   cwd?: string | null
+  owner_token?: string
+}
+
+export class OwnershipConflictError extends Error {
+  constructor(readonly currentGeneration: number) {
+    super('session ownership is held by an active client')
+    this.name = 'OwnershipConflictError'
+  }
+}
+
+function hasValidOwnerLease(
+  session: SessionRow,
+  ownerLeaseTtlMs: number,
+): boolean {
+  if (session.released_at !== null || session.owner_token === null) return false
+  if (!session.owner_seen_at) return false
+  const lastSeenMs = Date.parse(session.owner_seen_at)
+  return Number.isFinite(lastSeenMs) && Date.now() - lastSeenMs < ownerLeaseTtlMs
 }
 
 /**
@@ -207,6 +235,7 @@ export interface RegisterClientSessionInput {
 export function registerClientSession(
   db: Database,
   input: RegisterClientSessionInput,
+  options: { ownerLeaseTtlMs?: number } = {},
 ): SessionRow {
   return db.transaction(() => {
     const existing = findAnySessionByClientSessionId(
@@ -235,21 +264,63 @@ export function registerClientSession(
     }
 
     const now = nowUtc()
-    db.query(`
-      UPDATE sessions
-      SET alias = ?,
-          cwd = CASE WHEN ? THEN ? ELSE cwd END,
-          last_activity = ?,
-          generation = generation + 1,
-          released_at = NULL
-      WHERE id = ?
-    `).run(
-      targetAlias,
-      input.cwd !== undefined ? 1 : 0,
-      input.cwd ?? null,
-      now,
-      existing.id,
-    )
+    if (input.owner_token !== undefined) {
+      const sameOwner = existing.owner_token === input.owner_token
+      const ownerLeaseTtlMs = options.ownerLeaseTtlMs ?? LEASE_TTL_MS
+      if (!sameOwner && hasValidOwnerLease(existing, ownerLeaseTtlMs)) {
+        throw new OwnershipConflictError(existing.generation)
+      }
+
+      // A same-owner call is a lease/metadata renewal and deliberately keeps
+      // its generation stable. Acquiring an ownerless/released identity or
+      // taking over an expired owner creates a new lifecycle generation.
+      const bumpGeneration = !sameOwner || existing.released_at !== null
+      db.query(`
+        UPDATE sessions
+        SET alias = ?,
+            cwd = CASE WHEN ? THEN ? ELSE cwd END,
+            last_activity = ?,
+            last_seen_at = CASE WHEN ? THEN NULL ELSE last_seen_at END,
+            owner_seen_at = ?,
+            generation = generation + ?,
+            owner_token = ?,
+            released_at = NULL
+        WHERE id = ?
+      `).run(
+        targetAlias,
+        input.cwd !== undefined ? 1 : 0,
+        input.cwd ?? null,
+        now,
+        bumpGeneration ? 1 : 0,
+        now,
+        bumpGeneration ? 1 : 0,
+        input.owner_token,
+        existing.id,
+      )
+    } else {
+      // Legacy clients intentionally retain last-register-wins semantics.
+      // Clearing owner_token prevents an earlier token holder from renewing
+      // after an owner-unaware client has started a newer generation.
+      db.query(`
+        UPDATE sessions
+        SET alias = ?,
+            cwd = CASE WHEN ? THEN ? ELSE cwd END,
+            last_activity = ?,
+            last_seen_at = CASE WHEN ? THEN NULL ELSE last_seen_at END,
+            generation = generation + 1,
+            owner_token = NULL,
+            owner_seen_at = NULL,
+            released_at = NULL
+        WHERE id = ?
+      `).run(
+        targetAlias,
+        input.cwd !== undefined ? 1 : 0,
+        input.cwd ?? null,
+        now,
+        existing.owner_token !== null ? 1 : 0,
+        existing.id,
+      )
+    }
     return findSessionById(db, existing.id)!
   })()
 }
@@ -259,6 +330,7 @@ export type UnregisterClientSessionResult =
   | 'already_released'
   | 'not_found'
   | 'generation_mismatch'
+  | 'owner_mismatch'
 
 export function unregisterClientSession(
   db: Database,
@@ -266,6 +338,7 @@ export function unregisterClientSession(
     client_kind: ClientKind
     client_session_id: string
     generation: number
+    owner_token?: string
   },
 ): UnregisterClientSessionResult {
   return db.transaction(() => {
@@ -276,20 +349,35 @@ export function unregisterClientSession(
     )
     if (!existing) return 'not_found'
     if (existing.generation !== input.generation) return 'generation_mismatch'
+    if (
+      input.owner_token !== undefined &&
+      existing.owner_token !== input.owner_token
+    ) return 'owner_mismatch'
     if (existing.released_at !== null) return 'already_released'
 
     const result = db.query(`
       UPDATE sessions
-      SET alias = NULL, released_at = ?
+      SET alias = NULL,
+          owner_token = CASE WHEN ? IS NULL THEN NULL ELSE owner_token END,
+          owner_seen_at = NULL,
+          released_at = ?
       WHERE id = ? AND generation = ? AND released_at IS NULL
-    `).run(nowUtc(), existing.id, input.generation)
+        AND (? IS NULL OR owner_token = ?)
+    `).run(
+      input.owner_token ?? null,
+      nowUtc(),
+      existing.id,
+      input.generation,
+      input.owner_token ?? null,
+      input.owner_token ?? null,
+    )
     return Number(result.changes) === 1 ? 'released' : 'generation_mismatch'
   })()
 }
 
 export function releaseSession(db: Database, id: string): void {
   db.query(
-    `UPDATE sessions SET alias = NULL, released_at = ? WHERE id = ?`,
+    `UPDATE sessions SET alias = NULL, owner_token = NULL, owner_seen_at = NULL, released_at = ? WHERE id = ?`,
   ).run(nowUtc(), id)
 }
 
@@ -300,7 +388,7 @@ export function releaseSessionIfGeneration(
 ): boolean {
   const result = db.query(
     `UPDATE sessions
-     SET alias = NULL, released_at = ?
+     SET alias = NULL, owner_token = NULL, owner_seen_at = NULL, released_at = ?
      WHERE id = ? AND generation = ? AND released_at IS NULL`,
   ).run(nowUtc(), id, generation)
   return Number(result.changes) === 1
@@ -321,6 +409,11 @@ export function updateLastActivity(db: Database, id: string): void {
 
 export function updateLastSeen(db: Database, id: string): void {
   db.query('UPDATE sessions SET last_seen_at = ? WHERE id = ?')
+    .run(nowUtc(), id)
+}
+
+export function updateOwnerSeen(db: Database, id: string): void {
+  db.query('UPDATE sessions SET owner_seen_at = ? WHERE id = ?')
     .run(nowUtc(), id)
 }
 
@@ -439,7 +532,7 @@ export function recallMessage(db: Database, input: RecallInput): number {
 export function listAllSessions(db: Database): SessionRow[] {
   return db.query<SessionRow, []>(
     `SELECT id, alias, client_kind, client_session_id, cwd, created_at,
-            last_activity, last_seen_at, generation, released_at
+            last_activity, last_seen_at, generation, owner_token, owner_seen_at, released_at
      FROM sessions
      ORDER BY created_at ASC`,
   ).all()
@@ -496,7 +589,7 @@ export function releaseStaleActiveSessions(
   const placeholders = staleIds.map(() => '?').join(',')
   db.query(
     `UPDATE sessions
-     SET alias = NULL, released_at = ?
+     SET alias = NULL, owner_token = NULL, owner_seen_at = NULL, released_at = ?
      WHERE id IN (${placeholders}) AND released_at IS NULL`,
   ).run(now, ...staleIds)
   return staleIds

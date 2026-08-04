@@ -118,3 +118,59 @@ test('one completed wait does not clear another wait for the same client identit
   await second
   expect(reg.isPolling('codex', 'same-id')).toBe(false)
 })
+
+test('owned polling liveness is scoped to generation and owner token', async () => {
+  const reg = new UnreadWaiterRegistry()
+  const abort = new AbortController()
+  const ownership = { generation: 2, ownerToken: 'owner-two' }
+  const waiting = reg.wait(
+    'session',
+    'codex',
+    'same-id',
+    60_000,
+    abort.signal,
+    ownership,
+  )
+
+  expect(reg.isPolling('codex', 'same-id')).toBe(false)
+  expect(reg.isPolling('codex', 'same-id', ownership)).toBe(true)
+  expect(reg.isPolling('codex', 'same-id', {
+    generation: 1,
+    ownerToken: 'owner-one',
+  })).toBe(false)
+
+  abort.abort()
+  await waiting
+})
+
+test('polling keys cannot collide through delimiters in identities or owner tokens', async () => {
+  const reg = new UnreadWaiterRegistry()
+  const firstAbort = new AbortController()
+  const secondAbort = new AbortController()
+  const firstOwnership = { generation: 1, ownerToken: 'x:owner:2:y' }
+  const secondOwnership = { generation: 2, ownerToken: 'y' }
+  const first = reg.wait(
+    'first-session',
+    'codex',
+    'a',
+    60_000,
+    firstAbort.signal,
+    firstOwnership,
+  )
+  const second = reg.wait(
+    'second-session',
+    'codex',
+    'a:owner:1:x',
+    60_000,
+    secondAbort.signal,
+    secondOwnership,
+  )
+
+  firstAbort.abort()
+  await first
+  expect(reg.isPolling('codex', 'a', firstOwnership)).toBe(false)
+  expect(reg.isPolling('codex', 'a:owner:1:x', secondOwnership)).toBe(true)
+
+  secondAbort.abort()
+  await second
+})

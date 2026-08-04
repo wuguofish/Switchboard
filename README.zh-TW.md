@@ -176,19 +176,31 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
   `{ "alias": "...", "client_kind": "claude_code"|"codex"|"external", "client_session_id": "<穩定的 instance id>", "cwd": "/絕對路徑" }`。
   以 `(client_kind, client_session_id)` 冪等 upsert；重複註冊會重新啟用該列並遞增 generation。回傳
   `{session_id, alias, generation}`；驗證錯誤回 400、alias 衝突回 409。
+  選填 `owner_token` 啟用 ownership CAS：取得無主 identity 或接手 lease 已過期的
+  舊 owner 會遞增 generation；同 owner 重呼叫視為 lease 續租、generation 不動；
+  現任 owner 的 lease 還活著時，第二個 owner 會被 `409 {code: "owner_conflict"}`
+  拒絕。不帶 token 的註冊維持 last-register-wins 語意，並會清掉已存的 owner token。
 - `POST /unregister` — peer 優雅下線。JSON body：
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`。
   generation 必須與現值相符——舊 instance 遲到的下線請求動不了新 instance（409）。回傳
-  `{status: "released" | "already_released"}`，查無此 identity 回 404。
+  `{status: "released" | "already_released"}`，查無此 identity 回 404。帶 `owner_token`
+  時，409 body 會標明 `code: "stale_generation"` 或 `code: "owner_mismatch"`，讓 client
+  能區分兩種失敗。
 - `POST /messages/read` — peer 驗證身分後讀取自己的 inbox。JSON body：
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`。
   identity 必須對應 active session，generation 也必須與現值相符。回傳
   `{messages: [...]}`，欄位與 Asia/Taipei 時間格式均和 MCP `read_messages` 相同，
   並將本次回傳的訊息標為已讀。驗證錯誤回 400、查無或已釋放 identity 回 404、
-  舊 generation 回 409。
+  舊 generation 回 409。帶 `owner_token` 時，409 body 會標明 `code: "stale_generation"`
+  或 `code: "owner_mismatch"`——client 收到這兩種要當「停止喚醒」處理，
+  絕不能當成「端點不可用」降級。
 - `GET /poll?client_kind=<kind>&client_session_id=<id>&timeout_s=<1..250>` —
   正式版 long-poll 等待新訊息，每次呼叫同時為呼叫者續租 lease（更新 `last_seen_at`）。
-  舊格式 `?cc_session_id=<uuid>` 仍支援，等同 `client_kind=claude_code`。回 JSON：
+  舊格式 `?cc_session_id=<uuid>` 仍支援，等同 `client_kind=claude_code`。可選
+  `&owner_token=<t>&generation=<g>`（兩者必須成對出現）讓 poll 帶 ownership 檢查：
+  不符時回與 `/messages/read` 相同的 409 body；long-poll 等待結束後會重查 ownership，
+  避免舊 owner 的長連線在新 owner 接手後還被喚醒；owner lease（`owner_seen_at`）
+  也隨 poll lease 一併續租。回 JSON：
   - `{status: "unread", count, alias, message}` — Stop-hook shim 應 `exit 2`
   - `{status: "timeout"}` — shim 重新撥接
   - `{status: "no-session"}` — alias 消失；shim `exit 0`
@@ -253,7 +265,9 @@ session 已一般化，不再是 Claude Code 專屬：
   `(client_kind, client_session_id)`，Codex 的 instance id 永遠不會跟 Claude Code 的 session id 撞衫。
 - **穩定 identity，不是 thread identity**。peer 的 `client_session_id` 是持久的 instance UUID
   （Codex waker 存在 `~/.codex/waker-instance-id`）；對話 thread id 屬 client 端狀態，絕不進資料庫。
-- **generation guard**：每次重新註冊遞增 generation。所有釋放路徑——HTTP `/unregister`、
+- **generation guard**：取得 identity 時遞增 generation——legacy 重新註冊、首次取得
+  ownership、接手過期 lease 都算；唯一例外是同 `owner_token` 的續租，generation 不動。
+  所有釋放路徑——HTTP `/unregister`、
   MCP `unregister` 工具、MCP transport 斷線清理——都檢查 generation，舊 instance 遲到的
   下線動作不可能誤殺活著的新 instance。
 - **lease 制 online**：`online = 活的 MCP 連線 OR 進行中的 /poll(/monitor) OR 有效 lease`。

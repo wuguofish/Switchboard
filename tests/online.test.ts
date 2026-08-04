@@ -15,6 +15,8 @@ function session(overrides: Partial<SessionRow> = {}): SessionRow {
     last_activity: '2026-07-24T00:00:00.000Z',
     last_seen_at: null,
     generation: 1,
+    owner_token: null,
+    owner_seen_at: null,
     released_at: null,
     ...overrides,
   }

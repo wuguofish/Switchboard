@@ -28,7 +28,14 @@ export function isSessionOnline(
   if (registry.isOnline(session.id)) return true
   if (!session.client_session_id) return false
   return (
-    waiters.isPolling(session.client_kind, session.client_session_id) ||
+    waiters.isPolling(
+      session.client_kind,
+      session.client_session_id,
+      session.owner_token === null ? undefined : {
+        generation: session.generation,
+        ownerToken: session.owner_token,
+      },
+    ) ||
     hasValidLease(session, nowMs)
   )
 }
