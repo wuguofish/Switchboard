@@ -180,6 +180,8 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
   舊 owner 會遞增 generation；同 owner 重呼叫視為 lease 續租、generation 不動；
   現任 owner 的 lease 還活著時，第二個 owner 會被 `409 {code: "owner_conflict"}`
   拒絕。不帶 token 的註冊維持 last-register-wins 語意，並會清掉已存的 owner token。
+  無 token 的 fallback 可帶 `"respect_owner": true`，遇到活 owner 時同樣回
+  `owner_conflict` 而不搶 ownership；省略此欄位則維持舊行為。
 - `POST /unregister` — peer 優雅下線。JSON body：
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`。
   generation 必須與現值相符——舊 instance 遲到的下線請求動不了新 instance（409）。回傳

@@ -208,6 +208,7 @@ export interface RegisterClientSessionInput {
   client_session_id: string
   cwd?: string | null
   owner_token?: string
+  respect_owner?: boolean
 }
 
 export class OwnershipConflictError extends Error {
@@ -253,6 +254,14 @@ export function registerClientSession(
       }
       const id = createClientSession(db, input)
       return findSessionById(db, id)!
+    }
+
+    if (
+      input.owner_token === undefined &&
+      input.respect_owner === true &&
+      hasValidOwnerLease(existing, options.ownerLeaseTtlMs ?? LEASE_TTL_MS)
+    ) {
+      throw new OwnershipConflictError(existing.generation)
     }
 
     const targetAlias = input.alias ?? existing.alias

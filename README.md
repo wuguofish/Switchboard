@@ -186,7 +186,9 @@ Codex-kind recipients are only written to when they are online at insert time �
   same-owner call is a lease renewal that keeps its generation, and a second
   owner is rejected with `409 {code: "owner_conflict"}` while the current
   owner's lease is alive. Token-less registers keep last-register-wins
-  semantics and clear any stored owner token.
+  semantics and clear any stored owner token. A token-less fallback can pass
+  `"respect_owner": true` to receive the same `owner_conflict` instead of
+  preempting a live owner; omitting it preserves legacy behavior.
 - `POST /unregister` — graceful peer sign-off. JSON body:
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`.
   The generation must match the current row — a delayed unregister from an
