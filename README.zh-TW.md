@@ -265,7 +265,9 @@ session 已一般化，不再是 Claude Code 專屬：
   `(client_kind, client_session_id)`，Codex 的 instance id 永遠不會跟 Claude Code 的 session id 撞衫。
 - **穩定 identity，不是 thread identity**。peer 的 `client_session_id` 是持久的 instance UUID
   （Codex waker 存在 `~/.codex/waker-instance-id`）；對話 thread id 屬 client 端狀態，絕不進資料庫。
-- **generation guard**：每次重新註冊遞增 generation。所有釋放路徑——HTTP `/unregister`、
+- **generation guard**：取得 identity 時遞增 generation——legacy 重新註冊、首次取得
+  ownership、接手過期 lease 都算；唯一例外是同 `owner_token` 的續租，generation 不動。
+  所有釋放路徑——HTTP `/unregister`、
   MCP `unregister` 工具、MCP transport 斷線清理——都檢查 generation，舊 instance 遲到的
   下線動作不可能誤殺活著的新 instance。
 - **lease 制 online**：`online = 活的 MCP 連線 OR 進行中的 /poll(/monitor) OR 有效 lease`。

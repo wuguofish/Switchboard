@@ -278,7 +278,10 @@ Sessions are generalized beyond Claude Code:
   durable instance UUID (for the Codex waker it persists in
   `~/.codex/waker-instance-id`). Conversation thread ids are client-side state
   and never enter the database.
-- **Generation guard.** Every re-register bumps the row's generation. All
+- **Generation guard.** Acquiring an identity bumps the row's generation —
+  legacy re-registers, first ownership grabs, and expired-lease takeovers all
+  count; the one exception is a same-`owner_token` renewal, which keeps its
+  generation. All
   release paths — HTTP `/unregister`, the MCP `unregister` tool, and MCP
   transport cleanup on disconnect — are generation-checked, so a stale
   instance's late sign-off can never evict the live one.
