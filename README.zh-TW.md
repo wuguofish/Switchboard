@@ -266,6 +266,12 @@ generation/identity 驗證身分、讀取並標記自己未讀訊息的途徑。
 `read_messages` 共用 read-at 語意，因此 poll 驅動的 client 不必直接讀 SQLite，
 也不會再被已讀郵件重複觸發。
 
+## 內附 clients
+
+- **`clients/opencode-plugin/`** —— 把 headless OpenCode server 變成 Switchboard peer 的
+  plugin：總機 alias 附門鈴、per-session 分機（alias 跟隨 session 標題）、喚醒 prompt 內建
+  認領指引。部署方式與 `SWITCHBOARD_DOORBELL=1` 門鈴旗見該目錄的 README。
+
 ## 保留 & 清理
 
 - 已讀訊息 7 天後自動刪除。
