@@ -122,6 +122,18 @@ function optionalNonEmptyString(
   return value.trim()
 }
 
+function optionalBoolean(
+  body: Record<string, unknown>,
+  field: string,
+): boolean | undefined {
+  const value = body[field]
+  if (value === undefined) return undefined
+  if (typeof value !== 'boolean') {
+    throw new RequestValidationError(`${field} must be a boolean when provided`)
+  }
+  return value
+}
+
 function ownershipMismatchResponse(
   session: SessionRow,
   generation: number,
@@ -202,12 +214,14 @@ export async function startServer(opts: {
       const client_session_id = requireNonEmptyString(body, 'client_session_id')
       const cwd = requireNonEmptyString(body, 'cwd')
       const owner_token = optionalNonEmptyString(body, 'owner_token')
+      const respect_owner = optionalBoolean(body, 'respect_owner')
       const session = registerClientSession(db, {
         alias,
         client_kind,
         client_session_id,
         cwd,
         owner_token,
+        respect_owner,
       }, { ownerLeaseTtlMs: opts.ownerLeaseTtlMs })
       return Response.json({
         session_id: session.id,
@@ -934,7 +948,12 @@ export async function startServer(opts: {
 
     // Every valid poll renews the client's lease, including immediate unread
     // responses that never enter the waiter registry.
-    updateLastSeen(db, session.id)
+    // A legacy fallback poll may watch an owner-controlled identity so it can
+    // reclaim after release. It must not renew the foreground owner's online
+    // lease or make a stale fallback look deliverable.
+    if (ownerToken !== undefined || session.owner_token === null) {
+      updateLastSeen(db, session.id)
+    }
     updateLastActivity(db, session.id)
     if (ownerToken !== undefined) updateOwnerSeen(db, session.id)
 

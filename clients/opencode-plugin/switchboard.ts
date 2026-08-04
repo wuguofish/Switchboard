@@ -31,15 +31,21 @@ type SessionInfo = {
 
 type SessionPeer = {
   sessionId: string
+  info: SessionInfo
   alias: string
   generation: number | null
   lastActivityAt: number
   lastWokenCount: number
   wakePending: boolean
+  wakeStopped: boolean
   stopping: boolean
   pollAbort: AbortController | null
   idleTimer: ReturnType<typeof setTimeout> | null
+  registering: Promise<void> | null
 }
+
+const STALE_READ = Symbol("stale-read")
+type MessageReadResult = any[] | null | typeof STALE_READ
 
 function responseData<T = any>(result: any): T | null {
   return (result?.data ?? result) as T ?? null
@@ -83,6 +89,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     ? readFileSync(SESSION_ID_PATH, "utf8").trim() || null
     : null
   let stopping = false
+  let totalWakeStopped = false
   let wakePending = false // 節流:session 忙碌中不重複塞喚醒 prompt
   // 未讀節流:Switchboard 尚無讀信端點,未讀數不會下降——同一計數只喚醒一次,
   // 否則會陷入 poll→喚醒→idle→poll 的無限迴圈(2026-07-29 實戰血淚)
@@ -141,8 +148,9 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     return sessionId
   }
 
-  async function registerPeer(peer: SessionPeer, info: SessionInfo, requestedAlias = peer.alias): Promise<void> {
-    let alias = requestedAlias
+  async function registerPeerNow(peer: SessionPeer): Promise<void> {
+    const info = peer.info
+    let alias = sessionAlias(info)
     let res = await fetch(`${SWITCHBOARD_URL}/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -151,8 +159,18 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
         client_kind: "codex",
         client_session_id: peer.sessionId,
         cwd: info.directory ?? directory ?? process.cwd(),
+        respect_owner: true,
       }),
+      signal: AbortSignal.timeout(15_000),
     })
+    let data = await res.json().catch(() => null)
+    if (res.status === 409 && data?.code === "owner_conflict") {
+      peer.generation = null
+      peer.wakePending = false
+      peer.wakeStopped = true
+      log(`session peer standing by behind active owner session=${peer.sessionId}`)
+      return
+    }
     // The short ID suffix is readable and normally unique. On a real collision,
     // retry with the full stable session ID rather than stealing another alias.
     if (res.status === 409) {
@@ -165,14 +183,51 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
           client_kind: "codex",
           client_session_id: peer.sessionId,
           cwd: info.directory ?? directory ?? process.cwd(),
+          respect_owner: true,
         }),
+        signal: AbortSignal.timeout(15_000),
       })
+      data = await res.json().catch(() => null)
+      if (res.status === 409 && data?.code === "owner_conflict") {
+        peer.generation = null
+        peer.wakePending = false
+        peer.wakeStopped = true
+        log(`session peer standing by behind active owner session=${peer.sessionId}`)
+        return
+      }
     }
-    if (!res.ok) throw new Error(`register failed: ${res.status} ${await res.text()}`)
-    const data = await res.json()
+    if (!res.ok || !data) throw new Error(`register failed: ${res.status} ${JSON.stringify(data)}`)
     peer.alias = data.alias
     peer.generation = data.generation
+    peer.lastWokenCount = 0
+    peer.wakePending = false
+    peer.wakeStopped = false
     log(`registered session=${peer.sessionId} alias=${peer.alias} generation=${peer.generation}`)
+  }
+
+  function updatePeerInfo(peer: SessionPeer, info: SessionInfo): void {
+    peer.info = {
+      ...peer.info,
+      ...info,
+      title: info.title ?? peer.info.title,
+      directory: info.directory ?? peer.info.directory,
+    }
+  }
+
+  async function registerPeer(peer: SessionPeer, info?: SessionInfo): Promise<void> {
+    if (info) updatePeerInfo(peer, info)
+    const previous = peer.registering
+    const current = (async () => {
+      await previous?.catch(() => {})
+      if (peer.stopping || stopping) return
+      await registerPeerNow(peer)
+    })()
+    peer.registering = current
+    try {
+      await current
+    } finally {
+      if (peer.registering === current) peer.registering = null
+    }
   }
 
   async function unregisterPeer(peer: SessionPeer): Promise<void> {
@@ -190,7 +245,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     }).catch(() => {})
   }
 
-  async function readPeerMessages(peer: SessionPeer): Promise<any[] | null> {
+  async function readPeerMessages(peer: SessionPeer): Promise<MessageReadResult> {
     if (peer.generation === null) return null
     try {
       const res = await fetch(`${SWITCHBOARD_URL}/messages/read`, {
@@ -202,6 +257,9 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
           generation: peer.generation,
         }),
       })
+      // A 409 means a newer generation/owner now controls this identity. It is
+      // not an endpoint outage and must never trigger a signal-only prompt.
+      if (res.status === 409) return STALE_READ
       if (!res.ok) return null
       const data = await res.json()
       return Array.isArray(data.messages) ? data.messages : null
@@ -217,6 +275,13 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     }
     peer.wakePending = true
     const messages = await readPeerMessages(peer)
+    if (messages === STALE_READ) {
+      peer.wakePending = false
+      peer.wakeStopped = true
+      peer.generation = null
+      log(`session wake stopped after stale read session=${peer.sessionId}`)
+      return
+    }
     if (messages) peer.lastWokenCount = 0
     const claimHint = `\n\n請先用 switchboard MCP register 認領本分機:` +
       ` client_kind='codex', client_session_id='${peer.sessionId}'。` +
@@ -245,9 +310,19 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     log(`woke session=${peer.sessionId} unread=${count} content=${messages ? "full" : "signal-only"}`)
   }
 
-  async function pollPeer(peer: SessionPeer, info: SessionInfo): Promise<void> {
+  async function pollPeer(peer: SessionPeer): Promise<void> {
     while (!peer.stopping && !stopping) {
       try {
+        if (peer.wakeStopped) {
+          // Foreground TUI ownership may disappear through a graceful exit or
+          // lease expiry after a crash. Retry the CAS-aware fallback register
+          // instead of waiting for no-session (an expired owner row remains
+          // active and would otherwise strand this peer forever).
+          await new Promise((r) => setTimeout(r, 5000))
+          if (peer.stopping || stopping) break
+          await registerPeer(peer)
+          continue
+        }
         peer.pollAbort = new AbortController()
         const timeout = AbortSignal.timeout((POLL_TIMEOUT_S + 15) * 1000)
         const signal = AbortSignal.any([peer.pollAbort.signal, timeout])
@@ -267,7 +342,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
           peer.lastWokenCount = 0
         } else if (data.status === "no-session") {
           log(`session peer released remotely; re-registering session=${peer.sessionId}`)
-          await registerPeer(peer, info)
+          await registerPeer(peer)
         }
       } catch (e) {
         if (peer.stopping || stopping) break
@@ -299,6 +374,10 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     peer.stopping = true
     if (peer.idleTimer) clearTimeout(peer.idleTimer)
     peer.pollAbort?.abort()
+    // A register may already be on the wire. Let its bounded request settle so
+    // unregister sees the final generation instead of leaving a successful
+    // late registration orphaned without a poller.
+    await peer.registering?.catch(() => {})
     await unregisterPeer(peer)
     log(`unregistered session=${id} reason=${reason}`)
   }
@@ -307,6 +386,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     if (!info.id || info.id === sessionId || info.title === "小回 switchboard 常駐站") return
     const existing = peers.get(info.id)
     if (existing) {
+      updatePeerInfo(existing, info)
       existing.lastActivityAt = Math.max(existing.lastActivityAt, activityAt)
       schedulePeerExpiry(existing)
       return
@@ -314,14 +394,17 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     if (Date.now() - activityAt >= SESSION_ACTIVE_MS) return
     const peer: SessionPeer = {
       sessionId: info.id,
+      info,
       alias: sessionAlias(info),
       generation: null,
       lastActivityAt: activityAt,
       lastWokenCount: 0,
       wakePending: false,
+      wakeStopped: false,
       stopping: false,
       pollAbort: null,
       idleTimer: null,
+      registering: null,
     }
     peers.set(info.id, peer)
     schedulePeerExpiry(peer)
@@ -330,7 +413,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
       if (peer.stopping || stopping) {
         await unregisterPeer(peer)
       } else {
-        pollPeer(peer, info)
+        pollPeer(peer)
       }
     } catch (e) {
       if (peers.get(info.id) === peer) peers.delete(info.id)
@@ -352,14 +435,15 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     }
   }
 
-  /** 讀取並標記自己的信件（POST /messages/read,generation-guarded）。端點不存在或驗證失敗時回 null 走降級。 */
-  async function readOwnMessages(): Promise<any[] | null> {
+  /** 讀取並標記自己的信件。409 代表身分已失效；其他失敗才允許走 signal-only 降級。 */
+  async function readOwnMessages(): Promise<MessageReadResult> {
     try {
       const res = await fetch(`${SWITCHBOARD_URL}/messages/read`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ client_kind: "codex", client_session_id: instanceId, generation }),
       })
+      if (res.status === 409) return STALE_READ
       if (!res.ok) return null
       const data = await res.json()
       return Array.isArray(data.messages) ? data.messages : null
@@ -376,6 +460,12 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     wakePending = true
     const sid = await ensureSession()
     const messages = await readOwnMessages()
+    if (messages === STALE_READ) {
+      wakePending = false
+      totalWakeStopped = true
+      log("main switchboard wake stopped after stale read")
+      return
+    }
     if (messages) lastWokenCount = 0 // 信已讀走,水位歸零,下一封新信才叫得醒
     const text = messages && messages.length
       ? `Switchboard 站內信（${messages.length} 封,已代你標記已讀）:\n\n` +
@@ -396,7 +486,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
   }
 
   async function pollLoop(): Promise<void> {
-    while (!stopping) {
+    while (!stopping && !totalWakeStopped) {
       try {
         const url = `${SWITCHBOARD_URL}/poll?client_kind=codex&client_session_id=${instanceId}&timeout_s=${POLL_TIMEOUT_S}`
         const res = await fetch(url, { signal: AbortSignal.timeout((POLL_TIMEOUT_S + 15) * 1000) })
@@ -478,11 +568,12 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
 
       if (event.type === "session.updated" && info) {
         const peer = peers.get(info.id)
+        if (peer) updatePeerInfo(peer, info)
         const alias = sessionAlias(info)
         const fallbackAlias = sessionAlias(info, true)
         if (peer && alias !== peer.alias && fallbackAlias !== peer.alias) {
           try {
-            await registerPeer(peer, info, alias)
+            await registerPeer(peer, info)
           } catch (e) {
             // Keep polling under the previous registration and retry on a later update.
             log(`session alias update failed session=${peer.sessionId} alias=${alias}: ${e}`)

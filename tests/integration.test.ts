@@ -1373,6 +1373,93 @@ test('HTTP register owner CAS rejects a second owner while the lease is active',
   })
 })
 
+test('respect_owner lets a legacy fallback stand by without taking an active owner', async () => {
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'foreground-owner',
+    client_kind: 'codex',
+    client_session_id: 'foreground-owner-session',
+    cwd: '/workspace',
+    owner_token: 'foreground-token',
+  })).json()
+
+  const fallback = await postJson(REGISTER_URL, {
+    alias: 'foreground-owner',
+    client_kind: 'codex',
+    client_session_id: 'foreground-owner-session',
+    cwd: '/workspace',
+    respect_owner: true,
+  })
+  expect(fallback.status).toBe(409)
+  expect(await fallback.json()).toEqual({
+    code: 'owner_conflict',
+    error: 'session ownership is held by an active client',
+    current_generation: current.generation,
+  })
+
+  // Omitting the opt-in flag preserves the legacy last-register-wins path.
+  const legacy = await postJson(REGISTER_URL, {
+    alias: 'foreground-owner',
+    client_kind: 'codex',
+    client_session_id: 'foreground-owner-session',
+    cwd: '/workspace',
+  })
+  expect(legacy.status).toBe(200)
+  expect((await legacy.json()).generation).toBe(current.generation + 1)
+})
+
+test('respect_owner fallback can take over after the owner lease expires', async () => {
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'expiring-foreground',
+    client_kind: 'codex',
+    client_session_id: 'expiring-foreground-session',
+    cwd: '/workspace',
+    owner_token: 'expiring-foreground-token',
+  })).json()
+  const blocked = await postJson(REGISTER_URL, {
+    alias: 'expiring-foreground',
+    client_kind: 'codex',
+    client_session_id: 'expiring-foreground-session',
+    cwd: '/workspace',
+    respect_owner: true,
+  })
+  expect(blocked.status).toBe(409)
+
+  await Bun.sleep(70)
+  const takeover = await postJson(REGISTER_URL, {
+    alias: 'expiring-foreground',
+    client_kind: 'codex',
+    client_session_id: 'expiring-foreground-session',
+    cwd: '/workspace',
+    respect_owner: true,
+  })
+  expect(takeover.status).toBe(200)
+  expect((await takeover.json()).generation).toBe(current.generation + 1)
+})
+
+test('legacy fallback polling does not make an owner-controlled identity online', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'foreground-not-polled',
+    client_kind: 'codex',
+    client_session_id: 'foreground-not-polled-session',
+    cwd: '/workspace',
+    owner_token: 'foreground-not-polled-token',
+  })
+  const fallbackPoll = fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=foreground-not-polled-session&timeout_s=1`,
+  )
+  await Bun.sleep(30)
+
+  const sender = await makeClient('fallback-liveness-sender')
+  await sender.callTool({ name: 'register', arguments: { role: 'fallback-liveness-sender' } })
+  const sent = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'foreground-not-polled', message: 'owner is not polling' },
+  })).content as any[])[0].text)
+  expect(sent.delivered_notification).toBe(false)
+  expect((await (await fallbackPoll).json()).status).toBe('unread')
+  await sender.close()
+})
+
 test('owner registration alone is not reported online before an owned poll starts', async () => {
   await postJson(REGISTER_URL, {
     alias: 'owner-not-polling',
@@ -1721,6 +1808,10 @@ test('HTTP register validates JSON, required fields, and client_kind', async () 
     {
       body: { alias: 'peer', client_kind: 'codex', client_session_id: 'thread', cwd: '/workspace', owner_token: '' },
       error: 'owner_token must be a non-empty string when provided',
+    },
+    {
+      body: { alias: 'peer', client_kind: 'codex', client_session_id: 'thread', cwd: '/workspace', respect_owner: 'yes' },
+      error: 'respect_owner must be a boolean when provided',
     },
   ]
 
