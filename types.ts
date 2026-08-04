@@ -14,6 +14,8 @@ export interface SessionRow {
   last_activity: string // ISO 8601 UTC
   last_seen_at: string | null // ISO 8601 UTC
   generation: number
+  owner_token: string | null
+  owner_seen_at: string | null // ISO 8601 UTC; ownership CAS lease only
   released_at: string | null // ISO 8601 UTC; NULL means active
 }
 

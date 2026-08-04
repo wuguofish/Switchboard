@@ -9,7 +9,11 @@ const TEST_PORT = 19876
 const TEST_URL = `http://127.0.0.1:${TEST_PORT}/mcp`
 
 beforeEach(async () => {
-  handle = await startServer({ port: TEST_PORT, dbPath: ':memory:' })
+  handle = await startServer({
+    port: TEST_PORT,
+    dbPath: ':memory:',
+    ownerLeaseTtlMs: 50,
+  })
 })
 
 afterEach(async () => {
@@ -688,6 +692,14 @@ test('/poll validates canonical client identity parameters', async () => {
     `${POLL_URL}?cc_session_id=some-id&client_kind=codex&client_session_id=some-id&timeout_s=1`,
   )
   expect(ambiguous.status).toBe(400)
+
+  const missingGeneration = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=some-id&owner_token=owner&timeout_s=1`,
+  )
+  expect(missingGeneration.status).toBe(400)
+  expect(await missingGeneration.json()).toEqual({
+    error: 'owner_token and generation must be provided together',
+  })
 })
 
 test('/poll returns unread immediately when messages are already waiting', async () => {
@@ -1299,6 +1311,227 @@ test('HTTP register upserts active and released peer sessions with increasing ge
   })
 })
 
+test('HTTP register owner CAS acquires, renews, and takes over an expired lease', async () => {
+  const acquired = await (await postJson(REGISTER_URL, {
+    alias: 'owned-codex',
+    client_kind: 'codex',
+    client_session_id: 'owned-codex-session',
+    cwd: '/workspace',
+    owner_token: 'tui-owner-a',
+  })).json()
+  expect(acquired.generation).toBe(1)
+
+  const renewed = await (await postJson(REGISTER_URL, {
+    alias: 'owned-codex-renamed',
+    client_kind: 'codex',
+    client_session_id: 'owned-codex-session',
+    cwd: '/workspace/renamed',
+    owner_token: 'tui-owner-a',
+  })).json()
+  expect(renewed).toEqual({
+    session_id: acquired.session_id,
+    alias: 'owned-codex-renamed',
+    generation: acquired.generation,
+  })
+
+  await Bun.sleep(70)
+  const takenOver = await (await postJson(REGISTER_URL, {
+    alias: 'owned-codex-taken-over',
+    client_kind: 'codex',
+    client_session_id: 'owned-codex-session',
+    cwd: '/workspace/new-owner',
+    owner_token: 'tui-owner-b',
+  })).json()
+  expect(takenOver).toEqual({
+    session_id: acquired.session_id,
+    alias: 'owned-codex-taken-over',
+    generation: acquired.generation + 1,
+  })
+})
+
+test('HTTP register owner CAS rejects a second owner while the lease is active', async () => {
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'owner-conflict-peer',
+    client_kind: 'codex',
+    client_session_id: 'owner-conflict-session',
+    cwd: '/workspace',
+    owner_token: 'active-owner',
+  })).json()
+
+  const conflict = await postJson(REGISTER_URL, {
+    alias: 'owner-conflict-peer',
+    client_kind: 'codex',
+    client_session_id: 'owner-conflict-session',
+    cwd: '/workspace',
+    owner_token: 'contending-owner',
+  })
+  expect(conflict.status).toBe(409)
+  expect(await conflict.json()).toEqual({
+    code: 'owner_conflict',
+    error: 'session ownership is held by an active client',
+    current_generation: current.generation,
+  })
+})
+
+test('owner registration alone is not reported online before an owned poll starts', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'owner-not-polling',
+    client_kind: 'codex',
+    client_session_id: 'owner-not-polling-session',
+    cwd: '/workspace',
+    owner_token: 'owner-not-polling-token',
+  })
+  const observer = await makeClient('owner-not-polling-observer')
+  await observer.callTool({ name: 'register', arguments: { role: 'owner-not-polling-observer' } })
+  const sessions = JSON.parse(((await observer.callTool({
+    name: 'list_sessions',
+    arguments: {},
+  })).content as any[])[0].text)
+  expect(sessions.find((session: any) => session.alias === 'owner-not-polling')?.online)
+    .toBe(false)
+  await observer.close()
+})
+
+test('legacy polling does not renew a token owner lease', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'owner-with-legacy-poll',
+    client_kind: 'codex',
+    client_session_id: 'owner-with-legacy-poll-session',
+    cwd: '/workspace',
+    owner_token: 'expiring-owner',
+  })
+  await Bun.sleep(30)
+  const legacyPoll = fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=owner-with-legacy-poll-session&timeout_s=1`,
+  )
+  await Bun.sleep(30)
+
+  const takeover = await postJson(REGISTER_URL, {
+    alias: 'owner-after-legacy-poll',
+    client_kind: 'codex',
+    client_session_id: 'owner-with-legacy-poll-session',
+    cwd: '/workspace',
+    owner_token: 'new-owner',
+  })
+  expect(takeover.status).toBe(200)
+  await legacyPoll
+})
+
+test('a stale owned long-poll does not make the takeover generation look online', async () => {
+  const oldOwner = await (await postJson(REGISTER_URL, {
+    alias: 'owner-long-poll',
+    client_kind: 'codex',
+    client_session_id: 'owner-long-poll-session',
+    cwd: '/workspace',
+    owner_token: 'old-long-poll-owner',
+  })).json()
+  const oldPoll = fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=owner-long-poll-session` +
+      `&generation=${oldOwner.generation}&owner_token=old-long-poll-owner&timeout_s=2`,
+  )
+  await Bun.sleep(70)
+  const newOwner = await (await postJson(REGISTER_URL, {
+    alias: 'owner-long-poll',
+    client_kind: 'codex',
+    client_session_id: 'owner-long-poll-session',
+    cwd: '/workspace',
+    owner_token: 'new-long-poll-owner',
+  })).json()
+
+  const sender = await makeClient('owner-long-poll-sender')
+  await sender.callTool({ name: 'register', arguments: { role: 'owner-long-poll-sender' } })
+  const sent = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'owner-long-poll', message: 'wake only current owner' },
+  })).content as any[])[0].text)
+  expect(sent.delivered_notification).toBe(false)
+
+  const stale = await oldPoll
+  expect(stale.status).toBe(409)
+  expect(await stale.json()).toEqual({
+    code: 'stale_generation',
+    error: `generation mismatch: current generation is ${newOwner.generation}`,
+    current_generation: newOwner.generation,
+  })
+  await sender.close()
+})
+
+test('an owned poll lease does not make a legacy takeover generation look online', async () => {
+  const oldOwner = await (await postJson(REGISTER_URL, {
+    alias: 'owner-to-legacy',
+    client_kind: 'codex',
+    client_session_id: 'owner-to-legacy-session',
+    cwd: '/workspace',
+    owner_token: 'owner-before-legacy',
+  })).json()
+  const oldPoll = fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=owner-to-legacy-session` +
+      `&generation=${oldOwner.generation}&owner_token=owner-before-legacy&timeout_s=2`,
+  )
+  await Bun.sleep(30)
+  const legacy = await (await postJson(REGISTER_URL, {
+    alias: 'owner-to-legacy',
+    client_kind: 'codex',
+    client_session_id: 'owner-to-legacy-session',
+    cwd: '/workspace',
+  })).json()
+
+  const sender = await makeClient('owner-to-legacy-sender')
+  await sender.callTool({ name: 'register', arguments: { role: 'owner-to-legacy-sender' } })
+  const sent = JSON.parse(((await sender.callTool({
+    name: 'send',
+    arguments: { to: 'owner-to-legacy', message: 'legacy owner has not polled' },
+  })).content as any[])[0].text)
+  expect(sent.delivered_notification).toBe(false)
+
+  const stale = await oldPoll
+  expect(stale.status).toBe(409)
+  expect(await stale.json()).toEqual({
+    code: 'stale_generation',
+    error: `generation mismatch: current generation is ${legacy.generation}`,
+    current_generation: legacy.generation,
+  })
+  await sender.close()
+})
+
+test('HTTP ownership is optional and legacy clients retain their existing behavior', async () => {
+  const first = await (await postJson(REGISTER_URL, {
+    alias: 'legacy-ownerless-one',
+    client_kind: 'codex',
+    client_session_id: 'legacy-ownerless-session',
+    cwd: '/workspace/one',
+  })).json()
+  const second = await (await postJson(REGISTER_URL, {
+    alias: 'legacy-ownerless-two',
+    client_kind: 'codex',
+    client_session_id: 'legacy-ownerless-session',
+    cwd: '/workspace/two',
+  })).json()
+  expect(second.generation).toBe(first.generation + 1)
+
+  const poll = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=legacy-ownerless-session&timeout_s=1`,
+  )
+  expect(poll.status).toBe(200)
+  expect(await poll.json()).toEqual({ status: 'timeout' })
+
+  const read = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'legacy-ownerless-session',
+    generation: second.generation,
+  })
+  expect(read.status).toBe(200)
+  expect(await read.json()).toEqual({ messages: [] })
+
+  const unregister = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'legacy-ownerless-session',
+    generation: second.generation,
+  })
+  expect(unregister.status).toBe(200)
+  expect(await unregister.json()).toEqual({ status: 'released' })
+})
+
 test('HTTP unregister rejects stale generation without killing the current instance', async () => {
   const first = await (await postJson(REGISTER_URL, {
     alias: 'stale-token-one',
@@ -1330,6 +1563,108 @@ test('HTTP unregister rejects stale generation without killing the current insta
   })
   expect(currentResp.status).toBe(200)
   expect(await currentResp.json()).toEqual({ status: 'released' })
+})
+
+test('HTTP ownership guards poll, message read, and unregister', async () => {
+  await postJson(REGISTER_URL, {
+    alias: 'guarded-owner-peer',
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    cwd: '/workspace',
+  })
+  const current = await (await postJson(REGISTER_URL, {
+    alias: 'guarded-owner-peer',
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    cwd: '/workspace',
+    owner_token: 'guarded-owner',
+  })).json()
+
+  const poll = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=guarded-owner-session` +
+      `&generation=${current.generation}&owner_token=wrong-owner&timeout_s=1`,
+  )
+  expect(poll.status).toBe(409)
+  expect(await poll.json()).toEqual({
+    code: 'owner_mismatch',
+    error: 'owner token mismatch',
+    current_generation: current.generation,
+  })
+
+  const stalePoll = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=guarded-owner-session` +
+      `&generation=${current.generation - 1}&owner_token=guarded-owner&timeout_s=1`,
+  )
+  expect(stalePoll.status).toBe(409)
+  expect(await stalePoll.json()).toEqual({
+    code: 'stale_generation',
+    error: `generation mismatch: current generation is ${current.generation}`,
+    current_generation: current.generation,
+  })
+
+  const read = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    generation: current.generation,
+    owner_token: 'wrong-owner',
+  })
+  expect(read.status).toBe(409)
+  expect(await read.json()).toEqual({
+    code: 'owner_mismatch',
+    error: 'owner token mismatch',
+    current_generation: current.generation,
+  })
+
+  const staleRead = await postJson(MESSAGE_READ_URL, {
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    generation: current.generation - 1,
+    owner_token: 'guarded-owner',
+  })
+  expect(staleRead.status).toBe(409)
+  expect(await staleRead.json()).toEqual({
+    code: 'stale_generation',
+    error: `generation mismatch: current generation is ${current.generation}`,
+    current_generation: current.generation,
+  })
+
+  const unregister = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    generation: current.generation,
+    owner_token: 'wrong-owner',
+  })
+  expect(unregister.status).toBe(409)
+  expect(await unregister.json()).toEqual({
+    code: 'owner_mismatch',
+    error: 'owner token mismatch',
+    current_generation: current.generation,
+  })
+
+  const validPoll = await fetch(
+    `${POLL_URL}?client_kind=codex&client_session_id=guarded-owner-session` +
+      `&generation=${current.generation}&owner_token=guarded-owner&timeout_s=1`,
+  )
+  expect(validPoll.status).toBe(200)
+  expect(await validPoll.json()).toEqual({ status: 'timeout' })
+
+  const validUnregister = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    generation: current.generation,
+    owner_token: 'guarded-owner',
+  })
+  expect(validUnregister.status).toBe(200)
+  expect(await validUnregister.json()).toEqual({ status: 'released' })
+
+  const repeatedUnregister = await postJson(UNREGISTER_URL, {
+    client_kind: 'codex',
+    client_session_id: 'guarded-owner-session',
+    generation: current.generation,
+    owner_token: 'guarded-owner',
+  })
+  expect(repeatedUnregister.status).toBe(200)
+  expect(await repeatedUnregister.json()).toEqual({ status: 'already_released' })
 })
 
 test('HTTP register reports an active alias conflict', async () => {
@@ -1383,6 +1718,10 @@ test('HTTP register validates JSON, required fields, and client_kind', async () 
       body: { alias: 'peer', client_kind: 'codex', client_session_id: 'thread', cwd: '' },
       error: 'cwd is required and must be a non-empty string',
     },
+    {
+      body: { alias: 'peer', client_kind: 'codex', client_session_id: 'thread', cwd: '/workspace', owner_token: '' },
+      error: 'owner_token must be a non-empty string when provided',
+    },
   ]
 
   for (const invalidCase of invalidCases) {
@@ -1414,6 +1753,10 @@ test('HTTP unregister validates identity and generation fields', async () => {
       body: { client_kind: 'codex', client_session_id: 'thread', generation: 1.5 },
       error: 'generation is required and must be a positive integer',
     },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 1, owner_token: '' },
+      error: 'owner_token must be a non-empty string when provided',
+    },
   ]
 
   for (const invalidCase of invalidCases) {
@@ -1436,6 +1779,10 @@ test('HTTP message read validates identity and generation fields', async () => {
     {
       body: { client_kind: 'codex', client_session_id: 'thread', generation: 0 },
       error: 'generation is required and must be a positive integer',
+    },
+    {
+      body: { client_kind: 'codex', client_session_id: 'thread', generation: 1, owner_token: '' },
+      error: 'owner_token must be a non-empty string when provided',
     },
   ]
 

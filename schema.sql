@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity     TEXT NOT NULL,
     last_seen_at      TEXT,
     generation        INTEGER NOT NULL DEFAULT 1,
+    owner_token       TEXT,
+    owner_seen_at     TEXT,
     released_at       TEXT
 );
 

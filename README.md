@@ -181,22 +181,36 @@ Codex-kind recipients are only written to when they are online at insert time �
   reactivates the row and bumps its generation. Returns
   `{session_id, alias, generation}`; 400 on validation errors, 409 on alias
   collision.
+  Optional `owner_token` opts into ownership CAS: acquiring an ownerless
+  identity or taking over an expired owner lease bumps the generation, a
+  same-owner call is a lease renewal that keeps its generation, and a second
+  owner is rejected with `409 {code: "owner_conflict"}` while the current
+  owner's lease is alive. Token-less registers keep last-register-wins
+  semantics and clear any stored owner token.
 - `POST /unregister` — graceful peer sign-off. JSON body:
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`.
   The generation must match the current row — a delayed unregister from an
   older instance cannot release a newer one (409). Returns
-  `{status: "released" | "already_released"}`, 404 when unknown.
+  `{status: "released" | "already_released"}`, 404 when unknown. With an
+  `owner_token`, 409 bodies carry `code: "stale_generation"` or
+  `code: "owner_mismatch"` so clients can tell the two apart.
 - `POST /messages/read` — authenticated peer inbox read. JSON body:
   `{ "client_kind": ..., "client_session_id": ..., "generation": <int> }`.
   The identity must resolve to an active session and the generation must match.
   Returns `{messages: [...]}` with the same fields and Asia/Taipei timestamps as
   MCP `read_messages`, and marks the returned messages read.
   Validation errors return 400, unknown or released identities return 404, and
-  stale generations return 409.
+  stale generations return 409. With an `owner_token`, 409 bodies carry
+  `code: "stale_generation"` or `code: "owner_mismatch"` — clients must treat
+  these as "stop waking", never as "endpoint unavailable".
 - `GET /poll?client_kind=<kind>&client_session_id=<id>&timeout_s=<1..250>` —
   canonical long-poll for unread mail. Every call also renews the caller's
   lease (`last_seen_at`). The legacy form `?cc_session_id=<uuid>` remains
-  supported as an alias for `client_kind=claude_code`. Returns JSON:
+  supported as an alias for `client_kind=claude_code`. Optional
+  `&owner_token=<t>&generation=<g>` (must appear together) makes the poll
+  owner-aware: mismatches return the same 409 bodies as `/messages/read`,
+  ownership is re-checked after the long wait, and the owner lease
+  (`owner_seen_at`) is renewed alongside the poll lease. Returns JSON:
   - `{status: "unread", count, alias, message}` — Stop-hook shim exits 2
   - `{status: "timeout"}` — shim re-dials
   - `{status: "no-session"}` — alias is gone; shim exits 0

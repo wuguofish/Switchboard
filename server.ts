@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId } from './db'
+import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString } from './time'
@@ -108,9 +108,46 @@ function requireGeneration(body: Record<string, unknown>): number {
   return value as number
 }
 
+function optionalNonEmptyString(
+  body: Record<string, unknown>,
+  field: string,
+): string | undefined {
+  const value = body[field]
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new RequestValidationError(
+      `${field} must be a non-empty string when provided`,
+    )
+  }
+  return value.trim()
+}
+
+function ownershipMismatchResponse(
+  session: SessionRow,
+  generation: number,
+  ownerToken: string,
+): Response | null {
+  if (session.generation !== generation) {
+    return Response.json({
+      code: 'stale_generation',
+      error: `generation mismatch: current generation is ${session.generation}`,
+      current_generation: session.generation,
+    }, { status: 409 })
+  }
+  if (session.owner_token !== ownerToken) {
+    return Response.json({
+      code: 'owner_mismatch',
+      error: 'owner token mismatch',
+      current_generation: session.generation,
+    }, { status: 409 })
+  }
+  return null
+}
+
 export async function startServer(opts: {
   port: number
   dbPath: string
+  ownerLeaseTtlMs?: number
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
   const registry = new ConnectionRegistry()
@@ -164,12 +201,14 @@ export async function startServer(opts: {
       const client_kind = requireClientKind(body)
       const client_session_id = requireNonEmptyString(body, 'client_session_id')
       const cwd = requireNonEmptyString(body, 'cwd')
+      const owner_token = optionalNonEmptyString(body, 'owner_token')
       const session = registerClientSession(db, {
         alias,
         client_kind,
         client_session_id,
         cwd,
-      })
+        owner_token,
+      }, { ownerLeaseTtlMs: opts.ownerLeaseTtlMs })
       return Response.json({
         session_id: session.id,
         alias: session.alias,
@@ -179,6 +218,13 @@ export async function startServer(opts: {
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof RequestValidationError) {
         return Response.json({ error: message }, { status: 400 })
+      }
+      if (error instanceof OwnershipConflictError) {
+        return Response.json({
+          code: 'owner_conflict',
+          error: error.message,
+          current_generation: error.currentGeneration,
+        }, { status: 409 })
       }
       if (message.startsWith('alias already taken:')) {
         return Response.json({ error: message }, { status: 409 })
@@ -197,10 +243,12 @@ export async function startServer(opts: {
       const client_kind = requireClientKind(body)
       const client_session_id = requireNonEmptyString(body, 'client_session_id')
       const generation = requireGeneration(body)
+      const owner_token = optionalNonEmptyString(body, 'owner_token')
       const result = unregisterClientSession(db, {
         client_kind,
         client_session_id,
         generation,
+        owner_token,
       })
 
       if (result === 'not_found') {
@@ -212,12 +260,27 @@ export async function startServer(opts: {
           client_kind,
           client_session_id,
         )
-        return Response.json(
-          {
-            error: `generation mismatch: current generation is ${current?.generation ?? 'unknown'}`,
-          },
-          { status: 409 },
+        const error = `generation mismatch: current generation is ${current?.generation ?? 'unknown'}`
+        if (owner_token === undefined) {
+          return Response.json({ error }, { status: 409 })
+        }
+        return Response.json({
+          code: 'stale_generation',
+          error,
+          current_generation: current?.generation ?? null,
+        }, { status: 409 })
+      }
+      if (result === 'owner_mismatch') {
+        const current = findAnySessionByClientSessionId(
+          db,
+          client_kind,
+          client_session_id,
         )
+        return Response.json({
+          code: 'owner_mismatch',
+          error: 'owner token mismatch',
+          current_generation: current?.generation ?? null,
+        }, { status: 409 })
       }
       return Response.json({ status: result })
     } catch (error) {
@@ -239,6 +302,7 @@ export async function startServer(opts: {
       const client_kind = requireClientKind(body)
       const client_session_id = requireNonEmptyString(body, 'client_session_id')
       const generation = requireGeneration(body)
+      const owner_token = optionalNonEmptyString(body, 'owner_token')
       const session = findSessionByClientSessionId(
         db,
         client_kind,
@@ -249,12 +313,22 @@ export async function startServer(opts: {
         return Response.json({ error: 'session not found' }, { status: 404 })
       }
       if (session.generation !== generation) {
+        const error = `generation mismatch: current generation is ${session.generation}`
+        if (owner_token === undefined) {
+          return Response.json({ error }, { status: 409 })
+        }
         return Response.json(
           {
-            error: `generation mismatch: current generation is ${session.generation}`,
+            code: 'stale_generation',
+            error,
+            current_generation: session.generation,
           },
           { status: 409 },
         )
+      }
+      if (owner_token !== undefined) {
+        const mismatch = ownershipMismatchResponse(session, generation, owner_token)
+        if (mismatch) return mismatch
       }
       return Response.json({ messages: readUnreadMessages(session.id) })
     } catch (error) {
@@ -825,15 +899,44 @@ export async function startServer(opts: {
     const parsed = parseInt(timeoutRaw, 10)
     const timeoutS = Math.min(Math.max(Number.isFinite(parsed) ? parsed : 240, 1), 250)
 
-    const session = findSessionByClientSessionId(db, clientKind, clientSessionId)
+    const ownerTokenRaw = url.searchParams.get('owner_token')
+    const generationRaw = url.searchParams.get('generation')
+    if ((ownerTokenRaw === null) !== (generationRaw === null)) {
+      return Response.json({
+        error: 'owner_token and generation must be provided together',
+      }, { status: 400 })
+    }
+    let ownerToken: string | undefined
+    let generation: number | undefined
+    if (ownerTokenRaw !== null && generationRaw !== null) {
+      ownerToken = ownerTokenRaw.trim()
+      generation = Number(generationRaw)
+      if (!ownerToken) {
+        return Response.json({
+          error: 'owner_token must be a non-empty string when provided',
+        }, { status: 400 })
+      }
+      if (!Number.isSafeInteger(generation) || generation < 1) {
+        return Response.json({
+          error: 'generation must be a positive integer when provided',
+        }, { status: 400 })
+      }
+    }
+
+    let session = findSessionByClientSessionId(db, clientKind, clientSessionId)
     if (!session || !session.alias) {
       return Response.json({ status: 'no-session' })
+    }
+    if (ownerToken !== undefined && generation !== undefined) {
+      const mismatch = ownershipMismatchResponse(session, generation, ownerToken)
+      if (mismatch) return mismatch
     }
 
     // Every valid poll renews the client's lease, including immediate unread
     // responses that never enter the waiter registry.
     updateLastSeen(db, session.id)
     updateLastActivity(db, session.id)
+    if (ownerToken !== undefined) updateOwnerSeen(db, session.id)
 
     const initial = countUnreadBySessionId(db, session.id)
     if (initial > 0) {
@@ -851,7 +954,21 @@ export async function startServer(opts: {
       clientSessionId,
       timeoutS * 1000,
       req.signal,
+      ownerToken !== undefined && generation !== undefined
+        ? { ownerToken, generation }
+        : undefined,
     )
+    // Ownership may have changed while this request was blocked. Re-read the
+    // row before exposing mailbox state so an old long-poll cannot wake after
+    // a newer owner has taken over the identity.
+    session = findSessionByClientSessionId(db, clientKind, clientSessionId)
+    if (!session || !session.alias) {
+      return Response.json({ status: 'no-session' })
+    }
+    if (ownerToken !== undefined && generation !== undefined) {
+      const mismatch = ownershipMismatchResponse(session, generation, ownerToken)
+      if (mismatch) return mismatch
+    }
     // Re-check: the waiter may have resolved because of a new message, a
     // timeout, or a client abort. Only the first case yields status=unread.
     const final = countUnreadBySessionId(db, session.id)

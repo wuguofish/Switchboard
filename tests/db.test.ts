@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions, OwnershipConflictError } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -295,6 +295,8 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
   expect(sessionColumns).toContain('cwd')
   expect(sessionColumns).toContain('last_seen_at')
   expect(sessionColumns).toContain('generation')
+  expect(sessionColumns).toContain('owner_token')
+  expect(sessionColumns).toContain('owner_seen_at')
   expect(sessionColumns).not.toContain('cc_session_id')
 
   const sessions = migrated.query<{
@@ -308,9 +310,11 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
     cwd: string | null
     last_seen_at: string | null
     generation: number
+    owner_token: string | null
+    owner_seen_at: string | null
   }, []>(`
     SELECT id, alias, client_kind, client_session_id, created_at,
-           last_activity, released_at, cwd, last_seen_at, generation
+           last_activity, released_at, cwd, last_seen_at, generation, owner_token, owner_seen_at
     FROM sessions
     ORDER BY id
   `).all()
@@ -326,6 +330,8 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
       cwd: null,
       last_seen_at: null,
       generation: 1,
+      owner_token: null,
+      owner_seen_at: null,
     },
     {
       id: 'released-id',
@@ -338,6 +344,8 @@ test('migration upgrades Phase 2.5 schema without losing data', () => {
       cwd: null,
       last_seen_at: null,
       generation: 1,
+      owner_token: null,
+      owner_seen_at: null,
     },
   ])
 
@@ -409,6 +417,61 @@ test('registerClientSession upserts identity and increments generation', () => {
   expect(third.id).toBe(first.id)
   expect(third.released_at).toBeNull()
   expect(third.generation).toBe(3)
+})
+
+test('registerClientSession owner CAS acquires, renews, rejects, and takes over expired ownership', () => {
+  const first = registerClientSession(db, {
+    alias: 'owned-one',
+    client_kind: 'codex',
+    client_session_id: 'owned-thread',
+    owner_token: 'owner-a',
+  }, { ownerLeaseTtlMs: 50 })
+  expect(first.owner_token).toBe('owner-a')
+  expect(first.last_seen_at).toBeNull()
+  expect(first.owner_seen_at).not.toBeNull()
+
+  const renewed = registerClientSession(db, {
+    alias: 'owned-renewed',
+    client_kind: 'codex',
+    client_session_id: 'owned-thread',
+    owner_token: 'owner-a',
+  }, { ownerLeaseTtlMs: 50 })
+  expect(renewed.generation).toBe(first.generation)
+  expect(renewed.alias).toBe('owned-renewed')
+
+  expect(() => registerClientSession(db, {
+    alias: 'owned-contender',
+    client_kind: 'codex',
+    client_session_id: 'owned-thread',
+    owner_token: 'owner-b',
+  }, { ownerLeaseTtlMs: 50 })).toThrow(OwnershipConflictError)
+
+  db.query('UPDATE sessions SET owner_seen_at = ? WHERE id = ?')
+    .run(new Date(Date.now() - 51).toISOString(), first.id)
+  const takenOver = registerClientSession(db, {
+    alias: 'owned-taken-over',
+    client_kind: 'codex',
+    client_session_id: 'owned-thread',
+    owner_token: 'owner-b',
+  }, { ownerLeaseTtlMs: 50 })
+  expect(takenOver.generation).toBe(first.generation + 1)
+  expect(takenOver.owner_token).toBe('owner-b')
+})
+
+test('legacy register clears ownership and keeps unconditional generation bumps', () => {
+  const owned = registerClientSession(db, {
+    alias: 'owned-before-legacy',
+    client_kind: 'codex',
+    client_session_id: 'legacy-takeover-thread',
+    owner_token: 'tui-owner',
+  })
+  const legacy = registerClientSession(db, {
+    alias: 'legacy-takeover',
+    client_kind: 'codex',
+    client_session_id: 'legacy-takeover-thread',
+  })
+  expect(legacy.generation).toBe(owned.generation + 1)
+  expect(legacy.owner_token).toBeNull()
 })
 
 test('registerClientSession prefers the active row over released identity history', () => {

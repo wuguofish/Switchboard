@@ -16,12 +16,25 @@ export interface Waiter {
   resolve: () => void
 }
 
+export interface PollOwnership {
+  generation: number
+  ownerToken: string
+}
+
 export class UnreadWaiterRegistry {
   private waiters = new Map<string, Set<Waiter>>()
   private polling = new Map<string, number>()
 
-  private pollingKey(clientKind: ClientKind, clientSessionId: string): string {
-    return `${clientKind}:${clientSessionId}`
+  private pollingKey(
+    clientKind: ClientKind,
+    clientSessionId: string,
+    ownership?: PollOwnership,
+  ): string {
+    return JSON.stringify(
+      ownership
+        ? [clientKind, clientSessionId, 'owner', ownership.generation, ownership.ownerToken]
+        : [clientKind, clientSessionId, 'legacy'],
+    )
   }
 
   /**
@@ -42,8 +55,9 @@ export class UnreadWaiterRegistry {
     clientSessionId: string,
     timeoutMs: number,
     abortSignal?: AbortSignal,
+    ownership?: PollOwnership,
   ): Promise<void> {
-    const pollingKey = this.pollingKey(clientKind, clientSessionId)
+    const pollingKey = this.pollingKey(clientKind, clientSessionId, ownership)
     this.polling.set(pollingKey, (this.polling.get(pollingKey) ?? 0) + 1)
     try {
       await new Promise<void>((resolve) => {
@@ -98,8 +112,12 @@ export class UnreadWaiterRegistry {
   }
 
   /** True if this kind-qualified client identity is currently polling. */
-  isPolling(clientKind: ClientKind, clientSessionId: string): boolean {
-    return this.polling.has(this.pollingKey(clientKind, clientSessionId))
+  isPolling(
+    clientKind: ClientKind,
+    clientSessionId: string,
+    ownership?: PollOwnership,
+  ): boolean {
+    return this.polling.has(this.pollingKey(clientKind, clientSessionId, ownership))
   }
 
   /**
