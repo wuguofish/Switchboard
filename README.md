@@ -279,6 +279,14 @@ generation/identity-guarded way to fetch and mark their own unread messages.
 It shares the MCP `read_messages` read-at semantics, so poll-driven clients can
 consume the inbox without touching SQLite or retriggering on already-read mail.
 
+## Bundled clients
+
+- **`clients/opencode-plugin/`** — OpenCode plugin that turns a headless
+  OpenCode server into a Switchboard peer: an operator alias with a doorbell,
+  per-session extensions whose aliases follow session titles, and claim
+  instructions baked into wake prompts. See its README for deployment and the
+  `SWITCHBOARD_DOORBELL=1` gate.
+
 ## Retention & cleanup
 
 - Messages marked read are deleted after 7 days.
