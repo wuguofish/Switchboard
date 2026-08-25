@@ -565,6 +565,23 @@ export function deleteExpiredMessages(db: Database): number {
 }
 
 /**
+ * Delete session rows nobody can reach any more: already released, idle beyond
+ * the retention window, and not referenced by any surviving message. Every
+ * client start leaves a row behind, so without this the table grows forever
+ * and every list_sessions call pays for the whole history.
+ */
+export function deleteStaleSessionRows(db: Database, retentionDays: number): number {
+  const info = db.query(`
+    DELETE FROM sessions
+    WHERE released_at IS NOT NULL
+      AND datetime(last_activity) < datetime('now', ?)
+      AND id NOT IN (SELECT sender_id FROM messages)
+      AND id NOT IN (SELECT recipient_id FROM messages)
+  `).run(`-${retentionDays} days`)
+  return Number(info.changes)
+}
+
+/**
  * Release sessions that look orphaned: alive in DB (released_at IS NULL) but
  * either (a) not currently connected to any transport, and (b) no activity
  * within staleThresholdMs. The later of lease renewal and general activity is

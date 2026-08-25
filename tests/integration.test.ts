@@ -810,7 +810,8 @@ test('/poll renews a lease used by list_sessions and delivered_notification', as
     name: 'list_sessions',
     arguments: {},
   })).content as any[])[0].text)
-  expect(before.find((s: any) => s.alias === 'leased-codex')?.online).toBe(false)
+  // Not online now means absent from the listing, not present-and-flagged.
+  expect(before.some((s: any) => s.alias === 'leased-codex')).toBe(false)
 
   const poll = fetch(
     `${POLL_URL}?client_kind=codex&client_session_id=leased-codex-id&timeout_s=1`,
@@ -1474,8 +1475,8 @@ test('owner registration alone is not reported online before an owned poll start
     name: 'list_sessions',
     arguments: {},
   })).content as any[])[0].text)
-  expect(sessions.find((session: any) => session.alias === 'owner-not-polling')?.online)
-    .toBe(false)
+  // Not online now means absent from the listing, not present-and-flagged.
+  expect(sessions.some((session: any) => session.alias === 'owner-not-polling')).toBe(false)
   await observer.close()
 })
 

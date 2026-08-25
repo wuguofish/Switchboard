@@ -542,7 +542,9 @@ export async function startServer(opts: {
         },
         {
           name: 'list_sessions',
-          description: 'List all registered sessions with online status.',
+          description:
+            'List the sessions that are currently online. '
+            + 'Offline history is not returned — query the sessions table directly if you need it.',
           inputSchema: { type: 'object' as const, properties: {} },
         },
         {
@@ -790,14 +792,16 @@ export async function startServer(opts: {
       }
 
       if (name === 'list_sessions') {
-        const all = listAllSessions(db)
-        const result = all.map(s => ({
-          session_id: s.id,
-          alias: s.alias,
-          online: isSessionOnline(s, registry, waiters),
-          created_at: toTaipeiISOString(s.created_at),
-          last_activity: toTaipeiISOString(s.last_activity),
-        }))
+        // Online only: offline rows pile up into the hundreds and flood the caller's context
+        const result = listAllSessions(db)
+          .filter(s => isSessionOnline(s, registry, waiters))
+          .map(s => ({
+            session_id: s.id,
+            alias: s.alias,
+            online: true,
+            created_at: toTaipeiISOString(s.created_at),
+            last_activity: toTaipeiISOString(s.last_activity),
+          }))
         return {
           content: [{ type: 'text', text: JSON.stringify(result) }],
         }
