@@ -74,13 +74,50 @@ Environment variables (all optional):
 | `SWITCHBOARD_DB` | `<homedir>/.claude/switchboard.db` | SQLite file path |
 | `SWITCHBOARD_POLLER_STATE_DIR` | `<homedir>/.claude` | Directory for poller state/lock files |
 
-### Auto-start on login (Windows scheduled task)
+### Run as a service (recommended)
+
+Running the daemon from a terminal ties its lifetime to that window. On Windows
+11 the tie is literal: Windows Terminal hosts every console program, so closing
+the window sends `CTRL_CLOSE` to the daemon as well. A service has no console.
+
+**Windows** — [WinSW](https://github.com/winsw/winsw/releases), saved next to the
+repo as `switchboard-service.exe`:
+
+```powershell
+Copy-Item switchboard-service.example.xml switchboard-service.xml
+# fill in the absolute paths inside it, then from an elevated shell:
+.\switchboard-service.exe install
+Start-Service switchboard-daemon
+```
+
+Restarting later also needs elevation: `Restart-Service switchboard-daemon`.
+
+**Linux** — systemd user service:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp switchboard.service.example ~/.config/systemd/user/switchboard.service
+systemctl --user daemon-reload
+systemctl --user enable --now switchboard
+loginctl enable-linger "$USER"   # survive reboots without logging in first
+```
+
+Logs go to the journal (`journalctl --user -u switchboard -f`) and restarting
+needs no elevation: `systemctl --user restart switchboard`.
+
+Both templates spell out `SWITCHBOARD_DB` and `SWITCHBOARD_POLLER_STATE_DIR`
+instead of leaning on `os.homedir()`, because a service account's home is not
+yours — omit them and the daemon quietly opens an empty database.
+
+### Auto-start on login (Windows scheduled task, legacy)
 
 ```powershell
 powershell -File install-task.ps1
 ```
 
-Registers the scheduled task `Switchboard MCP Daemon`, which runs `start-daemon.ps1` at user logon.
+Registers the scheduled task `Switchboard MCP Daemon`, which runs
+`start-daemon.ps1` at user logon. Superseded by the service above — see the
+console-close caveat.
 
 ## Wire up Claude Code
 
@@ -347,8 +384,10 @@ aliases.ts               # alias collision handling + target resolution
 poller.ts                # legacy bun-based Stop-hook poller (fallback)
 poller-shim.ps1          # PowerShell Stop-hook shim (default)
 hook-session-start.ts    # SessionStart hook that injects cc_session_id
-install-task.ps1         # registers the Windows scheduled task
+install-task.ps1         # registers the Windows scheduled task (legacy)
 start-daemon.ps1         # launches the daemon detached in the background
+switchboard-service.example.xml  # WinSW template for the Windows service
+switchboard.service.example      # systemd user-service template for Linux
 tests/                   # bun:test suites
 ```
 

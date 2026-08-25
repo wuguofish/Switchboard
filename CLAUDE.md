@@ -11,6 +11,12 @@ bun main.ts            # foreground
 powershell -File start-daemon.ps1  # detached background
 ```
 
+常駐部署掛成服務（設定範本 `switchboard-service.example.xml` / `switchboard.service.example`，
+安裝步驟見 README）。Windows 服務名 `switchboard-daemon`，**重啟要提權**；
+Linux 是 systemd user service，`systemctl --user restart switchboard` 不用提權。
+兩邊都要明寫 `SWITCHBOARD_DB` 與 `SWITCHBOARD_POLLER_STATE_DIR`——服務帳號的
+`os.homedir()` 不是你的家目錄，漏填會開到空資料庫。
+
 環境變數：
 - `SWITCHBOARD_PORT` — 預設 9876
 - `SWITCHBOARD_DB` — 預設 `<homedir>/.claude/switchboard.db`（用 `os.homedir()`，slash-normalized）

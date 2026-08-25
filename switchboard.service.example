@@ -1,0 +1,40 @@
+# systemd user service for the switchboard daemon.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp switchboard.service.example ~/.config/systemd/user/switchboard.service
+#   # adjust WorkingDirectory below if the repo does not live at ~/switchboard
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now switchboard
+#
+# A *user* service is deliberate. The daemon binds loopback only and keeps its
+# database under ~/.claude, so it wants your identity and your home directory.
+# A system service would resolve os.homedir() to the service account and open an
+# empty database instead — the Windows side of this repo hit exactly that.
+#
+# One consequence worth knowing: user services stop when you log out and do not
+# come back until the next login. To keep the daemon running across reboots
+# without logging in, enable lingering once:
+#
+#   loginctl enable-linger "$USER"
+#
+# Logs go to the journal:  journalctl --user -u switchboard -f
+
+[Unit]
+Description=Switchboard MCP daemon for Claude Code sessions
+Documentation=https://github.com/wuguofish/Switchboard
+After=network.target
+
+[Service]
+Type=simple
+# systemd does not inherit your shell PATH, so bun needs an absolute path.
+# %h expands to the home directory of the user the service runs as.
+ExecStart=%h/.bun/bin/bun main.ts
+WorkingDirectory=%h/switchboard
+Restart=always
+RestartSec=10s
+Environment=SWITCHBOARD_DB=%h/.claude/switchboard.db
+Environment=SWITCHBOARD_POLLER_STATE_DIR=%h/.claude
+
+[Install]
+WantedBy=default.target
