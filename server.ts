@@ -21,7 +21,7 @@ import type { Database } from 'bun:sqlite'
 import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
-import { toTaipeiISOString } from './time'
+import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
 import type { BroadcastScope, ClientKind, SessionRow } from './types'
@@ -1003,7 +1003,7 @@ export async function startServer(opts: {
   }
 
   /**
-   * GET /monitor?cc_session_id=X
+   * GET /monitor?cc_session_id=X[&heartbeat_secs=N]
    *
    * Live chunked text stream for the Claude Code `Monitor` tool. The client
    * runs `curl -sN http://127.0.0.1:.../monitor?cc_session_id=...` as a
@@ -1015,9 +1015,10 @@ export async function startServer(opts: {
    * Idle keep-alive: every 240s we write a single space byte (no newline)
    * so the TCP connection stays warm against Bun's 255s idleTimeout, but
    * Monitor — which is line-buffered — does not emit a notification. Once
-   * every HEARTBEAT_LINE_EVERY (~2 hr) we *do* emit a real
-   * `heartbeat <iso-ts>` line, so subscribed sessions get an occasional
-   * time tick to ground them in real time without being woken every 4 min.
+   * every HEARTBEAT_LINE_EVERY (4 hr by default, see heartbeat_secs) we
+   * *do* emit a real `heartbeat <iso-ts>` line, so subscribed sessions get an
+   * occasional time tick to ground them in real time without being woken
+   * every 4 min. The line carries the Taipei weekday inline.
    * Earlier versions emitted the line every 240s, which woke every
    * connected session every four minutes for nothing.
    *
@@ -1079,11 +1080,31 @@ export async function startServer(opts: {
         // re-subscribe. On waiter timeout (no new messages within
         // HEARTBEAT_MS) write a silent keep-alive byte so Bun's idleTimeout
         // doesn't cut us and idle subscribers don't wake. Every
-        // HEARTBEAT_LINE_EVERY ticks (~2 hr) emit a visible heartbeat
+        // HEARTBEAT_LINE_EVERY ticks (4 hr by default) emit a visible heartbeat
         // line instead, so subscribed sessions get an occasional ground-truth
         // timestamp without being pinged every 4 min.
         const HEARTBEAT_MS = 240_000
-        const HEARTBEAT_LINE_EVERY = 30
+        // Default 4 hours, overridable per subscriber via heartbeat_secs.
+        // Every heartbeat wake is a cold start — the prompt cache has expired
+        // by then, so the whole context is re-written at cache-write price.
+        // That makes the interval a direct cost knob: doubling it halves the
+        // idle burn. Sessions that genuinely need a faster clock (scheduled
+        // reminders) pass a smaller value; pure standby sessions pass a larger
+        // one. Converted to whole 240s ticks, floored at 1 so a tiny value
+        // can't round to 0 and wake the session every tick.
+        const DEFAULT_HEARTBEAT_SECS = 14_400
+        const rawSecs = url.searchParams.get('heartbeat_secs')
+        let heartbeatSecs = DEFAULT_HEARTBEAT_SECS
+        if (rawSecs !== null) {
+          const n = Number(rawSecs)
+          if (Number.isFinite(n) && n > 0) {
+            heartbeatSecs = Math.min(86_400, Math.max(HEARTBEAT_MS / 1000, n))
+          }
+        }
+        const HEARTBEAT_LINE_EVERY = Math.max(
+          1,
+          Math.round(heartbeatSecs / (HEARTBEAT_MS / 1000)),
+        )
         let silentTicks = 0
         while (!req.signal.aborted) {
           await waiters.wait(
@@ -1103,7 +1124,10 @@ export async function startServer(opts: {
             // Asia/Taipei (+08:00) — matches the rest of the API surface
             // (DB stores UTC, human-facing lines / API responses are
             // converted via toTaipeiISOString — see CLAUDE.md "Time").
-            ok = write(`heartbeat ${toTaipeiISOString(new Date().toISOString())}`)
+            // The weekday is inlined so subscribers read it instead of
+            // deriving it from the date themselves, which goes wrong across
+            // the UTC/Taipei day boundary.
+            ok = write(`heartbeat ${toTaipeiHeartbeatString(new Date().toISOString())}`)
             silentTicks = 0
           } else {
             ok = writeKeepalive()

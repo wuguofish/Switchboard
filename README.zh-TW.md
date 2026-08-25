@@ -209,7 +209,8 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
 - `GET /monitor?cc_session_id=<uuid>` — 為 Claude Code 的 `Monitor` tool 設計的長駐 chunked text stream，每行一個 event：
   - `hello <alias>` — 連上時的 baseline，inbox 空時才發
   - `inbox <N> <alias>` — 連上時有未讀、或有新的 `send` / `broadcast` 到
-  - `heartbeat <iso-ts>` — 每 ~2 hr 靜默時發一次的可見時間 tick（每 240s 還會發一個無訊息空白 byte 維持 Bun `idleTimeout` 不砍 stream）
+  - `heartbeat <iso-ts>` — 每 4 hr 靜默時發一次的可見時間 tick，例如 `heartbeat 2026-04-24(五)T13:38:25.000+08:00`；日期後面的 `(X)` 是台北時間的星期，訂閱端直接讀它就好，自己從日期推算會在 UTC／台北的換日邊界出錯（每 240s 還會發一個無訊息空白 byte 維持 Bun `idleTimeout` 不砍 stream）
+  - 在 `/monitor` 網址後面加 `&heartbeat_secs=N` 可以自訂間隔（下限 240、上限 86400）。對 LLM 訂閱端來說每次心跳喚醒都是冷啟動——prompt cache 早就過期，整包 context 等於用寫入價重寫一次——所以間隔就是成本旋鈕，拉長一倍、閒置消耗就少一半。
 
 Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 loop 即可。`/monitor` 則一直開著陪整個 session 生命週期，客戶端建議把 `curl -sN` 包在 reconnect loop 裡，daemon 重啟時能自我修復。
 

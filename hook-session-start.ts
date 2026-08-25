@@ -48,16 +48,29 @@ is the dedicated wake path — no Stop-hook shim required:
 Each line on the stream becomes a notification:
   hello <alias>             -> baseline on connect, no action needed
   inbox <N> <alias>         -> unread waiting; call mcp__switchboard__read_messages
-  heartbeat <Asia/Taipei>   -> ~2-hr time tick (e.g. "heartbeat
-                               2026-04-24T13:38:25.000+08:00"); just a
-                               clock signal, no action needed (don't
-                               reply with "Heartbeat OK")
+  heartbeat <Asia/Taipei>   -> ~4-hr time tick (e.g. "heartbeat
+                               2026-04-24(五)T13:38:25.000+08:00" — the
+                               (X) after the date is the Taipei weekday,
+                               read it instead of working it out from the
+                               date yourself); just a clock signal, no
+                               action needed (don't reply "Heartbeat OK")
 
 The 240s TCP keep-alive is a single space byte without a newline, so the
 Monitor tool stays silent between heartbeat lines.
 
 The \`while :; do ... sleep 5; done\` wrapper auto-reconnects if the daemon
-restarts. Skip subscribing only if you're staying anonymous.`
+restarts. Skip subscribing only if you're staying anonymous.
+
+The heartbeat interval defaults to 4 hours and is yours to set — append
+\`&heartbeat_secs=N\` to the URL (clamped to 240..86400):
+
+  ...?cc_session_id=\${cc_session_id}&heartbeat_secs=7200   # every 2 hours
+
+Why the default is that long: every heartbeat wake is a cold start, because
+the prompt cache has expired by then, so the whole context is rewritten at
+cache-write price. The interval is therefore a direct cost knob — doubling it
+halves the idle burn. Sessions on a fixed cadence (scheduled reminders) should
+shorten it; sessions that are purely on standby can lengthen it.`
 
   return {
     hookSpecificOutput: {
