@@ -5,3 +5,7 @@ node_modules/
 bun.lockb
 daemon.out.log
 daemon.err.log
+logs/
+*.log
+switchboard-service.exe
+switchboard-service.xml

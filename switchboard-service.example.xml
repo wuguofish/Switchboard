@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WinSW configuration for running the switchboard daemon as a Windows service.
+  Copy this to switchboard-service.xml and fill in the absolute paths below.
+
+  Why a service rather than a scheduled task: once Windows 11 sets the default
+  terminal application to Windows Terminal, every console program — including
+  the powershell.exe a scheduled task launches — is hosted by that terminal.
+  Closing the window sends CTRL_CLOSE to everything it hosts, so the daemon
+  dies with it and the log ends at a lone ^C. A service is not attached to any
+  console, so the window lifecycle cannot touch it.
+
+  <onfailure> is the Windows service recovery mechanism, which also removes the
+  need for a hand-written supervisor loop and its single point of failure: the
+  supervisor process itself getting killed.
+-->
+<service>
+  <id>switchboard-daemon</id>
+  <name>Switchboard MCP Daemon</name>
+  <description>Local MCP switchboard daemon for Claude Code session communication (loopback only, port 9876)</description>
+
+  <!-- Absolute paths are required: the service runs as LocalSystem, whose PATH
+       is not yours, so a bare "bun" will not resolve. -->
+  <executable>C:\Users\YOUR_USER\.bun\bin\bun.exe</executable>
+  <arguments>main.ts</arguments>
+  <workingdirectory>C:\path\to\switchboard</workingdirectory>
+
+  <startmode>Automatic</startmode>
+
+  <!-- Restart after a crash; forget the failure count once an hour passes clean -->
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>15 sec</stoptimeout>
+
+  <logpath>C:\path\to\switchboard\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <!--
+    Both paths must be spelled out. Under the service account os.homedir()
+    resolves to C:\Windows\System32\config\systemprofile, which would open an
+    empty database — every registration and every stored message would look
+    like it had vanished.
+  -->
+  <env name="SWITCHBOARD_DB" value="C:/Users/YOUR_USER/.claude/switchboard.db"/>
+  <env name="SWITCHBOARD_POLLER_STATE_DIR" value="C:/Users/YOUR_USER/.claude"/>
+</service>

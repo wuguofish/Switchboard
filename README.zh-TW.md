@@ -74,13 +74,49 @@ powershell -File start-daemon.ps1
 | `SWITCHBOARD_DB` | `<homedir>/.claude/switchboard.db` | SQLite 檔案路徑 |
 | `SWITCHBOARD_POLLER_STATE_DIR` | `<homedir>/.claude` | Poller state/lock 檔案目錄 |
 
-### 登入自動啟動（Windows Scheduled Task）
+### 掛成服務執行（建議）
+
+從終端機跑 daemon 等於把它的壽命綁在那個視窗上。Windows 11 上這件事是字面意義的：
+Windows Terminal 托管每一個主控台程式，視窗一關就把 `CTRL_CLOSE` 一起發給 daemon。
+服務沒有主控台，不受影響。
+
+**Windows** — 用 [WinSW](https://github.com/winsw/winsw/releases)，放在 repo 旁邊
+命名為 `switchboard-service.exe`：
+
+```powershell
+Copy-Item switchboard-service.example.xml switchboard-service.xml
+# 把裡面的絕對路徑填好，然後在提權的終端機執行：
+.\switchboard-service.exe install
+Start-Service switchboard-daemon
+```
+
+之後要重啟同樣需要提權：`Restart-Service switchboard-daemon`。
+
+**Linux** — systemd user service：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp switchboard.service.example ~/.config/systemd/user/switchboard.service
+systemctl --user daemon-reload
+systemctl --user enable --now switchboard
+loginctl enable-linger "$USER"   # 沒登入也要能撐過重開機就加這行
+```
+
+Log 走 journal（`journalctl --user -u switchboard -f`），重啟不需要提權：
+`systemctl --user restart switchboard`。
+
+兩份範本都把 `SWITCHBOARD_DB` 和 `SWITCHBOARD_POLLER_STATE_DIR` 寫死，而不是靠
+`os.homedir()`——服務帳號的家目錄不是你的家目錄，漏填的話 daemon 會無聲地開一個
+空資料庫。
+
+### 登入自動啟動（Windows Scheduled Task，舊做法）
 
 ```powershell
 powershell -File install-task.ps1
 ```
 
 會註冊一個 `Switchboard MCP Daemon` 排程，使用者登入時自動執行 `start-daemon.ps1`。
+已被上面的服務取代——原因見前一段的主控台關閉問題。
 
 ## 接 Claude Code
 
@@ -327,8 +363,10 @@ aliases.ts               # alias 碰撞處理 + 目標解析
 poller.ts                # 舊版 bun 實作的 Stop-hook poller（fallback）
 poller-shim.ps1          # PowerShell Stop-hook shim（預設）
 hook-session-start.ts    # SessionStart hook，注入 cc_session_id
-install-task.ps1         # 註冊 Windows 排程
+install-task.ps1         # 註冊 Windows 排程（舊做法）
 start-daemon.ps1         # 背景啟動 daemon
+switchboard-service.example.xml  # Windows 服務的 WinSW 設定範本
+switchboard.service.example      # Linux 的 systemd user service 範本
 tests/                   # bun:test 測試集
 ```
 
