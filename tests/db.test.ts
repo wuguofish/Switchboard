@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions, OwnershipConflictError } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions, deleteStaleSessionRows, OwnershipConflictError } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -728,4 +728,48 @@ test('releaseStaleActiveSessions uses last_seen_at when a lease has been renewed
 
   expect(releaseStaleActiveSessions(db, [], 24 * 60 * 60_000)).toEqual([])
   expect(findSessionByAlias(db, 'leased')?.id).toBe(id)
+})
+
+// --- deleteStaleSessionRows ---
+
+const THIRTY_DAYS_MS = 30 * 86400_000
+
+test('deleteStaleSessionRows removes released rows idle beyond the window', () => {
+  const gone = createSession(db, { alias: 'gone' })
+  releaseSession(db, gone)
+  backdateLastActivity(db, gone, THIRTY_DAYS_MS + 86400_000)
+
+  expect(deleteStaleSessionRows(db, 30)).toBe(1)
+  expect(findSessionById(db, gone)).toBeNull()
+})
+
+test('deleteStaleSessionRows keeps rows still referenced by a message', () => {
+  const sender = createSession(db, { alias: 'sender' })
+  const recipient = createSession(db, { alias: 'recipient' })
+  insertMessage(db, { sender_id: sender, recipient_id: recipient, broadcast_id: null, content: 'keeps them alive' })
+  for (const id of [sender, recipient]) {
+    releaseSession(db, id)
+    backdateLastActivity(db, id, THIRTY_DAYS_MS + 86400_000)
+  }
+
+  expect(deleteStaleSessionRows(db, 30)).toBe(0)
+  expect(findSessionById(db, sender)).not.toBeNull()
+  expect(findSessionById(db, recipient)).not.toBeNull()
+})
+
+test('deleteStaleSessionRows keeps active rows however old they are', () => {
+  const active = createSession(db, { alias: 'active' })
+  backdateLastActivity(db, active, THIRTY_DAYS_MS * 12)
+
+  expect(deleteStaleSessionRows(db, 30)).toBe(0)
+  expect(findSessionById(db, active)).not.toBeNull()
+})
+
+test('deleteStaleSessionRows keeps recently released rows', () => {
+  const recent = createSession(db, { alias: 'recent' })
+  releaseSession(db, recent)
+  backdateLastActivity(db, recent, 86400_000) // yesterday
+
+  expect(deleteStaleSessionRows(db, 30)).toBe(0)
+  expect(findSessionById(db, recent)).not.toBeNull()
 })
