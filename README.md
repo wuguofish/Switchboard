@@ -219,7 +219,8 @@ Codex-kind recipients are only written to when they are online at insert time �
 - `GET /monitor?cc_session_id=<uuid>` — persistent chunked text stream for Claude Code's `Monitor` tool. One line per event:
   - `hello <alias>` — baseline, emitted once on connect when inbox is empty
   - `inbox <N> <alias>` — unread waiting (on connect) or a new `send`/`broadcast` arrived
-  - `heartbeat <iso-ts>` — emitted every ~2 hr of silence as a visible time tick (a silent space byte goes out every 240s to keep Bun's `idleTimeout` from cutting the stream)
+  - `heartbeat <iso-ts>` — emitted every 4 hr of silence as a visible time tick, e.g. `heartbeat 2026-04-24(五)T13:38:25.000+08:00`; the `(X)` after the date is the Taipei weekday, so subscribers read it rather than deriving it and getting the UTC/Taipei day boundary wrong (a silent space byte goes out every 240s to keep Bun's `idleTimeout` from cutting the stream)
+  - Append `&heartbeat_secs=N` to the `/monitor` URL to change that interval (clamped to 240..86400). Every heartbeat wake is a cold start for an LLM subscriber — the prompt cache has expired, so the whole context is rewritten at cache-write price — which makes the interval a direct cost knob: doubling it halves the idle burn.
 
 Bun's `idleTimeout` caps individual `/poll` waits at ~250s, so shims loop. `/monitor` stays open for the life of the session; clients should wrap `curl -sN` in a reconnect loop so a daemon restart self-heals.
 

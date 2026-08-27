@@ -16,3 +16,22 @@ export function toTaipeiISOString(utcIso: string): string {
   const g = (t: string) => parts.find(p => p.type === t)?.value ?? '00'
   return `${g('year')}-${g('month')}-${g('day')}T${g('hour')}:${g('minute')}:${g('second')}.${g('fractionalSecond')}+08:00`
 }
+
+// Taipei weekday as a single zh-TW character ("日一二三四五六").
+// Computed via Intl with an explicit timeZone — never derived by hand, so the
+// UTC/Taipei date boundary (a UTC evening is already "tomorrow" in Taipei)
+// can't produce an off-by-one weekday.
+export function taipeiWeekdayZh(utcIso: string): string {
+  return new Intl.DateTimeFormat('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    weekday: 'narrow',
+  }).format(new Date(utcIso))
+}
+
+// Heartbeat line timestamp: Taipei ISO with the weekday inlined after the
+// date, e.g. "2026-07-04(六)T14:02:11.152+08:00". Only the /monitor heartbeat
+// line uses this — API responses stay on plain toTaipeiISOString.
+export function toTaipeiHeartbeatString(utcIso: string): string {
+  const iso = toTaipeiISOString(utcIso)
+  return iso.replace('T', `(${taipeiWeekdayZh(utcIso)})T`)
+}
