@@ -1,10 +1,10 @@
 /**
- * Switchboard peer plugin for OpenCode（小回的門鈴）
+ * Switchboard peer plugin for OpenCode（headless server 的門鈴）
  *
  * 職責（對應 Switchboard 雙邊 peer 設計的 client-side waker）:
  *   1. server 啟動時向 Switchboard 註冊（client_kind=codex、穩定 instance UUID、generation-aware）
- *   2. long-poll /poll 續租 lease;收到 unread 訊號就喚醒小回的常駐 session
- *   3. session.idle 時透過 /external/send 回報 main（阿宇）
+ *   2. long-poll /poll 續租 lease;收到 unread 訊號就喚醒常駐 session
+ *   3. session.idle 時透過 /external/send 回報 main
  *   4. server 內近期活躍的 session 各自註冊、收信與喚醒
  *   5. session 閒置逾時或行程結束時帶 generation 優雅 unregister
  *
@@ -16,7 +16,9 @@ import { homedir } from "node:os"
 import { join, dirname } from "node:path"
 
 const SWITCHBOARD_URL = (process.env.SWITCHBOARD_URL ?? "http://127.0.0.1:9876").replace(/\/$/, "")
-const ALIAS = process.env.SWITCHBOARD_PEER_ALIAS ?? "小回(codex)"
+const ALIAS = process.env.SWITCHBOARD_PEER_ALIAS ?? "opencode"
+const PEER_PREFIX = process.env.SWITCHBOARD_PEER_PREFIX ?? "opencode"
+const RESIDENT_SESSION_TITLE = `${ALIAS} switchboard 常駐站`
 const INSTANCE_ID_PATH = join(homedir(), ".config", "opencode", "switchboard-instance-id")
 const SESSION_ID_PATH = join(homedir(), ".config", "opencode", "switchboard-session-id")
 const POLL_TIMEOUT_S = 240
@@ -62,7 +64,7 @@ function sessionSlug(title: string | undefined): string {
 
 function sessionAlias(info: SessionInfo, fullId = false): string {
   const idPart = fullId ? info.id : info.id.slice(-8)
-  return `小回-${sessionSlug(info.title)}-${idPart}`
+  return `${PEER_PREFIX}-${sessionSlug(info.title)}-${idPart}`
 }
 
 function loadOrCreateInstanceId(): string {
@@ -130,7 +132,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
       // 存在性檢查改走 SDK 的 session.list（實證可用）。
       // 舊版用 client.baseUrl 拼 URL——該屬性拿不到值,檢查永遠失敗,
       // 每次總機喚醒都誤開新常駐站(2026-07-30 實測:一天生兩間,
-      // 且每通電話都是「失憶的新小回」)。list 失敗時傾向沿用舊 id
+      // 且每通電話都是「失憶的新 session」)。list 失敗時傾向沿用舊 id
       // ——重複開站比誤用舊站更糟。
       try {
         const sessions = responseData<SessionInfo[]>(await client.session.list())
@@ -141,7 +143,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
         return sessionId
       }
     }
-    const created = await client.session.create({ body: { title: "小回 switchboard 常駐站" } })
+    const created = await client.session.create({ body: { title: RESIDENT_SESSION_TITLE } })
     sessionId = created?.data?.id ?? created?.id
     if (!sessionId) throw new Error("session create failed")
     writeFileSync(SESSION_ID_PATH, sessionId)
@@ -291,7 +293,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
         messages.map((m: any) =>
           `— 來自 ${m.sender_alias ?? m.sender_id}（${m.created_at}${m.is_broadcast ? ",廣播" : ""}）:\n${m.content}`
         ).join("\n\n") +
-        `${claimHint}\n\n請依訊息內容處理;需要回覆時用你的 switchboard MCP send 工具(收件人通常是 main=阿宇)。`
+        `${claimHint}\n\n請依訊息內容處理;需要回覆時用你的 switchboard MCP send 工具,收件人填該則訊息「來自」的門牌。`
       : `Switchboard 未讀通知:你（${peer.alias}）有 ${count} 封未讀站內信,但讀信端點暫不可用——` +
         `請如實回報整合限制,不要猜測內容。${claimHint}`
     try {
@@ -383,7 +385,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
   }
 
   async function startPeer(info: SessionInfo, activityAt = Date.now()): Promise<void> {
-    if (!info.id || info.id === sessionId || info.title === "小回 switchboard 常駐站") return
+    if (!info.id || info.id === sessionId || info.title === RESIDENT_SESSION_TITLE) return
     const existing = peers.get(info.id)
     if (existing) {
       updatePeerInfo(existing, info)
@@ -472,7 +474,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
         messages.map((m: any) =>
           `— 來自 ${m.sender_alias ?? m.sender_id}（${m.created_at}${m.is_broadcast ? ",廣播" : ""}）:\n${m.content}`
         ).join("\n\n") +
-        `\n\n請依訊息內容處理;需要回覆時用你的 switchboard MCP send 工具(收件人通常是 main=阿宇)。`
+        `\n\n請依訊息內容處理;需要回覆時用你的 switchboard MCP send 工具,收件人填該則訊息「來自」的門牌。`
       : `Switchboard 未讀通知:你（${ALIAS}）有 ${count} 封未讀站內信,但讀信端點暫不可用——` +
         `請如實回報整合限制,不要猜測內容。`
     await (client.session.promptAsync?.({
@@ -581,9 +583,9 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
         }
       }
 
-      // 小回的常駐 session 閒置 = 本輪工作收尾 → 回報阿宇,並解除喚醒節流
+      // 常駐 session 閒置 = 本輪工作收尾 → 回報 main,並解除喚醒節流
       if (event.type === "session.idle" && event.properties?.sessionID === sessionId) {
-        // 只在「有一輪喚醒待收尾」時通知一次;重複的 idle 事件不再轟炸阿宇
+        // 只在「有一輪喚醒待收尾」時通知一次;重複的 idle 事件不再重複通知
         if (!wakePending) return
         wakePending = false
         await fetch(`${SWITCHBOARD_URL}/external/send`, {
@@ -592,7 +594,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
           body: JSON.stringify({
             to: "main",
             from: ALIAS,
-            message: "小回（OpenCode 身體）本輪工作已完成/閒置,如需結果請查看對應 session。",
+            message: `${ALIAS}（OpenCode 常駐 session）本輪工作已完成/閒置,如需結果請查看對應 session。`,
           }),
         }).catch(() => {})
       }
@@ -607,7 +609,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
           body: JSON.stringify({
             to: "main",
             from: peer.alias,
-            message: `小回分機（OpenCode session ${peer.sessionId}）本輪工作已完成/閒置,如需結果請查看對應 session。`,
+            message: `OpenCode 分機 ${peer.alias}（session ${peer.sessionId}）本輪工作已完成/閒置,如需結果請查看對應 session。`,
           }),
         }).catch(() => {})
       }

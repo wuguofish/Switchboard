@@ -1,6 +1,8 @@
 import { Database } from 'bun:sqlite'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
-const db = new Database('C:/Users/ATone/.claude/switchboard.db', { readonly: true })
+const db = new Database(join(homedir(), '.claude', 'switchboard.db'), { readonly: true })
 const ids = [
   '76506fab-ebdb-4d5c-adbf-7e0be5eb1dc4',
   '88a3cf5a-8add-42de-9f0a-89c01fb3f4d3',
