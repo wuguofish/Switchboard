@@ -8,6 +8,7 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 
 const SWITCHBOARD_URL = (process.env.SWITCHBOARD_URL ?? "http://127.0.0.1:9876").replace(/\/$/, "")
+const PEER_PREFIX = process.env.SWITCHBOARD_PEER_PREFIX ?? "opencode"
 const ROUTE_CHECK_MS = 750
 const STANDBY_RETRY_MS = 5_000
 const REQUEST_TIMEOUT_MS = 15_000
@@ -60,7 +61,7 @@ function sessionSlug(title: string | undefined): string {
 }
 
 function sessionAlias(id: string, title: string | undefined, fullId = false): string {
-  return `小回-${sessionSlug(title)}-${fullId ? id : id.slice(-8)}`
+  return `${PEER_PREFIX}-${sessionSlug(title)}-${fullId ? id : id.slice(-8)}`
 }
 
 async function responseJson(response: Response): Promise<any> {
@@ -246,7 +247,7 @@ const tui: TuiPlugin = async (api) => {
           `— 來自 ${message.sender_alias ?? message.sender_id}` +
           `（${message.created_at}${message.is_broadcast ? ",廣播" : ""}）:\n${message.content}`
         ).join("\n\n") +
-        `${claimHint}\n\n請依訊息內容處理;需要回覆時用你的 switchboard MCP send 工具(收件人通常是 main=阿宇)。`
+        `${claimHint}\n\n請依訊息內容處理;需要回覆時用你的 switchboard MCP send 工具,收件人填該則訊息「來自」的門牌。`
 
       try {
         const prompted = await api.client.session.promptAsync({
