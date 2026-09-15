@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
+import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
@@ -183,7 +183,7 @@ export async function startServer(opts: {
       updateLastActivity(db, existing.id)
       return existing.id
     }
-    return createSession(db, { alias, cc_session_id: null })
+    return createClientSession(db, { alias, client_kind: 'external', client_session_id: null })
   }
 
   async function parseJsonBody(req: Request): Promise<Record<string, unknown>> {
