@@ -1,4 +1,5 @@
 import { crossSessionInboundSetting } from './inbox-socket'
+import { sessionNameFor } from './session-names'
 
 export interface HookSpecificOutput {
   hookEventName: 'SessionStart'
@@ -23,6 +24,7 @@ export function buildHookOutput(
   input: string,
   delivery: Delivery = resolveDelivery(process.env.SWITCHBOARD_DELIVERY),
   inbound: string | null = crossSessionInboundSetting(),
+  sessionName?: string | null,
 ): HookOutput | null {
   let payload: { session_id?: string }
   try {
@@ -32,6 +34,7 @@ export function buildHookOutput(
   }
   const cc_session_id = payload.session_id
   if (!cc_session_id) return null
+  const name = sessionName === undefined ? sessionNameFor(cc_session_id) : sessionName
 
   const wakePath = delivery === 'channel'
     ? channelWakePath(cc_session_id)
@@ -58,14 +61,15 @@ Switchboard is for what the native path does not cover:
 
 If any of those apply, register in your first turn:
 
-  mcp__switchboard__register(role='<your-role-name>', cc_session_id='${cc_session_id}')
+  mcp__switchboard__register(cc_session_id='${cc_session_id}')
 
-Pick a unique role name (e.g. main, scratch-refactor, video-editor).
-If the role is already taken by another active session, pick a different one
-or wait until that session disconnects.
+Your Switchboard alias is your Claude Code session name: the one ListAgents
+shows and the user sets with /rename. The daemon mirrors it and keeps
+following renames, so there is nothing to pass and nothing to keep in sync.
+${aliasStatus(name)}
 
 If none apply, skip this — the session works anonymously on Switchboard,
-and you can register later with set_alias() if the need appears.
+and you can register later if the need appears.
 
 ${wakePath}`
 
@@ -75,6 +79,17 @@ ${wakePath}`
       additionalContext: context,
     },
   }
+}
+
+function aliasStatus(name: string | null): string {
+  if (name) {
+    return `This session is named "${name}", so that is the alias you get.`
+  }
+  return `This session has no name yet. New sessions, foreground or background,
+start without one and show up as the first eight characters of their id.
+Pass role='<placeholder>' to register so peers can reach you now; the alias
+switches to the real name by itself once the user runs /rename. set_alias
+works only while the session is unnamed.`
 }
 
 function socketWakePath(inbound: string | null): string {
