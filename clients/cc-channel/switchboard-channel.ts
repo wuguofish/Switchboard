@@ -61,7 +61,8 @@ async function daemonClient(): Promise<Client> {
 // Claude Code side: stdio server that is both a tool proxy and a channel.
 // ---------------------------------------------------------------------------
 const instructions = `Switchboard events arrive as <channel source="switchboard" kind="..."> tags.
-  kind="inbox"      unread messages are waiting: call read_messages now.
+  kind="inbox"      the messages themselves, already marked read: act on
+                    them; read_messages is not needed.
   kind="hello"      subscribed to the inbox stream; no action needed.
   kind="heartbeat"  a clock tick with the Taipei time in the "at" attribute;
                     no action needed and do not reply.

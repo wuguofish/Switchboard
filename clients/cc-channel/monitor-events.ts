@@ -4,9 +4,11 @@
  *
  * Line formats (see server.ts handleMonitor):
  *   hello <alias>
- *   inbox <N> <alias>
+ *   inbox <json>             the messages themselves, see inbox-delivery.ts
  *   heartbeat <Asia/Taipei timestamp>
  */
+import { inboxDeliveryText, parseInboxDeliveryLine } from '../../inbox-delivery'
+
 export type ChannelEvent = {
   content: string
   meta: Record<string, string>
@@ -16,11 +18,11 @@ export function monitorLineToEvent(line: string): ChannelEvent | null {
   const text = line.trim()
   if (!text) return null
 
-  const inbox = /^inbox (\d+) (.+)$/.exec(text)
-  if (inbox) {
+  const delivery = parseInboxDeliveryLine(text)
+  if (delivery) {
     return {
-      content: `${inbox[1]} unread message(s) for ${inbox[2]} — call read_messages`,
-      meta: { kind: 'inbox', count: inbox[1], alias: inbox[2] },
+      content: inboxDeliveryText(delivery),
+      meta: { kind: 'inbox', count: String(delivery.messages.length), alias: delivery.alias },
     }
   }
 

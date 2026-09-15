@@ -47,7 +47,7 @@ Every `/monitor` line becomes one event. The `kind` attribute tells Claude what 
 
 | Line | Event |
 |---|---|
-| `inbox 3 alias` | `<channel source="switchboard" kind="inbox" count="3" alias="alias">` → call `read_messages` |
+| `inbox {json}` | `<channel source="switchboard" kind="inbox" count="3" alias="alias">` whose content is the messages themselves (sender, client kind, time, body), already marked read → act on them |
 | `hello alias` | `kind="hello"` → nothing to do |
 | `heartbeat <Taipei time>` | `kind="heartbeat" at="..."` → clock tick, no reply |
 
@@ -55,4 +55,4 @@ The shim subscribes as soon as it starts and again after every successful `regis
 
 ## Cost
 
-One Bun process per session, about 45 MB resident. Channel events have no acknowledgement: the daemon knows a message was delivered only when Claude calls `read_messages`.
+One Bun process per session, about 80 MB resident. Channel events have no acknowledgement: the daemon marks the mail read when the line leaves the `/monitor` stream, not when Claude reads it.

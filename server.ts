@@ -24,7 +24,8 @@ import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
-import { inboxWakeText, wakeInboxSocket } from './inbox-socket'
+import { crossSessionInboundSetting, inboxWakeText, wakeInboxSocket } from './inbox-socket'
+import { inboxDeliveryLine, inboxDeliveryText, type InboxDelivery } from './inbox-delivery'
 import type { BroadcastScope, ClientKind, SessionRow } from './types'
 import { isSessionOnline } from './online'
 
@@ -161,8 +162,17 @@ export async function startServer(opts: {
   port: number
   dbPath: string
   ownerLeaseTtlMs?: number
+  /**
+   * Whether a socket wake carries the messages themselves (and marks them
+   * read) or only a count. Content is safe only when the receiving Claude
+   * Code accepts cross-session input outright; a held wake expires unread,
+   * and mail marked read on the way out would be lost with it.
+   */
+  deliverContentOverSocket?: boolean
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
+  const deliverContentOverSocket =
+    opts.deliverContentOverSocket ?? (crossSessionInboundSetting() === 'accept')
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
   const waiters = new UnreadWaiterRegistry()
@@ -204,17 +214,53 @@ export async function startServer(opts: {
   }
 
   /**
+   * Unread mail in the shape a wake carries. Rows stay unread until
+   * commitDelivery, so a wake that never reaches the session leaves the
+   * mail for read_messages.
+   */
+  function pendingDelivery(recipient: SessionRow): InboxDelivery | null {
+    if (!recipient.alias) return null
+    const unread = fetchUnreadForRecipient(db, recipient.id)
+    if (unread.length === 0) return null
+    return {
+      alias: recipient.alias,
+      messages: unread.map((message) => {
+        const sender = findSessionById(db, message.sender_id)
+        return {
+          id: message.id,
+          sender_alias: sender?.alias ?? null,
+          sender_kind: sender?.client_kind ?? 'unknown',
+          created_at: toTaipeiISOString(message.created_at),
+          content: message.content,
+          is_broadcast: message.broadcast_id !== null,
+        }
+      }),
+    }
+  }
+
+  function commitDelivery(delivery: InboxDelivery): void {
+    markMessagesRead(db, delivery.messages.map((message) => message.id))
+  }
+
+  /**
    * Socket wake for Claude Code sessions that keep no /monitor or /poll
    * connection open (background sessions in particular): nothing else would
-   * wake them, so poke the session's inbox socket. A session with a live
-   * stream gets the event on that stream instead and is skipped here.
+   * wake them, so post to the session's inbox socket. The post carries the
+   * messages themselves when the receiving side accepts cross-session input;
+   * otherwise only a count, and the mail stays unread for read_messages.
+   * A session with a live stream gets the mail on that stream instead and is
+   * skipped here.
    */
   async function wakeIfUnwatched(recipient: SessionRow | null): Promise<boolean> {
     if (!recipient || recipient.client_kind !== 'claude_code') return false
     if (!recipient.client_session_id || !recipient.alias) return false
     if (waiters.isPolling('claude_code', recipient.client_session_id)) return false
-    const count = countUnreadBySessionId(db, recipient.id)
-    const result = await wakeInboxSocket(recipient.client_session_id, inboxWakeText(count, recipient.alias))
+    const delivery = deliverContentOverSocket ? pendingDelivery(recipient) : null
+    const text = delivery
+      ? inboxDeliveryText(delivery)
+      : inboxWakeText(countUnreadBySessionId(db, recipient.id), recipient.alias)
+    const result = await wakeInboxSocket(recipient.client_session_id, text)
+    if (result.delivered && delivery) commitDelivery(delivery)
     if (!result.delivered) {
       process.stderr.write(`switchboard: socket wake skipped for ${recipient.alias}: ${result.reason}\n`)
     }
@@ -557,7 +603,9 @@ export async function startServer(opts: {
         },
         {
           name: 'read_messages',
-          description: 'Fetch and mark-as-read all unread messages for this session.',
+          description:
+            'Fetch and mark-as-read the messages that no wake has delivered yet. ' +
+            'Mail a wake carried into this session is already marked read and is not returned here.',
           inputSchema: { type: 'object' as const, properties: {} },
         },
         {
@@ -1036,8 +1084,10 @@ export async function startServer(opts: {
    * runs `curl -sN http://127.0.0.1:.../monitor?cc_session_id=...` as a
    * background monitor; each stdout line fires an assistant wake. Line grammar:
    *   hello <alias>            -> fired once on connect when inbox is empty
-   *   inbox <n> <alias>        -> fired once on connect if already unread, and
-   *                               every time a new message arrives for this cc
+   *   inbox <json>             -> the unread messages themselves (InboxDelivery),
+   *                               once on connect if any are waiting and every
+   *                               time new mail arrives; the rows are marked
+   *                               read as the line goes out
    *
    * Idle keep-alive: every 240s we write a single space byte (no newline)
    * so the TCP connection stays warm against Bun's 255s idleTimeout, but
@@ -1093,12 +1143,11 @@ export async function startServer(opts: {
         // Opening the stream counts as activity; retention should not sweep us.
         updateLastActivity(db, sessionId)
 
-        // Catch up immediately: if inbox already has unread rows, emit one
-        // "inbox N" line so the subscriber wakes right away without going
-        // through a separate /poll call.
-        const initial = countUnreadBySessionId(db, sessionId)
-        if (initial > 0) {
-          write(`inbox ${initial} ${alias}`)
+        // Catch up immediately: mail that arrived before the stream opened
+        // goes out as the first line.
+        const initial = pendingDelivery(session)
+        if (initial) {
+          if (write(inboxDeliveryLine(initial))) commitDelivery(initial)
         } else {
           write(`hello ${alias}`)
         }
@@ -1142,10 +1191,11 @@ export async function startServer(opts: {
             req.signal,
           )
           if (req.signal.aborted) break
-          const count = countUnreadBySessionId(db, sessionId)
+          const delivery = pendingDelivery(session)
           let ok: boolean
-          if (count > 0) {
-            ok = write(`inbox ${count} ${alias}`)
+          if (delivery) {
+            ok = write(inboxDeliveryLine(delivery))
+            if (ok) commitDelivery(delivery)
             silentTicks = 0
           } else if (++silentTicks >= HEARTBEAT_LINE_EVERY) {
             // Asia/Taipei (+08:00) — matches the rest of the API surface

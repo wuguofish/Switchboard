@@ -16,10 +16,11 @@ On top of that it provides:
 
 - **Directed messages** (`send`) and **fan-out** (`broadcast`) between named sessions
 - **Recall** for messages you wish you hadn't sent
-- **Auto-wake, two paths**:
-  - A Stop-hook shim long-polls `/poll`, so when a message arrives the next Claude Code turn starts with an `INBOX` reminder.
+- **Auto-wake, and the wake carries the mail**: every path below hands the session the messages themselves, already marked read, so it acts on them without a `read_messages` round trip.
+  - The daemon posts to the session's Claude Code inbox socket (default; works in background sessions).
   - A [channel shim](clients/cc-channel/README.md) (opt-in, foreground sessions only) pushes each `/monitor` line into the session as a `<channel>` event, so a message wakes the session with no watch to re-arm.
   - *Or* Claude Code's `Monitor` tool `curl -N`s `/monitor` as a chunked stream; each inbox line fires an assistant turn, but since Claude Code 2.1.271 the watch expires every 30 minutes and must be re-armed.
+  - A Stop-hook shim long-polls `/poll`, so when a message arrives the next Claude Code turn starts with an `INBOX` reminder (count only; the session then calls `read_messages`).
 - **Persistence** — messages live in SQLite and survive daemon restarts
 
 Everything is bound to `127.0.0.1` with no authentication, which makes it safe for intra-machine coordination but never appropriate to expose to a network.
@@ -132,7 +133,7 @@ Pick one delivery path for the session. It decides how the MCP server is wired a
 
 |                         | `socket` (default)                                                    | `channel` (opt-in, foreground sessions only)                           | `monitor` (legacy)       |
 |-------------------------|-----------------------------------------------------------------------|------------------------------------------------------------------------|--------------------------|
-| How a message wakes the session | The daemon posts one line to the session's Claude Code inbox socket, which starts a turn | The `switchboard` stdio server pushes a `<channel>` event into the conversation | Claude arms the `Monitor` tool on `/monitor`, re-arms every 30 minutes |
+| How a message wakes the session | The daemon posts the messages to the session's Claude Code inbox socket, which starts a turn carrying them | The `switchboard` stdio server pushes the messages into the conversation as a `<channel>` event | Claude arms the `Monitor` tool on `/monitor`, re-arms every 30 minutes; each `inbox` line carries the messages |
 | Launch                  | plain `claude`                                                        | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | `SWITCHBOARD_DELIVERY=monitor claude` |
 | Works in background sessions (agent view, `claude --bg`) | Yes                                              | **No**: the channel flag is not among the flags a background session carries, and the flag's confirmation prompt has no terminal to answer it | Yes |
 | Required setting        | `crossSessionInbound: "accept"` in `~/.claude/settings.json`          | none                                                                   | none                     |
@@ -141,7 +142,7 @@ Pick one delivery path for the session. It decides how the MCP server is wired a
 
 `SWITCHBOARD_DELIVERY` in the environment Claude Code starts from selects the path (`socket` when unset). The hook reads it and describes only the chosen path.
 
-How the socket path works: Claude Code 2.1.224+ binds one Unix domain socket per session and records it, with the session id, under `~/.claude/sessions/`. When a message arrives for a Claude Code session that has no `/monitor` or `/poll` connection open, the daemon looks the session up there and writes a `{"type":"user", ...}` line saying how many messages are unread; Claude Code turns that into a new turn. Sessions with a live stream are skipped, so nothing is delivered twice. The frame format is not published: it comes from the recipe Claude Code logs in `--debug` mode and is verified against `peerProtocol` 1 (Claude Code 2.1.272); the daemon refuses to post to any other protocol version and logs why.
+How the socket path works: Claude Code 2.1.224+ binds one Unix domain socket per session and records it, with the session id, under `~/.claude/sessions/`. When a message arrives for a Claude Code session that has no `/monitor` or `/poll` connection open, the daemon looks the session up there and writes a `{"type":"user", ...}` line carrying the unread messages (sender, client kind, time, body); Claude Code turns that into a new turn and the daemon marks the rows read once the socket accepted the write. Sessions with a live stream are skipped, so nothing is delivered twice. Without `crossSessionInbound: "accept"` the wake carries only a count and the mail stays unread, because a held wake expires and would take the mail with it. The frame format is not published: it comes from the recipe Claude Code logs in `--debug` mode and is verified against `peerProtocol` 1 (Claude Code 2.1.272); the daemon refuses to post to any other protocol version and logs why.
 
 Verified 2026-09-15: a `claude --bg` session launched with the channel flag loads the shim as a plain MCP server (tools work, `register` works) but never receives a `<channel>` event, and the flag is dropped from the job's respawn flags. The same session, with nothing but `register`, wakes from the socket path.
 
@@ -226,7 +227,7 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `set_alias` | `alias` | `{old_alias, new_alias}` |
 | `send` | `to`, `message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`, `scope?` | `{broadcast_id, recipient_count, notified_count}` |
-| `read_messages` | — | `{messages: [...]}` |
+| `read_messages` | — | `{messages: [...]}` — only mail no wake has carried; mail delivered by a wake is already read |
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}` — `status` is `released`, `stale_ignored` (a newer generation re-registered this identity; nothing was released), or `already_offline` |
@@ -293,7 +294,7 @@ Codex-kind recipients are only written to when they are online at insert time �
   - `{status: "no-session"}` — alias is gone; shim exits 0
 - `GET /monitor?cc_session_id=<uuid>` — persistent chunked text stream for Claude Code's `Monitor` tool. One line per event:
   - `hello <alias>` — baseline, emitted once on connect when inbox is empty
-  - `inbox <N> <alias>` — unread waiting (on connect) or a new `send`/`broadcast` arrived
+  - `inbox <json>` — the unread messages themselves, `{alias, messages: [{id, sender_alias, sender_kind, created_at, content, is_broadcast}]}`, on connect if any are waiting and whenever a `send`/`broadcast` arrives; the rows are marked read as the line goes out
   - `heartbeat <iso-ts>` — emitted every 4 hr of silence as a visible time tick, e.g. `heartbeat 2026-04-24(五)T13:38:25.000+08:00`; the `(X)` after the date is the Taipei weekday, so subscribers read it rather than deriving it and getting the UTC/Taipei day boundary wrong (a silent space byte goes out every 240s to keep Bun's `idleTimeout` from cutting the stream)
   - Append `&heartbeat_secs=N` to the `/monitor` URL to change that interval (clamped to 240..86400). Every heartbeat wake is a cold start for an LLM subscriber — the prompt cache has expired, so the whole context is rewritten at cache-write price — which makes the interval a direct cost knob: doubling it halves the idle burn.
 
