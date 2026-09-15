@@ -146,7 +146,7 @@ Each line on the stream becomes a notification:
                                them (mcp__switchboard__read_messages only
                                returns mail no wake carried)
   heartbeat <Asia/Taipei>   -> ~4-hr time tick (e.g. "heartbeat
-                               2026-04-24(五)T13:38:25.000+08:00" — the
+                               2026-04-24(五)T13:38:25+08:00" — the
                                (X) after the date is the Taipei weekday,
                                read it instead of working it out from the
                                date yourself); just a clock signal, no

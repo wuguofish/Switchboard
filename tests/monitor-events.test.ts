@@ -7,16 +7,14 @@ describe('monitorLineToEvent', () => {
     const line = inboxDeliveryLine({
       alias: 'pocenter-yu',
       messages: [
-        { id: 'm1', sender_alias: 'rctx-yu', sender_kind: 'claude_code', created_at: '2026-09-15T16:00:00.000+08:00', content: 'first\nline two', is_broadcast: false },
-        { id: 'm2', sender_alias: '小回(codex)', sender_kind: 'codex', created_at: '2026-09-15T16:01:00.000+08:00', content: 'second', is_broadcast: true },
+        { id: 'm1', sender_alias: 'rctx-yu', sender_kind: 'claude_code', created_at: '2026-09-15T16:00:00+08:00', content: 'first\nline two', is_broadcast: false },
+        { id: 'm2', sender_alias: '小回(codex)', sender_kind: 'codex', created_at: '2026-09-15T16:01:00+08:00', content: 'second', is_broadcast: true },
       ],
     })
     const event = monitorLineToEvent(line)
     expect(event?.meta).toEqual({ kind: 'inbox', count: '2', alias: 'pocenter-yu' })
-    expect(event?.content).toContain('2 message(s) for pocenter-yu')
-    expect(event?.content).toContain('from rctx-yu (claude_code)')
-    expect(event?.content).toContain('first\nline two')
-    expect(event?.content).toContain('from 小回(codex) (codex) 2026-09-15T16:01:00.000+08:00 [broadcast]')
+    expect(event?.content).toContain('<switchboard from="rctx-yu" kind="claude_code" at="2026-09-15T16:00:00+08:00">\nfirst\nline two\n</switchboard>')
+    expect(event?.content).toContain('<switchboard from="小回(codex)" kind="codex" at="2026-09-15T16:01:00+08:00" broadcast="true">')
     expect(event?.content).not.toContain('read_messages')
   })
 
@@ -30,8 +28,8 @@ describe('monitorLineToEvent', () => {
   })
 
   test('heartbeat keeps the Taipei timestamp verbatim', () => {
-    const event = monitorLineToEvent('heartbeat 2026-04-24(五)T13:38:25.000+08:00')
-    expect(event?.meta).toEqual({ kind: 'heartbeat', at: '2026-04-24(五)T13:38:25.000+08:00' })
+    const event = monitorLineToEvent('heartbeat 2026-04-24(五)T13:38:25+08:00')
+    expect(event?.meta).toEqual({ kind: 'heartbeat', at: '2026-04-24(五)T13:38:25+08:00' })
   })
 
   test('keep-alive whitespace produces no event', () => {

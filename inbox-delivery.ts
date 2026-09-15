@@ -40,18 +40,25 @@ export function parseInboxDeliveryLine(line: string): InboxDelivery | null {
 }
 
 /**
- * The text the recipient reads. The sender line names the client kind because
- * Claude Code wraps every socket wake as "another Claude session" even when
- * the sender is Codex, OpenCode or an external HTTP caller.
+ * The text the recipient reads: one tag per message, shaped like Claude
+ * Code's own cross-session-message tag. `kind` is there because Claude Code
+ * wraps every socket wake as "another Claude session" even when the sender
+ * is Codex, OpenCode or an external HTTP caller; `at` carries the Taipei
+ * date with weekday because a socket-woken session gets no heartbeat.
+ * How to reply is the hook's job, not every message's.
  */
 export function inboxDeliveryText(delivery: InboxDelivery): string {
-  const count = delivery.messages.length
-  const header = `Switchboard: ${count} message(s) for ${delivery.alias}, delivered here and marked read.`
-  const bodies = delivery.messages.map((message) => {
-    const sender = message.sender_alias ?? 'unknown sender'
-    const tag = message.is_broadcast ? ' [broadcast]' : ''
-    return `--- from ${sender} (${message.sender_kind}) ${message.created_at}${tag} ---\n${message.content}`
-  })
-  const footer = 'Reply with mcp__switchboard__send (to: the sender alias).'
-  return [header, ...bodies, footer].join('\n\n')
+  return delivery.messages.map((message) => {
+    const attrs = [
+      `from="${attr(message.sender_alias ?? 'unknown')}"`,
+      `kind="${attr(message.sender_kind)}"`,
+      `at="${attr(message.created_at)}"`,
+    ]
+    if (message.is_broadcast) attrs.push('broadcast="true"')
+    return `<switchboard ${attrs.join(' ')}>\n${message.content}\n</switchboard>`
+  }).join('\n\n')
+}
+
+function attr(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;')
 }

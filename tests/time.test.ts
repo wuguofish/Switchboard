@@ -31,10 +31,10 @@ test('taipeiWeekdayZh uses the Taipei date, not the UTC date', () => {
 
 test('toTaipeiHeartbeatString inlines weekday after the date', () => {
   const utc = '2026-07-04T06:02:11.152Z'  // Taipei 14:02 Saturday
-  expect(toTaipeiHeartbeatString(utc)).toBe('2026-07-04(六)T14:02:11.152+08:00')
+  expect(toTaipeiHeartbeatString(utc)).toBe('2026-07-04(六)T14:02:11+08:00')
 })
 
 test('toTaipeiHeartbeatString weekday follows Taipei across midnight rollover', () => {
   const utc = '2026-07-03T17:00:00.000Z'  // Taipei = Sat 2026-07-04 01:00
-  expect(toTaipeiHeartbeatString(utc)).toBe('2026-07-04(六)T01:00:00.000+08:00')
+  expect(toTaipeiHeartbeatString(utc)).toBe('2026-07-04(六)T01:00:00+08:00')
 })

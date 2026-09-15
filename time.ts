@@ -28,10 +28,10 @@ export function taipeiWeekdayZh(utcIso: string): string {
   }).format(new Date(utcIso))
 }
 
-// Heartbeat line timestamp: Taipei ISO with the weekday inlined after the
-// date, e.g. "2026-07-04(六)T14:02:11.152+08:00". Only the /monitor heartbeat
-// line uses this — API responses stay on plain toTaipeiISOString.
+// Timestamp for text an LLM reads (heartbeat lines, delivered mail): Taipei
+// ISO with the weekday inlined after the date and no milliseconds, e.g.
+// "2026-07-04(六)T14:02:11+08:00". API responses stay on toTaipeiISOString.
 export function toTaipeiHeartbeatString(utcIso: string): string {
-  const iso = toTaipeiISOString(utcIso)
+  const iso = toTaipeiISOString(utcIso).replace(/\.\d{3}\+08:00$/, '+08:00')
   return iso.replace('T', `(${taipeiWeekdayZh(utcIso)})T`)
 }
