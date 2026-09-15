@@ -6,7 +6,13 @@ A local-only MCP server that lets multiple Claude Code sessions — running on t
 
 ## Why
 
-Claude Code runs each workspace / terminal as its own process, with no built-in way for two sessions to talk. Switchboard fills that gap:
+Claude Code 2.1.224+ ships native cross-session messaging (`ListAgents` / `SendMessage`) between Claude Code sessions on the same machine, so that case no longer needs Switchboard. Switchboard covers what the native path does not:
+
+- **Peers that are not Claude Code** — Codex, OpenCode, or anything that can `POST /register`
+- **Broadcast** to every registered session at once
+- **Being reachable by those peers** — a Claude Code session on someone else's delivery list needs an alias here even if it never sends anything itself
+
+On top of that it provides:
 
 - **Directed messages** (`send`) and **fan-out** (`broadcast`) between named sessions
 - **Recall** for messages you wish you hadn't sent
@@ -152,7 +158,7 @@ console-close caveat.
 
 ### Getting Claude to register
 
-The `SessionStart` hook injects context telling Claude *how* to register, but Claude still needs a nudge to actually do it (and to decide on a role name). Two options:
+The `SessionStart` hook first tells Claude when Switchboard is the right tool: Claude Code ↔ Claude Code on the same machine goes through native `SendMessage`; cross-vendor peers, broadcasts, and being reachable by either are what registration is for. It then explains *how* to register, but Claude still needs a nudge to actually do it (and to decide on a role name). Two options:
 
 **Ad hoc** — just say it in your first message:
 
@@ -172,8 +178,9 @@ cc_session_id from the SessionStart additionalContext:
 
 Pick a role name that describes what this session is doing (e.g. `tools`,
 `docs`, `bug-triage`). If the role is taken, try a variant. Skipping
-registration leaves the session anonymous and unreachable from other
-sessions — fine if you don't want messages.
+registration leaves the session anonymous on Switchboard — fine when the
+only peers you talk to are Claude Code sessions on this machine, which
+native SendMessage already reaches.
 ```
 
 Without `register`, the session stays anonymous; `send` and `broadcast` cannot reach it, and the Stop-hook shim exits immediately on every turn (nothing to poll for).
