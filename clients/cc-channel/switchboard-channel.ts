@@ -79,18 +79,30 @@ const mcp = new Server(
   },
 )
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => {
-  const client = await daemonClient()
-  return client.listTools()
-})
+/**
+ * Run one daemon call; on a transport failure (daemon restarted, MCP session
+ * gone) drop the client and retry once on a fresh connection.
+ */
+async function withDaemon<T>(call: (client: Client) => Promise<T>): Promise<T> {
+  try {
+    return await call(await daemonClient())
+  } catch (error) {
+    log(`daemon call failed (${error instanceof Error ? error.message : String(error)}); reconnecting`)
+    try { await daemon?.close() } catch {}
+    daemon = null
+    daemonTransport = null
+    return call(await daemonClient())
+  }
+}
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => withDaemon((client) => client.listTools()))
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const client = await daemonClient()
   const args = { ...(request.params.arguments ?? {}) } as Record<string, unknown>
   if (request.params.name === 'register' && !args.cc_session_id && CC_SESSION_ID) {
     args.cc_session_id = CC_SESSION_ID
   }
-  const result = await client.callTool({ name: request.params.name, arguments: args })
+  const result = await withDaemon((client) => client.callTool({ name: request.params.name, arguments: args }))
   if ((request.params.name === 'register' || request.params.name === 'set_alias') && !result.isError) {
     subscribeSoon()
   }

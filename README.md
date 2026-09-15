@@ -130,18 +130,22 @@ console-close caveat.
 
 Pick one delivery path for the session. It decides how the MCP server is wired and what the hook teaches Claude:
 
-|                         | `monitor` (default)                                                   | `channel` (opt-in, foreground sessions only)                          | `socket` (planned, #20; the path with the fewest constraints) |
-|-------------------------|------------------------------------------------------------------------|-----------------------------------------------------------------------|--------------------------|
-| How a message wakes the session | Claude arms the `Monitor` tool on `/monitor`, re-arms every 30 minutes | The `switchboard` stdio server pushes a `<channel>` event into the conversation | Daemon writes to the session's inbox socket |
-| Launch                  | plain `claude`                                                        | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | plain `claude`           |
+|                         | `socket` (default)                                                    | `channel` (opt-in, foreground sessions only)                           | `monitor` (legacy)       |
+|-------------------------|-----------------------------------------------------------------------|------------------------------------------------------------------------|--------------------------|
+| How a message wakes the session | The daemon posts one line to the session's Claude Code inbox socket, which starts a turn | The `switchboard` stdio server pushes a `<channel>` event into the conversation | Claude arms the `Monitor` tool on `/monitor`, re-arms every 30 minutes |
+| Launch                  | plain `claude`                                                        | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | `SWITCHBOARD_DELIVERY=monitor claude` |
 | Works in background sessions (agent view, `claude --bg`) | Yes                                              | **No**: the channel flag is not among the flags a background session carries, and the flag's confirmation prompt has no terminal to answer it | Yes |
-| Required setting        | none                                                                  | none                                                                   | `crossSessionInbound: accept` |
-| Per-session cost        | bash + curl, ~17 MB, plus a cold start every 30 minutes               | one Bun process, ~80 MB                                                | none                     |
-| When it is misconfigured | Loud: expiry notice every 30 minutes until Claude re-arms            | Loud: no channel line under the startup banner, nothing arrives        | Silent: messages held for approval, dropped after 5 minutes |
+| Required setting        | `crossSessionInbound: "accept"` in `~/.claude/settings.json`          | none                                                                   | none                     |
+| Per-session cost        | none                                                                  | one Bun process, ~80 MB                                                | bash + curl, ~17 MB, plus a cold start every 30 minutes |
+| When it is misconfigured | Without `accept`, Claude Code holds each wake for approval and drops it after 5 minutes. The daemon warns at startup and the hook warns in every new session, so the silence is announced | Loud: no channel line under the startup banner, nothing arrives | Loud: expiry notice every 30 minutes until Claude re-arms |
 
-`SWITCHBOARD_DELIVERY` in the environment Claude Code starts from selects the path (`monitor` when unset). The hook reads it and describes only the chosen path. Verified 2026-09-15: a `claude --bg` session launched with the channel flag loads the shim as a plain MCP server (tools work, `register` works) but never receives a `<channel>` event, and the flag is dropped from the job's respawn flags.
+`SWITCHBOARD_DELIVERY` in the environment Claude Code starts from selects the path (`socket` when unset). The hook reads it and describes only the chosen path.
 
-1. Add the MCP server to your workspace's `.mcp.json`. For `monitor`, connect to the daemon directly:
+How the socket path works: Claude Code 2.1.224+ binds one Unix domain socket per session and records it, with the session id, under `~/.claude/sessions/`. When a message arrives for a Claude Code session that has no `/monitor` or `/poll` connection open, the daemon looks the session up there and writes a `{"type":"user", ...}` line saying how many messages are unread; Claude Code turns that into a new turn. Sessions with a live stream are skipped, so nothing is delivered twice. The frame format is not published: it comes from the recipe Claude Code logs in `--debug` mode and is verified against `peerProtocol` 1 (Claude Code 2.1.272); the daemon refuses to post to any other protocol version and logs why.
+
+Verified 2026-09-15: a `claude --bg` session launched with the channel flag loads the shim as a plain MCP server (tools work, `register` works) but never receives a `<channel>` event, and the flag is dropped from the job's respawn flags. The same session, with nothing but `register`, wakes from the socket path.
+
+1. Add the MCP server to your workspace's `.mcp.json`. For `socket` and `monitor`, connect to the daemon directly:
 
     ```json
     {
@@ -297,7 +301,7 @@ Bun's `idleTimeout` caps individual `/poll` waits at ~250s, so shims loop. `/mon
 
 ## Wake paths — which one, when?
 
-Foreground Claude Code sessions can opt into the channel shim described under [Wire up Claude Code](#wire-up-claude-code): it reads `/monitor` on the session's behalf and needs nothing from Claude, but background sessions cannot load a channel, so the two paths below remain the default. All three end at the same place (the `UnreadWaiterRegistry` inside the daemon), so each delivers messages reliably; they differ in transport, lifetime, and failure mode:
+The default for Claude Code is the socket path described under [Wire up Claude Code](#wire-up-claude-code): the daemon wakes the session directly and Claude does nothing beyond `register`. Foreground sessions can opt into the channel shim instead. The two paths below are the legacy ones, kept for Claude Code versions without an inbox socket. All three end at the same place (the `UnreadWaiterRegistry` inside the daemon), so each delivers messages reliably; they differ in transport, lifetime, and failure mode:
 
 |                         | `/poll` + Stop-hook shim               | `/monitor` + Monitor tool                |
 |-------------------------|----------------------------------------|------------------------------------------|
