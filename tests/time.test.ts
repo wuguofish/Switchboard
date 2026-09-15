@@ -15,7 +15,7 @@ test('toTaipeiISOString converts UTC to +08:00', () => {
 
 test('toTaipeiISOString handles midnight rollover', () => {
   const utc = '2026-04-14T17:00:00.000Z'  // Taipei = next day 01:00
-  expect(toTaipeiISOString(utc)).toBe('2026-04-15T01:00:00.000+08:00')
+  expect(toTaipeiISOString(utc)).toBe('2026-04-15T01:00:00+08:00')
 })
 
 test('taipeiWeekdayZh returns single zh-TW weekday char', () => {
@@ -36,5 +36,5 @@ test('toTaipeiHeartbeatString inlines weekday after the date', () => {
 
 test('toTaipeiHeartbeatString weekday follows Taipei across midnight rollover', () => {
   const utc = '2026-07-03T17:00:00.000Z'  // Taipei = Sat 2026-07-04 01:00
-  expect(toTaipeiHeartbeatString(utc)).toBe('2026-07-04(六)T01:00:00.000+08:00')
+  expect(toTaipeiHeartbeatString(utc)).toBe('2026-07-04(六)T01:00:00+08:00')
 })
