@@ -42,14 +42,18 @@ if (!CC_SESSION_ID) {
 // Daemon side: one MCP client per shim, connected lazily and re-created on loss.
 // ---------------------------------------------------------------------------
 let daemon: Client | null = null
+let daemonTransport: StreamableHTTPClientTransport | null = null
 
 async function daemonClient(): Promise<Client> {
   if (daemon) return daemon
   const client = new Client({ name: 'switchboard-channel', version: VERSION }, { capabilities: {} })
   const transport = new StreamableHTTPClientTransport(new URL(`${SWITCHBOARD_URL}/mcp`))
-  transport.onclose = () => { if (daemon === client) daemon = null }
+  transport.onclose = () => {
+    if (daemon === client) { daemon = null; daemonTransport = null }
+  }
   await client.connect(transport)
   daemon = client
+  daemonTransport = transport
   return client
 }
 
@@ -168,6 +172,9 @@ log(`stdio connected, daemon=${SWITCHBOARD_URL}, cc=${CC_SESSION_ID || '(unset)'
 subscribeSoon()
 
 async function stop(): Promise<void> {
+  // close() only aborts the HTTP client; the daemon learns the session ended
+  // from the DELETE that terminateSession() sends, and releases the row then.
+  try { await daemonTransport?.terminateSession() } catch {}
   try { await daemon?.close() } catch {}
   process.exit(0)
 }
