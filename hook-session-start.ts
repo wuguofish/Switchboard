@@ -21,9 +21,20 @@ export function buildHookOutput(input: string): HookOutput | null {
 
 Your Claude Code session id is: ${cc_session_id}
 
-If you want this session to be reachable from other sessions via a named
-alias (so other sessions can send you messages with mcp__switchboard__send
-and wake you up on new inbox), call this in your first turn:
+Decide first whether this session needs Switchboard at all. Claude Code
+2.1.224+ ships native cross-session messaging: ListAgents shows the other
+Claude Code sessions on this machine by name, and SendMessage reaches them
+directly, waking an idle one. For Claude Code talking to Claude Code on the
+same machine, use that — it needs no registration and no Monitor watch.
+
+Switchboard is for what the native path does not cover:
+  - peers that are not Claude Code (Codex, OpenCode, anything on /register)
+  - broadcast to every registered session at once
+  - being reachable BY those peers or by broadcasts — a session that never
+    sends anything itself still needs a Switchboard alias if its name is on
+    someone else's delivery list
+
+If any of those apply, register in your first turn:
 
   mcp__switchboard__register(role='<your-role-name>', cc_session_id='${cc_session_id}')
 
@@ -31,13 +42,13 @@ Pick a unique role name (e.g. main, scratch-refactor, video-editor).
 If the role is already taken by another active session, pick a different one
 or wait until that session disconnects.
 
-If you don't want to be reachable, you can skip this — the session will
-work anonymously, and you can register later with set_alias() if you
-change your mind.
+If none apply, skip this — the session works anonymously on Switchboard,
+and you can register later with set_alias() if the need appears.
 
-After register succeeds, subscribe to the inbox stream with the Monitor
-tool so new-message events wake this session even when you're idle. This
-is the dedicated wake path — no Stop-hook shim required:
+Registering and watching go together. An alias without a watch is a door
+with nobody behind it: messages queue up and no one learns they arrived.
+So right after register succeeds, subscribe to the inbox stream with the
+Monitor tool; each new-message event wakes this session even when idle:
 
   Monitor({
     description: 'switchboard inbox',

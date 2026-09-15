@@ -6,7 +6,13 @@
 
 ## 動機
 
-Claude Code 每個 workspace / 終端機都是獨立 process，原生沒有 session 互相溝通的機制。Switchboard 補上這塊：
+Claude Code 2.1.224 起原生就有跨 session 傳訊（`ListAgents` / `SendMessage`），同一台機器上 Claude Code 之間對話已經不需要 Switchboard。Switchboard 負責原生管道沒有覆蓋的部分：
+
+- **非 Claude Code 的同伴**——Codex、OpenCode，或任何能 `POST /register` 的東西
+- **廣播**，一次送給所有已註冊的 session
+- **讓那些同伴找得到你**——只要你的名字在別人的收件名單上，就算自己從不寄信也需要這裡的門牌
+
+在此之上另外提供：
 
 - **點對點訊息** (`send`) 與 **廣播** (`broadcast`)
 - **收回** (`recall`) 已送出的訊息
@@ -151,7 +157,7 @@ powershell -File install-task.ps1
 
 ### 讓 Claude 真的去 register
 
-`SessionStart` hook 會告訴 Claude *怎麼* register，但實際上仍需要推一把讓它動作（以及決定 role 名字）。兩種做法：
+`SessionStart` hook 會先告訴 Claude 什麼時候該用 Switchboard：同一台機器上 Claude Code 之間走原生 `SendMessage`；跨廠同伴、廣播、以及要被這兩者找到，才是 register 的用途。接著才說明 *怎麼* register，但實際上仍需要推一把讓它動作（以及決定 role 名字）。兩種做法：
 
 **臨時指示** — 在第一句對話直接講：
 
@@ -170,8 +176,9 @@ cc_session_id 向 switchboard 註冊：
     mcp__switchboard__register(role='<role-name>', cc_session_id='<cc_session_id>')
 
 Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`docs`、
-`bug-triage`）。如果撞名就換一個。沒 register 的話 session 是匿名的，
-別的 session send / broadcast 都找不到它——你不想收訊息的話這樣 OK。
+`bug-triage`）。如果撞名就換一個。沒 register 的話 session 在 Switchboard
+上是匿名的——如果你只跟同一台機器上的 Claude Code 對話，原生 SendMessage
+本來就到得了，這樣 OK。
 ```
 
 不 register 的話，session 保持匿名；`send` / `broadcast` 都到不了，Stop-hook shim 每次 turn 結束都會立即退出（沒東西可 poll）。
