@@ -8,7 +8,7 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 
 const SWITCHBOARD_URL = (process.env.SWITCHBOARD_URL ?? "http://127.0.0.1:9876").replace(/\/$/, "")
-const PEER_PREFIX = process.env.SWITCHBOARD_PEER_PREFIX ?? "opencode"
+const PEER_PREFIX = process.env.SWITCHBOARD_PEER_PREFIX ?? ""
 const ROUTE_CHECK_MS = 750
 const STANDBY_RETRY_MS = 5_000
 const REQUEST_TIMEOUT_MS = 15_000
@@ -60,8 +60,15 @@ function sessionSlug(title: string | undefined): string {
   return slug || "session"
 }
 
-function sessionAlias(id: string, title: string | undefined, fullId = false): string {
-  return `${PEER_PREFIX}-${sessionSlug(title)}-${fullId ? id : id.slice(-8)}`
+/**
+ * Alias candidates in the order to try. A session is named by its title alone,
+ * like every other Switchboard client; the session-ID suffixes exist only to
+ * resolve a real collision, so the plain title gets to keep its name whenever
+ * it is free. SWITCHBOARD_PEER_PREFIX is optional and prepended verbatim.
+ */
+function aliasCandidates(id: string, title: string | undefined): string[] {
+  const base = PEER_PREFIX ? `${PEER_PREFIX}-${sessionSlug(title)}` : sessionSlug(title)
+  return [base, `${base}-${id.slice(-8)}`, `${base}-${id}`]
 }
 
 async function responseJson(response: Response): Promise<any> {
@@ -89,7 +96,7 @@ const tui: TuiPlugin = async (api) => {
     const info = api.state.session.get(sessionID)
     return {
       id: sessionID,
-      alias: sessionAlias(sessionID, info?.title),
+      alias: aliasCandidates(sessionID, info?.title)[0],
       directory: info?.directory ?? api.state.path.directory ?? process.cwd(),
     }
   }
@@ -111,23 +118,14 @@ const tui: TuiPlugin = async (api) => {
 
   async function registerTarget(target: SessionTarget, abort?: AbortSignal): Promise<RegisterResult> {
     try {
+      const candidates = aliasCandidates(target.id, api.state.session.get(target.id)?.title)
       let alias = target.alias
-      let response = await postRegister(target, alias, abort)
-      let data = await responseJson(response)
-
-      if (response.status === 409 && data?.code === "owner_conflict") {
-        return { status: "conflict" }
-      }
-      if (response.status === 409 && (
-        data?.code === "stale_generation" || data?.code === "owner_mismatch"
-      )) {
-        return { status: "stale" }
-      }
-
-      // A plain 409 is an alias collision. Keep the readable short suffix for
-      // the normal case, but retry with the stable full session ID if needed.
-      if (response.status === 409) {
-        alias = sessionAlias(target.id, api.state.session.get(target.id)?.title, true)
+      let response: Response | null = null
+      let data: any = null
+      // A plain 409 is an alias collision: fall through to the next candidate.
+      // A coded 409 is an ownership answer and ends the attempt immediately.
+      for (const candidate of [target.alias, ...candidates.filter((c) => c !== target.alias)]) {
+        alias = candidate
         response = await postRegister(target, alias, abort)
         data = await responseJson(response)
         if (response.status === 409 && data?.code === "owner_conflict") {
@@ -138,9 +136,10 @@ const tui: TuiPlugin = async (api) => {
         )) {
           return { status: "stale" }
         }
+        if (response.status !== 409) break
       }
 
-      if (!response.ok || !Number.isSafeInteger(data?.generation)) {
+      if (!response?.ok || !Number.isSafeInteger(data?.generation)) {
         return { status: "unavailable" }
       }
       return {
