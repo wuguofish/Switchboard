@@ -17,7 +17,7 @@ import { join, dirname } from "node:path"
 
 const SWITCHBOARD_URL = (process.env.SWITCHBOARD_URL ?? "http://127.0.0.1:9876").replace(/\/$/, "")
 const ALIAS = process.env.SWITCHBOARD_PEER_ALIAS ?? "opencode"
-const PEER_PREFIX = process.env.SWITCHBOARD_PEER_PREFIX ?? "opencode"
+const PEER_PREFIX = process.env.SWITCHBOARD_PEER_PREFIX ?? ""
 const RESIDENT_SESSION_TITLE = `${ALIAS} switchboard 常駐站`
 const INSTANCE_ID_PATH = join(homedir(), ".config", "opencode", "switchboard-instance-id")
 const SESSION_ID_PATH = join(homedir(), ".config", "opencode", "switchboard-session-id")
@@ -62,9 +62,15 @@ function sessionSlug(title: string | undefined): string {
   return slug || "session"
 }
 
-function sessionAlias(info: SessionInfo, fullId = false): string {
-  const idPart = fullId ? info.id : info.id.slice(-8)
-  return `${PEER_PREFIX}-${sessionSlug(info.title)}-${idPart}`
+/**
+ * Alias candidates in the order to try. A session is named by its title alone,
+ * like every other Switchboard client; the session-ID suffixes exist only to
+ * resolve a real collision, so the plain title gets to keep its name whenever
+ * it is free. SWITCHBOARD_PEER_PREFIX is optional and prepended verbatim.
+ */
+function aliasCandidates(info: SessionInfo): string[] {
+  const base = PEER_PREFIX ? `${PEER_PREFIX}-${sessionSlug(info.title)}` : sessionSlug(info.title)
+  return [base, `${base}-${info.id.slice(-8)}`, `${base}-${info.id}`]
 }
 
 function loadOrCreateInstanceId(): string {
@@ -150,10 +156,9 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     return sessionId
   }
 
-  async function registerPeerNow(peer: SessionPeer): Promise<void> {
+  function postRegisterPeer(peer: SessionPeer, alias: string): Promise<Response> {
     const info = peer.info
-    let alias = sessionAlias(info)
-    let res = await fetch(`${SWITCHBOARD_URL}/register`, {
+    return fetch(`${SWITCHBOARD_URL}/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -165,30 +170,14 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
       }),
       signal: AbortSignal.timeout(15_000),
     })
-    let data = await res.json().catch(() => null)
-    if (res.status === 409 && data?.code === "owner_conflict") {
-      peer.generation = null
-      peer.wakePending = false
-      peer.wakeStopped = true
-      log(`session peer standing by behind active owner session=${peer.sessionId}`)
-      return
-    }
-    // The short ID suffix is readable and normally unique. On a real collision,
-    // retry with the full stable session ID rather than stealing another alias.
-    if (res.status === 409) {
-      alias = sessionAlias(info, true)
-      res = await fetch(`${SWITCHBOARD_URL}/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          alias,
-          client_kind: "codex",
-          client_session_id: peer.sessionId,
-          cwd: info.directory ?? directory ?? process.cwd(),
-          respect_owner: true,
-        }),
-        signal: AbortSignal.timeout(15_000),
-      })
+  }
+  async function registerPeerNow(peer: SessionPeer): Promise<void> {
+    let res: Response | null = null
+    let data: any = null
+    // A plain 409 is an alias collision: fall through to the next candidate.
+    // An owner_conflict 409 means another process holds this session; stand by.
+    for (const alias of aliasCandidates(peer.info)) {
+      res = await postRegisterPeer(peer, alias)
       data = await res.json().catch(() => null)
       if (res.status === 409 && data?.code === "owner_conflict") {
         peer.generation = null
@@ -197,8 +186,9 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
         log(`session peer standing by behind active owner session=${peer.sessionId}`)
         return
       }
+      if (res.status !== 409) break
     }
-    if (!res.ok || !data) throw new Error(`register failed: ${res.status} ${JSON.stringify(data)}`)
+    if (!res?.ok || !data) throw new Error(`register failed: ${res?.status} ${JSON.stringify(data)}`)
     peer.alias = data.alias
     peer.generation = data.generation
     peer.lastWokenCount = 0
@@ -397,7 +387,7 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
     const peer: SessionPeer = {
       sessionId: info.id,
       info,
-      alias: sessionAlias(info),
+      alias: aliasCandidates(info)[0],
       generation: null,
       lastActivityAt: activityAt,
       lastWokenCount: 0,
@@ -571,14 +561,13 @@ export const SwitchboardPeer = async ({ client, directory }: any) => {
       if (event.type === "session.updated" && info) {
         const peer = peers.get(info.id)
         if (peer) updatePeerInfo(peer, info)
-        const alias = sessionAlias(info)
-        const fallbackAlias = sessionAlias(info, true)
-        if (peer && alias !== peer.alias && fallbackAlias !== peer.alias) {
+        const candidates = aliasCandidates(info)
+        if (peer && !candidates.includes(peer.alias)) {
           try {
             await registerPeer(peer, info)
           } catch (e) {
             // Keep polling under the previous registration and retry on a later update.
-            log(`session alias update failed session=${peer.sessionId} alias=${alias}: ${e}`)
+            log(`session alias update failed session=${peer.sessionId} alias=${candidates[0]}: ${e}`)
           }
         }
       }
