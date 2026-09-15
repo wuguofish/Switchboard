@@ -1,4 +1,5 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test'
+import { parseInboxDeliveryLine } from '../inbox-delivery'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { startServer } from '../server'
@@ -1090,7 +1091,7 @@ test('/monitor emits "hello <alias>" on connect when inbox is empty', async () =
   await recipient.close()
 })
 
-test('/monitor emits "inbox N <alias>" immediately when unread already waiting', async () => {
+test('/monitor delivers waiting mail as the first line and marks it read', async () => {
   const sender = await makeClient('mon-sender-imm')
   await sender.callTool({
     name: 'register',
@@ -1110,7 +1111,15 @@ test('/monitor emits "inbox N <alias>" immediately when unread already waiting',
     `${MONITOR_URL}?cc_session_id=cc-mon-rcp-imm`,
     (ls) => ls.length >= 1,
   )
-  expect(lines[0]).toBe('inbox 1 mon-rcp-imm')
+  const delivery = parseInboxDeliveryLine(lines[0])
+  expect(delivery?.alias).toBe('mon-rcp-imm')
+  expect(delivery?.messages.map((m) => [m.sender_alias, m.sender_kind, m.content, m.is_broadcast]))
+    .toEqual([['mon-snd-imm', 'claude_code', 'pre-queued', false]])
+
+  const leftover = JSON.parse(
+    ((await recipient.callTool({ name: 'read_messages', arguments: {} })).content as any[])[0].text,
+  )
+  expect(leftover.messages).toEqual([])
 
   await sender.close()
   await recipient.close()
@@ -1145,7 +1154,7 @@ test('/monitor emits a new "inbox" line when a send arrives mid-stream', async (
   const { lines } = await linesPromise
   expect(lines[0]).toBe('hello mon-rcp-late')
   const inboxLine = lines.find((l) => l.startsWith('inbox '))
-  expect(inboxLine).toBe('inbox 1 mon-rcp-late')
+  expect(parseInboxDeliveryLine(inboxLine!)?.messages.map((m) => m.content)).toEqual(['hi there'])
 
   await sender.close()
   await recipient.close()
@@ -1177,7 +1186,9 @@ test('/monitor fires on broadcast as well as direct send', async () => {
   })
 
   const { lines } = await linesPromise
-  expect(lines.find((l) => l.startsWith('inbox '))).toMatch(/^inbox \d+ mon-rcp-bcast$/)
+  const delivery = parseInboxDeliveryLine(lines.find((l) => l.startsWith('inbox '))!)
+  expect(delivery?.alias).toBe('mon-rcp-bcast')
+  expect(delivery?.messages.map((m) => [m.content, m.is_broadcast])).toEqual([['hi everyone', true]])
 
   await sender.close()
   await recipient.close()

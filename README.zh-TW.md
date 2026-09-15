@@ -16,10 +16,11 @@ Claude Code 2.1.224 起原生就有跨 session 傳訊（`ListAgents` / `SendMess
 
 - **點對點訊息** (`send`) 與 **廣播** (`broadcast`)
 - **收回** (`recall`) 已送出的訊息
-- **自動喚醒，兩條 path**：
-  - Stop-hook shim 長連線到 `/poll`，一有新訊息，下一個 Claude Code turn 就帶 `INBOX` 提醒啟動
+- **自動喚醒，而且喚醒本身就帶著信**：下面每一條路徑都把訊息本文直接交給 session、同時標成已讀，session 直接處理，不必再繞一趟 `read_messages`。
+  - daemon 直接寫 session 的 Claude Code inbox socket（預設；背景 session 也可用）
   - [channel shim](clients/cc-channel/README.md)（自行啟用，僅限前景 session）把 `/monitor` 的每一行以 `<channel>` 事件推進 session，訊息叫醒 session 時沒有任何要重掛的東西。
   - *或* 讓 Claude Code 的 `Monitor` tool 以 `curl -N` 訂閱 `/monitor` 的 chunked stream，每行 inbox event 直接 fire 一個 assistant turn；但 Claude Code 2.1.271 起 watch 每 30 分鐘到期，必須重掛。
+  - Stop-hook shim 長連線到 `/poll`，一有新訊息，下一個 Claude Code turn 就帶 `INBOX` 提醒啟動（只帶數量，session 再呼叫 `read_messages`）
 - **持久化** — 訊息存在 SQLite，daemon 重啟也不會丟
 
 整套只綁 `127.0.0.1`、沒有認證——本機協調方便，但絕對不能暴露到網路上。
@@ -131,7 +132,7 @@ powershell -File install-task.ps1
 
 |                | `socket`（預設）                                                      | `channel`（自行啟用，僅限前景 session）                                  | `monitor`（舊路徑）        |
 |----------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------|---------------------------|
-| 訊息怎麼叫醒 session | daemon 對 session 的 Claude Code inbox socket 寫一行，直接開新一輪 | `switchboard` stdio server 把 `<channel>` 事件直接推進對話               | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次 |
+| 訊息怎麼叫醒 session | daemon 把訊息本文寫進 session 的 Claude Code inbox socket，直接開帶著信的新一輪 | `switchboard` stdio server 把訊息本文以 `<channel>` 事件直接推進對話 | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次；每行 `inbox` 都帶著訊息本文 |
 | 啟動           | 一般 `claude`                                                         | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | `SWITCHBOARD_DELIVERY=monitor claude` |
 | 背景 session（agent view、`claude --bg`）可用 | 可                                      | **不可**：channel flag 不在背景 session 會帶的 flag 清單裡，而且那個 flag 的確認提示沒有終端機可以按 | 可 |
 | 必要設定       | `~/.claude/settings.json` 的 `crossSessionInbound: "accept"`          | 無                                                                      | 無                        |
@@ -140,7 +141,7 @@ powershell -File install-task.ps1
 
 在啟動 Claude Code 的環境設 `SWITCHBOARD_DELIVERY` 選路徑（未設＝`socket`）。hook 會讀它，只講被選的那一條。
 
-socket 路徑的原理：Claude Code 2.1.224 起每個 session 綁一個 Unix domain socket，連同 session id 記在 `~/.claude/sessions/` 底下。當一封信送到某個沒有 `/monitor`、`/poll` 連線的 Claude Code session，daemon 就去那裡查出 socket，寫一行 `{"type":"user", …}` 說有幾封未讀；Claude Code 把它變成新的一輪。有串流連著的 session 會跳過，所以不會重複投遞。框架格式沒有公開，是從 Claude Code `--debug` 模式自己印出的範例取得、並在 `peerProtocol` 1（Claude Code 2.1.272）驗證過；daemon 遇到其他協定版本會拒絕投遞並記下原因。
+socket 路徑的原理：Claude Code 2.1.224 起每個 session 綁一個 Unix domain socket，連同 session id 記在 `~/.claude/sessions/` 底下。當一封信送到某個沒有 `/monitor`、`/poll` 連線的 Claude Code session，daemon 就去那裡查出 socket，寫一行 `{"type":"user", …}`，內容就是那些未讀訊息（寄件人、client kind、時間、本文）；Claude Code 把它變成新的一輪，daemon 在 socket 收下寫入後把那些列標成已讀。有串流連著的 session 會跳過，所以不會重複投遞。沒設 `crossSessionInbound: "accept"` 時喚醒只帶數量、訊息維持未讀，因為被扣住的喚醒會過期，信不能跟著陪葬。框架格式沒有公開，是從 Claude Code `--debug` 模式自己印出的範例取得、並在 `peerProtocol` 1（Claude Code 2.1.272）驗證過；daemon 遇到其他協定版本會拒絕投遞並記下原因。
 
 2026-09-15 實測：`claude --bg` 帶 channel flag 啟動的 session，shim 只被當一般 MCP server 帶起（工具可用、`register` 可用），但收不到任何 `<channel>` 事件，且 job 的 respawn flag 裡沒有那個 flag。同一種 session 只做 `register`，socket 路徑就叫得醒。
 
@@ -224,7 +225,7 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
 | `set_alias` | `alias` | `{old_alias, new_alias}` |
 | `send` | `to`、`message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`、`scope?` | `{broadcast_id, recipient_count, notified_count}` |
-| `read_messages` | — | `{messages: [...]}` |
+| `read_messages` | — | `{messages: [...]}`——只回沒有任何喚醒帶走的信；喚醒送到的已是已讀 |
 | `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}`——`status` 為 `released`、`stale_ignored`（同一 identity 已被更新世代重新註冊，未釋放任何東西）或 `already_offline` |
@@ -282,7 +283,7 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
   - `{status: "no-session"}` — alias 消失；shim `exit 0`
 - `GET /monitor?cc_session_id=<uuid>` — 為 Claude Code 的 `Monitor` tool 設計的長駐 chunked text stream，每行一個 event：
   - `hello <alias>` — 連上時的 baseline，inbox 空時才發
-  - `inbox <N> <alias>` — 連上時有未讀、或有新的 `send` / `broadcast` 到
+  - `inbox <json>` — 未讀訊息本身，`{alias, messages: [{id, sender_alias, sender_kind, created_at, content, is_broadcast}]}`；連上時有未讀就發、之後每有 `send` / `broadcast` 到就發，送出同時把那些列標成已讀
   - `heartbeat <iso-ts>` — 每 4 hr 靜默時發一次的可見時間 tick，例如 `heartbeat 2026-04-24(五)T13:38:25.000+08:00`；日期後面的 `(X)` 是台北時間的星期，訂閱端直接讀它就好，自己從日期推算會在 UTC／台北的換日邊界出錯（每 240s 還會發一個無訊息空白 byte 維持 Bun `idleTimeout` 不砍 stream）
   - 在 `/monitor` 網址後面加 `&heartbeat_secs=N` 可以自訂間隔（下限 240、上限 86400）。對 LLM 訂閱端來說每次心跳喚醒都是冷啟動——prompt cache 早就過期，整包 context 等於用寫入價重寫一次——所以間隔就是成本旋鈕，拉長一倍、閒置消耗就少一半。
 

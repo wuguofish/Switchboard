@@ -86,10 +86,11 @@ drop it unread after five minutes. Tell the user to set it to "accept" (the
 /config row "Messages from your other sessions") before relying on Switchboard.`
   return `Registering is all this session has to do for delivery. The Switchboard
 daemon wakes this session itself: when a message arrives and no stream is
-attached, it posts a one-line note to this session's Claude Code inbox socket,
-which starts a new turn saying how many messages are unread. Then call
-mcp__switchboard__read_messages. No Monitor tool, no channel flag, and it
-works in background sessions too.
+attached, it posts the messages themselves to this session's Claude Code
+inbox socket, which starts a new turn carrying them, already marked read.
+Act on them directly; mcp__switchboard__read_messages only returns mail that
+no wake could carry (for example mail that arrived before register). No
+Monitor tool, no channel flag, and it works in background sessions too.
 
 ${preflight}`
 }
@@ -113,7 +114,8 @@ the Monitor-tool path applies. Do not fall back to a Monitor watch on your
 own: two wake paths on one session deliver every message twice.
 
 Events you will see (kind attribute):
-  inbox      unread waiting; call mcp__switchboard__read_messages
+  inbox      the messages themselves, already marked read; act on them
+             (mcp__switchboard__read_messages only returns mail no wake carried)
   hello      subscribed; no action needed
   heartbeat  clock tick with the Taipei time in "at"; no action, no reply`
 }
@@ -138,7 +140,11 @@ so treat the expiry notice as work, not noise.
 
 Each line on the stream becomes a notification:
   hello <alias>             -> baseline on connect, no action needed
-  inbox <N> <alias>         -> unread waiting; call mcp__switchboard__read_messages
+  inbox <json>              -> the messages themselves ({alias, messages:[{
+                               sender_alias, sender_kind, created_at, content,
+                               is_broadcast}]}), already marked read; act on
+                               them (mcp__switchboard__read_messages only
+                               returns mail no wake carried)
   heartbeat <Asia/Taipei>   -> ~4-hr time tick (e.g. "heartbeat
                                2026-04-24(五)T13:38:25.000+08:00" — the
                                (X) after the date is the Taipei weekday,

@@ -65,7 +65,7 @@ test('socket delivery needs no watch and reports the inbound preflight', () => {
   const input = JSON.stringify({ session_id: 'cc-socket' })
   const ok = buildHookOutput(input, 'socket', 'accept')!.hookSpecificOutput.additionalContext
   expect(ok).toContain('inbox socket')
-  expect(ok).toContain('read_messages')
+  expect(ok).toContain('already marked read')
   expect(ok).not.toContain('Monitor(')
   expect(ok).not.toContain('development-channels')
   expect(ok).toContain('"accept"')
