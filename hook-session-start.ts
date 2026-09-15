@@ -7,7 +7,16 @@ export interface HookOutput {
   hookSpecificOutput: HookSpecificOutput
 }
 
-export function buildHookOutput(input: string): HookOutput | null {
+export type Delivery = 'channel' | 'monitor'
+
+// Monitor stays the default: the channel path needs a launch flag that
+// background sessions (agent view, `claude --bg`) cannot carry, so a session
+// opts into it explicitly with SWITCHBOARD_DELIVERY=channel.
+export function resolveDelivery(raw: string | undefined): Delivery {
+  return raw === 'channel' ? 'channel' : 'monitor'
+}
+
+export function buildHookOutput(input: string, delivery: Delivery = resolveDelivery(process.env.SWITCHBOARD_DELIVERY)): HookOutput | null {
   let payload: { session_id?: string }
   try {
     payload = JSON.parse(input)
@@ -16,6 +25,8 @@ export function buildHookOutput(input: string): HookOutput | null {
   }
   const cc_session_id = payload.session_id
   if (!cc_session_id) return null
+
+  const wakePath = delivery === 'channel' ? channelWakePath(cc_session_id) : monitorWakePath(cc_session_id)
 
   const context = `Switchboard MCP is available.
 
@@ -45,7 +56,42 @@ or wait until that session disconnects.
 If none apply, skip this — the session works anonymously on Switchboard,
 and you can register later with set_alias() if the need appears.
 
-Registering and watching go together. An alias without a watch is a door
+${wakePath}`
+
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'SessionStart',
+      additionalContext: context,
+    },
+  }
+}
+
+function channelWakePath(cc_session_id: string): string {
+  return `Registering and watching go together. In this session the watch is the
+Switchboard channel: the stdio server declared as "switchboard" in your MCP
+config is spawned by Claude Code and pushes every inbox event straight into
+this conversation as a <channel source="switchboard" kind="..."> tag, waking
+the session when idle. No Monitor tool, no re-arming.
+
+That only works if Claude Code was started with the channel enabled
+(channels are a research preview, so the flag is required):
+
+  claude --dangerously-load-development-channels server:switchboard
+
+Check the startup banner for the line saying messages from server:switchboard
+inject into this session. If it is missing, tell the user to restart with the
+flag above, or to drop SWITCHBOARD_DELIVERY=channel from the environment so
+the Monitor-tool path applies. Do not fall back to a Monitor watch on your
+own: two wake paths on one session deliver every message twice.
+
+Events you will see (kind attribute):
+  inbox      unread waiting; call mcp__switchboard__read_messages
+  hello      subscribed; no action needed
+  heartbeat  clock tick with the Taipei time in "at"; no action, no reply`
+}
+
+function monitorWakePath(cc_session_id: string): string {
+  return `Registering and watching go together. An alias without a watch is a door
 with nobody behind it: messages queue up and no one learns they arrived.
 So right after register succeeds, subscribe to the inbox stream with the
 Monitor tool; each new-message event wakes this session even when idle:
@@ -92,13 +138,6 @@ Note since 2.1.271: the 30-minute watch deadline now sets the floor on idle
 wakes, so a heartbeat longer than 30 minutes no longer lowers the wake rate —
 the re-arm notice arrives first either way. Lengthening the heartbeat past
 30 minutes only stops the clock tick, not the cold start.`
-
-  return {
-    hookSpecificOutput: {
-      hookEventName: 'SessionStart',
-      additionalContext: context,
-    },
-  }
 }
 
 export async function main() {
