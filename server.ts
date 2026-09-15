@@ -24,6 +24,7 @@ import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
+import { inboxWakeText, wakeInboxSocket } from './inbox-socket'
 import type { BroadcastScope, ClientKind, SessionRow } from './types'
 import { isSessionOnline } from './online'
 
@@ -200,6 +201,24 @@ export async function startServer(opts: {
         is_broadcast: message.broadcast_id !== null,
       }
     })
+  }
+
+  /**
+   * Socket wake for Claude Code sessions that keep no /monitor or /poll
+   * connection open (background sessions in particular): nothing else would
+   * wake them, so poke the session's inbox socket. A session with a live
+   * stream gets the event on that stream instead and is skipped here.
+   */
+  async function wakeIfUnwatched(recipient: SessionRow | null): Promise<boolean> {
+    if (!recipient || recipient.client_kind !== 'claude_code') return false
+    if (!recipient.client_session_id || !recipient.alias) return false
+    if (waiters.isPolling('claude_code', recipient.client_session_id)) return false
+    const count = countUnreadBySessionId(db, recipient.id)
+    const result = await wakeInboxSocket(recipient.client_session_id, inboxWakeText(count, recipient.alias))
+    if (!result.delivered) {
+      process.stderr.write(`switchboard: socket wake skipped for ${recipient.alias}: ${result.reason}\n`)
+    }
+    return result.delivered
   }
 
   async function handleRegister(req: Request): Promise<Response> {
@@ -392,10 +411,11 @@ export async function startServer(opts: {
       })
       waiters.notify(targetId)
       const recipient = findSessionById(db, targetId)
+      const woke = await wakeIfUnwatched(recipient)
       return Response.json({
         message_id,
         delivered_notification:
-          pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
+          woke || pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
       })
     } catch (e) {
       return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 })
@@ -721,13 +741,14 @@ export async function startServer(opts: {
         // no waiter exists.
         waiters.notify(targetId)
         const recipient = findSessionById(db, targetId)
+        const woke = await wakeIfUnwatched(recipient)
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
               message_id,
               delivered_notification:
-                pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
+                woke || pushed || (recipient ? isSessionOnline(recipient, registry, waiters) : false),
             }),
           }],
         }
@@ -764,7 +785,9 @@ export async function startServer(opts: {
             is_broadcast: true,
           })
           const recipient = findSessionById(db, id)
+          const woke = await wakeIfUnwatched(recipient)
           if (
+            woke ||
             pushed ||
             (recipient ? isSessionOnline(recipient, registry, waiters) : false)
           ) {

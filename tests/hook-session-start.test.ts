@@ -3,7 +3,7 @@ import { buildHookOutput, resolveDelivery } from '../hook-session-start'
 
 test('buildHookOutput embeds cc_session_id into additionalContext', () => {
   const input = JSON.stringify({ session_id: 'cc-xyz-789', source: 'startup' })
-  const out = buildHookOutput(input)
+  const out = buildHookOutput(input, 'socket', 'accept')
   expect(out).not.toBeNull()
   expect(out!.hookSpecificOutput.hookEventName).toBe('SessionStart')
   expect(out!.hookSpecificOutput.additionalContext).toContain('cc-xyz-789')
@@ -53,9 +53,25 @@ test('channel delivery teaches the channel flag instead of Monitor', () => {
   expect(ctx).toContain('read_messages')
 })
 
-test('resolveDelivery defaults to monitor; channel is explicit opt-in', () => {
-  expect(resolveDelivery(undefined)).toBe('monitor')
+test('resolveDelivery defaults to socket; channel and monitor are explicit opt-in', () => {
+  expect(resolveDelivery(undefined)).toBe('socket')
+  expect(resolveDelivery('socket')).toBe('socket')
   expect(resolveDelivery('monitor')).toBe('monitor')
   expect(resolveDelivery('channel')).toBe('channel')
-  expect(resolveDelivery('typo')).toBe('monitor')
+  expect(resolveDelivery('typo')).toBe('socket')
+})
+
+test('socket delivery needs no watch and reports the inbound preflight', () => {
+  const input = JSON.stringify({ session_id: 'cc-socket' })
+  const ok = buildHookOutput(input, 'socket', 'accept')!.hookSpecificOutput.additionalContext
+  expect(ok).toContain('inbox socket')
+  expect(ok).toContain('read_messages')
+  expect(ok).not.toContain('Monitor(')
+  expect(ok).not.toContain('development-channels')
+  expect(ok).toContain('"accept"')
+  expect(ok).not.toContain('WARNING')
+
+  const warn = buildHookOutput(input, 'socket', null)!.hookSpecificOutput.additionalContext
+  expect(warn).toContain('WARNING')
+  expect(warn).toContain('not set')
 })

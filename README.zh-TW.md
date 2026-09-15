@@ -129,18 +129,22 @@ powershell -File install-task.ps1
 
 先替 session 選一條投遞路徑。它決定 MCP server 怎麼接、以及 hook 教 Claude 哪一套：
 
-|                | `monitor`（預設）                                                     | `channel`（自行啟用，僅限前景 session）                                  | `socket`（規劃中，#20；限制最少的一條） |
+|                | `socket`（預設）                                                      | `channel`（自行啟用，僅限前景 session）                                  | `monitor`（舊路徑）        |
 |----------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------|---------------------------|
-| 訊息怎麼叫醒 session | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次          | `switchboard` stdio server 把 `<channel>` 事件直接推進對話               | daemon 直接寫 session 的 inbox socket |
-| 啟動           | 一般 `claude`                                                         | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | 一般 `claude` |
+| 訊息怎麼叫醒 session | daemon 對 session 的 Claude Code inbox socket 寫一行，直接開新一輪 | `switchboard` stdio server 把 `<channel>` 事件直接推進對話               | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次 |
+| 啟動           | 一般 `claude`                                                         | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | `SWITCHBOARD_DELIVERY=monitor claude` |
 | 背景 session（agent view、`claude --bg`）可用 | 可                                      | **不可**：channel flag 不在背景 session 會帶的 flag 清單裡，而且那個 flag 的確認提示沒有終端機可以按 | 可 |
-| 必要設定       | 無                                                                    | 無                                                                      | `crossSessionInbound: accept` |
-| 每 session 成本 | bash＋curl 約 17 MB，外加每 30 分鐘一次冷啟動                         | 一支 Bun 行程，約 80 MB                                                 | 無                        |
-| 設錯時         | 大聲：每 30 分鐘一次到期通知直到 Claude 重掛                           | 大聲：啟動畫面沒有 channel 那行，訊息一封都不來                          | 安靜：訊息被扣住等核准，5 分鐘後丟棄 |
+| 必要設定       | `~/.claude/settings.json` 的 `crossSessionInbound: "accept"`          | 無                                                                      | 無                        |
+| 每 session 成本 | 無                                                                    | 一支 Bun 行程，約 80 MB                                                 | bash＋curl 約 17 MB，外加每 30 分鐘一次冷啟動 |
+| 設錯時         | 沒設 accept 時，Claude Code 會把每次喚醒扣住等核准、5 分鐘後丟棄。daemon 啟動時會警告、hook 在每個新 session 也會警告，所以這個「安靜」是有人先喊過的 | 大聲：啟動畫面沒有 channel 那行，訊息一封都不來 | 大聲：每 30 分鐘一次到期通知直到 Claude 重掛 |
 
-在啟動 Claude Code 的環境設 `SWITCHBOARD_DELIVERY` 選路徑（未設＝`monitor`）。hook 會讀它，只講被選的那一條。2026-09-15 實測：`claude --bg` 帶 channel flag 啟動的 session，shim 只被當一般 MCP server 帶起（工具可用、`register` 可用），但收不到任何 `<channel>` 事件，且 job 的 respawn flag 裡沒有那個 flag。
+在啟動 Claude Code 的環境設 `SWITCHBOARD_DELIVERY` 選路徑（未設＝`socket`）。hook 會讀它，只講被選的那一條。
 
-1. 在 workspace 的 `.mcp.json` 加入 MCP server。`monitor` 模式直接連 daemon：
+socket 路徑的原理：Claude Code 2.1.224 起每個 session 綁一個 Unix domain socket，連同 session id 記在 `~/.claude/sessions/` 底下。當一封信送到某個沒有 `/monitor`、`/poll` 連線的 Claude Code session，daemon 就去那裡查出 socket，寫一行 `{"type":"user", …}` 說有幾封未讀；Claude Code 把它變成新的一輪。有串流連著的 session 會跳過，所以不會重複投遞。框架格式沒有公開，是從 Claude Code `--debug` 模式自己印出的範例取得、並在 `peerProtocol` 1（Claude Code 2.1.272）驗證過；daemon 遇到其他協定版本會拒絕投遞並記下原因。
+
+2026-09-15 實測：`claude --bg` 帶 channel flag 啟動的 session，shim 只被當一般 MCP server 帶起（工具可用、`register` 可用），但收不到任何 `<channel>` 事件，且 job 的 respawn flag 裡沒有那個 flag。同一種 session 只做 `register`，socket 路徑就叫得醒。
+
+1. 在 workspace 的 `.mcp.json` 加入 MCP server。`socket` 與 `monitor` 模式直接連 daemon：
 
     ```json
     {
@@ -286,7 +290,7 @@ Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 l
 
 ## Wake paths — 哪條、什麼時候用？
 
-前景的 Claude Code session 可以改用 [接 Claude Code](#接-claude-code) 那節的 channel shim：它代替 session 讀 `/monitor`，Claude 不用做任何事；但背景 session 載不了 channel，所以下面兩條仍是預設。三條的終點都是 daemon 裡的 `UnreadWaiterRegistry`，投遞都可靠；差別在傳輸、生命週期與失敗模式：
+Claude Code 的預設是 [接 Claude Code](#接-claude-code) 那節的 socket 路徑：daemon 直接叫醒 session，Claude 除了 `register` 什麼都不用做。前景 session 可改用 channel shim。下面兩條是舊路徑，留給沒有 inbox socket 的 Claude Code 版本。三條的終點都是 daemon 裡的 `UnreadWaiterRegistry`，投遞都可靠；差別在傳輸、生命週期與失敗模式：
 
 |                           | `/poll` + Stop-hook shim           | `/monitor` + Monitor tool           |
 |---------------------------|------------------------------------|-------------------------------------|

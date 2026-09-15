@@ -1,3 +1,5 @@
+import { crossSessionInboundSetting } from './inbox-socket'
+
 export interface HookSpecificOutput {
   hookEventName: 'SessionStart'
   additionalContext: string
@@ -7,16 +9,21 @@ export interface HookOutput {
   hookSpecificOutput: HookSpecificOutput
 }
 
-export type Delivery = 'channel' | 'monitor'
+export type Delivery = 'socket' | 'channel' | 'monitor'
 
-// Monitor stays the default: the channel path needs a launch flag that
-// background sessions (agent view, `claude --bg`) cannot carry, so a session
-// opts into it explicitly with SWITCHBOARD_DELIVERY=channel.
+// Socket is the default: the daemon wakes the session through its Claude
+// Code inbox socket, which needs no launch flag and works in background
+// sessions. `channel` (foreground only) and `monitor` (legacy) are opt-in.
 export function resolveDelivery(raw: string | undefined): Delivery {
-  return raw === 'channel' ? 'channel' : 'monitor'
+  if (raw === 'channel' || raw === 'monitor') return raw
+  return 'socket'
 }
 
-export function buildHookOutput(input: string, delivery: Delivery = resolveDelivery(process.env.SWITCHBOARD_DELIVERY)): HookOutput | null {
+export function buildHookOutput(
+  input: string,
+  delivery: Delivery = resolveDelivery(process.env.SWITCHBOARD_DELIVERY),
+  inbound: string | null = crossSessionInboundSetting(),
+): HookOutput | null {
   let payload: { session_id?: string }
   try {
     payload = JSON.parse(input)
@@ -26,7 +33,11 @@ export function buildHookOutput(input: string, delivery: Delivery = resolveDeliv
   const cc_session_id = payload.session_id
   if (!cc_session_id) return null
 
-  const wakePath = delivery === 'channel' ? channelWakePath(cc_session_id) : monitorWakePath(cc_session_id)
+  const wakePath = delivery === 'channel'
+    ? channelWakePath(cc_session_id)
+    : delivery === 'monitor'
+      ? monitorWakePath(cc_session_id)
+      : socketWakePath(inbound)
 
   const context = `Switchboard MCP is available.
 
@@ -64,6 +75,23 @@ ${wakePath}`
       additionalContext: context,
     },
   }
+}
+
+function socketWakePath(inbound: string | null): string {
+  const preflight = inbound === 'accept'
+    ? 'Checked just now: crossSessionInbound is "accept" in ~/.claude/settings.json, so wakes arrive.'
+    : `WARNING checked just now: crossSessionInbound is ${inbound === null ? 'not set' : `"${inbound}"`} in
+~/.claude/settings.json. Claude Code will hold every wake for approval and
+drop it unread after five minutes. Tell the user to set it to "accept" (the
+/config row "Messages from your other sessions") before relying on Switchboard.`
+  return `Registering is all this session has to do for delivery. The Switchboard
+daemon wakes this session itself: when a message arrives and no stream is
+attached, it posts a one-line note to this session's Claude Code inbox socket,
+which starts a new turn saying how many messages are unread. Then call
+mcp__switchboard__read_messages. No Monitor tool, no channel flag, and it
+works in background sessions too.
+
+${preflight}`
 }
 
 function channelWakePath(cc_session_id: string): string {
