@@ -271,10 +271,12 @@ Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 l
 ```
 Monitor({
   description: 'switchboard inbox for <my-alias>',
-  persistent: true,
+  timeout_ms: 1800000,
   command: 'while :; do curl -sN "http://127.0.0.1:9876/monitor?cc_session_id=<cc_session_id>" || true; sleep 5; done',
 })
 ```
+
+Claude Code 2.1.271 拿掉了 Monitor 的無逾時 `persistent` 選項——每個 watch 現在一定有期限，最長 30 分鐘（`-p` 模式 10 分鐘），到期時 Claude 會收到一則通知。**收到那則通知就要重掛**：把它當雜訊的 session 會無聲地變成不可達。這同時也給閒置喚醒設了下限，所以 `heartbeat_secs` 設得比 30 分鐘長，已經不會再降低喚醒頻率。
 
 `while … sleep 5` wrapper 會在 daemon 重啟或 TCP 閃斷時自動重連。進階訂閱者可以在確定 stream 穩定後補 `grep --line-buffered "^inbox "` 把 `hello` / `heartbeat` noise 過濾掉。
 
