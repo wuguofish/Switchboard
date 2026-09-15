@@ -230,7 +230,7 @@ export async function startServer(opts: {
           id: message.id,
           sender_alias: sender?.alias ?? null,
           sender_kind: sender?.client_kind ?? 'unknown',
-          created_at: toTaipeiISOString(message.created_at),
+          created_at: toTaipeiHeartbeatString(message.created_at),
           content: message.content,
           is_broadcast: message.broadcast_id !== null,
         }

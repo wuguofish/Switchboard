@@ -26,16 +26,16 @@ describe('inbox delivery line', () => {
 describe('inbox delivery text', () => {
   const text = inboxDeliveryText(delivery)
 
-  test('header states count, recipient and that the mail is already read', () => {
-    expect(text.startsWith('Switchboard: 2 message(s) for worker, delivered here and marked read.')).toBe(true)
+  test('one tag per message with sender, client kind and time; body verbatim', () => {
+    expect(text).toBe(
+      '<switchboard from="boss" kind="claude_code" at="2026-09-15T16:00:00.000+08:00">\ndo the thing\nsecond line\n</switchboard>'
+      + '\n\n'
+      + '<switchboard from="unknown" kind="external" at="2026-09-15T16:02:00.000+08:00" broadcast="true">\nping\n</switchboard>',
+    )
   })
 
-  test('each message names sender, client kind and time, keeping the body verbatim', () => {
-    expect(text).toContain('--- from boss (claude_code) 2026-09-15T16:00:00.000+08:00 ---\ndo the thing\nsecond line')
-    expect(text).toContain('--- from unknown sender (external) 2026-09-15T16:02:00.000+08:00 [broadcast] ---\nping')
-  })
-
-  test('tells the recipient how to reply', () => {
-    expect(text.trimEnd().endsWith('Reply with mcp__switchboard__send (to: the sender alias).')).toBe(true)
+  test('quotes in an alias cannot break out of the attribute', () => {
+    const quoted = inboxDeliveryText({ alias: 'w', messages: [{ ...delivery.messages[0], sender_alias: 'a"b' }] })
+    expect(quoted).toContain('from="a&quot;b"')
   })
 })
