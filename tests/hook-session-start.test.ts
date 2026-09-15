@@ -42,7 +42,7 @@ test('buildHookOutput teaches the Monitor-tool subscription path in monitor deli
   expect(ctx).toContain('read_messages')
 })
 
-test('channel delivery is the default and teaches the channel flag instead of Monitor', () => {
+test('channel delivery teaches the channel flag instead of Monitor', () => {
   const input = JSON.stringify({ session_id: 'cc-channel-teach' })
   const ctx = buildHookOutput(input, 'channel')!.hookSpecificOutput.additionalContext
   expect(ctx).toContain('--dangerously-load-development-channels server:switchboard')
@@ -53,9 +53,9 @@ test('channel delivery is the default and teaches the channel flag instead of Mo
   expect(ctx).toContain('read_messages')
 })
 
-test('resolveDelivery falls back to channel for anything but monitor', () => {
-  expect(resolveDelivery(undefined)).toBe('channel')
-  expect(resolveDelivery('channel')).toBe('channel')
+test('resolveDelivery defaults to monitor; channel is explicit opt-in', () => {
+  expect(resolveDelivery(undefined)).toBe('monitor')
   expect(resolveDelivery('monitor')).toBe('monitor')
-  expect(resolveDelivery('typo')).toBe('channel')
+  expect(resolveDelivery('channel')).toBe('channel')
+  expect(resolveDelivery('typo')).toBe('monitor')
 })

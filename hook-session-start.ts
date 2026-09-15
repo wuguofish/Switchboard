@@ -9,8 +9,11 @@ export interface HookOutput {
 
 export type Delivery = 'channel' | 'monitor'
 
+// Monitor stays the default: the channel path needs a launch flag that
+// background sessions (agent view, `claude --bg`) cannot carry, so a session
+// opts into it explicitly with SWITCHBOARD_DELIVERY=channel.
 export function resolveDelivery(raw: string | undefined): Delivery {
-  return raw === 'monitor' ? 'monitor' : 'channel'
+  return raw === 'channel' ? 'channel' : 'monitor'
 }
 
 export function buildHookOutput(input: string, delivery: Delivery = resolveDelivery(process.env.SWITCHBOARD_DELIVERY)): HookOutput | null {
@@ -77,9 +80,9 @@ That only works if Claude Code was started with the channel enabled
 
 Check the startup banner for the line saying messages from server:switchboard
 inject into this session. If it is missing, tell the user to restart with the
-flag above — or with SWITCHBOARD_DELIVERY=monitor in the environment to use
-the legacy Monitor-tool path instead. Do not fall back to a Monitor watch on
-your own: two wake paths on one session deliver every message twice.
+flag above, or to drop SWITCHBOARD_DELIVERY=channel from the environment so
+the Monitor-tool path applies. Do not fall back to a Monitor watch on your
+own: two wake paths on one session deliver every message twice.
 
 Events you will see (kind attribute):
   inbox      unread waiting; call mcp__switchboard__read_messages

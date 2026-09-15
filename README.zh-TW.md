@@ -18,7 +18,7 @@ Claude Code 2.1.224 起原生就有跨 session 傳訊（`ListAgents` / `SendMess
 - **收回** (`recall`) 已送出的訊息
 - **自動喚醒，兩條 path**：
   - Stop-hook shim 長連線到 `/poll`，一有新訊息，下一個 Claude Code turn 就帶 `INBOX` 提醒啟動
-  - [channel shim](clients/cc-channel/README.md)（Claude Code 預設）把 `/monitor` 的每一行以 `<channel>` 事件推進 session，訊息叫醒 session 時沒有任何要重掛的東西。
+  - [channel shim](clients/cc-channel/README.md)（自行啟用，僅限前景 session）把 `/monitor` 的每一行以 `<channel>` 事件推進 session，訊息叫醒 session 時沒有任何要重掛的東西。
   - *或* 讓 Claude Code 的 `Monitor` tool 以 `curl -N` 訂閱 `/monitor` 的 chunked stream，每行 inbox event 直接 fire 一個 assistant turn；但 Claude Code 2.1.271 起 watch 每 30 分鐘到期，必須重掛。
 - **持久化** — 訊息存在 SQLite，daemon 重啟也不會丟
 
@@ -129,30 +129,18 @@ powershell -File install-task.ps1
 
 先替 session 選一條投遞路徑。它決定 MCP server 怎麼接、以及 hook 教 Claude 哪一套：
 
-|                | `channel`（預設）                                                     | `monitor`（舊路徑，Claude Code < 2.1.224 或不帶 channel flag 時）      | `socket`（規劃中，#20）   |
+|                | `monitor`（預設）                                                     | `channel`（自行啟用，僅限前景 session）                                  | `socket`（規劃中，#20；限制最少的一條） |
 |----------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------|---------------------------|
-| 訊息怎麼叫醒 session | `switchboard` stdio server 把 `<channel>` 事件直接推進對話          | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次               | daemon 直接寫 session 的 inbox socket |
-| 啟動           | `claude --dangerously-load-development-channels server:switchboard`   | 一般 `claude`                                                           | 一般 `claude`             |
+| 訊息怎麼叫醒 session | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次          | `switchboard` stdio server 把 `<channel>` 事件直接推進對話               | daemon 直接寫 session 的 inbox socket |
+| 啟動           | 一般 `claude`                                                         | `SWITCHBOARD_DELIVERY=channel claude --dangerously-load-development-channels server:switchboard` | 一般 `claude` |
+| 背景 session（agent view、`claude --bg`）可用 | 可                                      | **不可**：channel flag 不在背景 session 會帶的 flag 清單裡，而且那個 flag 的確認提示沒有終端機可以按 | 可 |
 | 必要設定       | 無                                                                    | 無                                                                      | `crossSessionInbound: accept` |
-| 每 session 成本 | 一支 Bun 行程，約 80 MB                                               | bash＋curl 約 17 MB，外加每 30 分鐘一次冷啟動                            | 無                        |
-| 設錯時         | 大聲：啟動畫面沒有 channel 那行，訊息一封都不來                        | 大聲：每 30 分鐘一次到期通知直到 Claude 重掛                             | 安靜：訊息被扣住等核准，5 分鐘後丟棄 |
+| 每 session 成本 | bash＋curl 約 17 MB，外加每 30 分鐘一次冷啟動                         | 一支 Bun 行程，約 80 MB                                                 | 無                        |
+| 設錯時         | 大聲：每 30 分鐘一次到期通知直到 Claude 重掛                           | 大聲：啟動畫面沒有 channel 那行，訊息一封都不來                          | 安靜：訊息被扣住等核准，5 分鐘後丟棄 |
 
-在啟動 Claude Code 的環境設 `SWITCHBOARD_DELIVERY`（未設＝`channel`，或 `monitor`）。hook 會讀它，只講被選的那一條。
+在啟動 Claude Code 的環境設 `SWITCHBOARD_DELIVERY` 選路徑（未設＝`monitor`）。hook 會讀它，只講被選的那一條。2026-09-15 實測：`claude --bg` 帶 channel flag 啟動的 session，shim 只被當一般 MCP server 帶起（工具可用、`register` 可用），但收不到任何 `<channel>` 事件，且 job 的 respawn flag 裡沒有那個 flag。
 
-1. 在 workspace 的 `.mcp.json` 加入 MCP server。`channel` 模式指向 shim（見 [`clients/cc-channel/`](clients/cc-channel/README.md)）：
-
-    ```json
-    {
-      "mcpServers": {
-        "switchboard": {
-          "command": "bun",
-          "args": ["/absolute/path/to/Switchboard/clients/cc-channel/switchboard-channel.ts"]
-        }
-      }
-    }
-    ```
-
-    `monitor` 模式直接連 daemon：
+1. 在 workspace 的 `.mcp.json` 加入 MCP server。`monitor` 模式直接連 daemon：
 
     ```json
     {
@@ -160,6 +148,19 @@ powershell -File install-task.ps1
         "switchboard": {
           "type": "http",
           "url": "http://127.0.0.1:9876/mcp"
+        }
+      }
+    }
+    ```
+
+    `channel` 模式指向 shim（見 [`clients/cc-channel/`](clients/cc-channel/README.md)）：
+
+    ```json
+    {
+      "mcpServers": {
+        "switchboard": {
+          "command": "bun",
+          "args": ["/absolute/path/to/Switchboard/clients/cc-channel/switchboard-channel.ts"]
         }
       }
     }
@@ -285,7 +286,7 @@ Bun 的 `idleTimeout` 把單次 `/poll` 等待上限壓在 ~250s，shim 自己 l
 
 ## Wake paths — 哪條、什麼時候用？
 
-Claude Code 的預設是 [接 Claude Code](#接-claude-code) 那節的 channel shim：它代替 session 讀 `/monitor`，Claude 不用做任何事。下面兩條是舊路徑，給載不了 channel 的 session。三條的終點都是 daemon 裡的 `UnreadWaiterRegistry`，投遞都可靠；差別在傳輸、生命週期與失敗模式：
+前景的 Claude Code session 可以改用 [接 Claude Code](#接-claude-code) 那節的 channel shim：它代替 session 讀 `/monitor`，Claude 不用做任何事；但背景 session 載不了 channel，所以下面兩條仍是預設。三條的終點都是 daemon 裡的 `UnreadWaiterRegistry`，投遞都可靠；差別在傳輸、生命週期與失敗模式：
 
 |                           | `/poll` + Stop-hook shim           | `/monitor` + Monitor tool           |
 |---------------------------|------------------------------------|-------------------------------------|

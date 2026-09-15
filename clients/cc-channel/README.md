@@ -27,7 +27,11 @@
 
    Several channels can share one session; list them space-separated after the flag. A dim line under the startup banner confirms the channel is registered. No line means no channel: messages will not arrive.
 
-3. Leave `SWITCHBOARD_DELIVERY` unset (or set it to `channel`). The SessionStart hook then teaches this path and omits the Monitor instructions.
+3. Export `SWITCHBOARD_DELIVERY=channel` in the environment Claude Code starts from. The SessionStart hook then teaches this path and omits the Monitor instructions.
+
+## Foreground sessions only
+
+Background sessions cannot use this shim as a channel. Neither agent view nor `claude --bg` carries `--dangerously-load-development-channels` into the session, the flag's confirmation prompt has no terminal to answer it, and the job's respawn flags drop it. Verified 2026-09-15: such a session loads the shim as a plain MCP server (tools and `register` work) but never receives a `<channel>` event. Use the Monitor path there, or the socket path once it lands (#20).
 
 ## Environment
 
