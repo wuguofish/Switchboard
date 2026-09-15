@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { buildHookOutput } from '../hook-session-start'
+import { buildHookOutput, resolveDelivery } from '../hook-session-start'
 
 test('buildHookOutput embeds cc_session_id into additionalContext', () => {
   const input = JSON.stringify({ session_id: 'cc-xyz-789', source: 'startup' })
@@ -27,9 +27,9 @@ test('buildHookOutput mentions anonymous fallback', () => {
   expect(out!.hookSpecificOutput.additionalContext).toMatch(/anonymously|anonymous/i)
 })
 
-test('buildHookOutput teaches the Monitor-tool subscription path', () => {
+test('buildHookOutput teaches the Monitor-tool subscription path in monitor delivery', () => {
   const input = JSON.stringify({ session_id: 'cc-monitor-teach' })
-  const out = buildHookOutput(input)
+  const out = buildHookOutput(input, 'monitor')
   const ctx = out!.hookSpecificOutput.additionalContext
   // The instructions must reference the Monitor tool, the /monitor endpoint,
   // the cc_session_id (so Claude can't be tempted to subscribe to someone
@@ -40,4 +40,22 @@ test('buildHookOutput teaches the Monitor-tool subscription path', () => {
   expect(ctx).toContain('inbox')
   expect(ctx).toContain('heartbeat')
   expect(ctx).toContain('read_messages')
+})
+
+test('channel delivery is the default and teaches the channel flag instead of Monitor', () => {
+  const input = JSON.stringify({ session_id: 'cc-channel-teach' })
+  const ctx = buildHookOutput(input, 'channel')!.hookSpecificOutput.additionalContext
+  expect(ctx).toContain('--dangerously-load-development-channels server:switchboard')
+  expect(ctx).toContain('<channel source="switchboard"')
+  expect(ctx).not.toContain('/monitor?cc_session_id=')
+  expect(ctx).toContain('inbox')
+  expect(ctx).toContain('heartbeat')
+  expect(ctx).toContain('read_messages')
+})
+
+test('resolveDelivery falls back to channel for anything but monitor', () => {
+  expect(resolveDelivery(undefined)).toBe('channel')
+  expect(resolveDelivery('channel')).toBe('channel')
+  expect(resolveDelivery('monitor')).toBe('monitor')
+  expect(resolveDelivery('typo')).toBe('channel')
 })

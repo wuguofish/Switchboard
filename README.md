@@ -18,7 +18,8 @@ On top of that it provides:
 - **Recall** for messages you wish you hadn't sent
 - **Auto-wake, two paths**:
   - A Stop-hook shim long-polls `/poll`, so when a message arrives the next Claude Code turn starts with an `INBOX` reminder.
-  - *Or* (recommended for long-lived sessions) Claude Code's `Monitor` tool `curl -N`s `/monitor` as a persistent chunked stream; each inbox line fires an assistant turn directly, sidestepping the known `asyncRewake`-degrades-over-time failure mode.
+  - A [channel shim](clients/cc-channel/README.md) (default for Claude Code) pushes each `/monitor` line into the session as a `<channel>` event, so a message wakes the session with no watch to re-arm.
+  - *Or* Claude Code's `Monitor` tool `curl -N`s `/monitor` as a chunked stream; each inbox line fires an assistant turn, but since Claude Code 2.1.271 the watch expires every 30 minutes and must be re-armed.
 - **Persistence** — messages live in SQLite and survive daemon restarts
 
 Everything is bound to `127.0.0.1` with no authentication, which makes it safe for intra-machine coordination but never appropriate to expose to a network.
@@ -127,7 +128,32 @@ console-close caveat.
 
 ## Wire up Claude Code
 
-1. Add the MCP server to your workspace's `.mcp.json`:
+Pick one delivery path for the session. It decides how the MCP server is wired and what the hook teaches Claude:
+
+|                         | `channel` (default)                                                    | `monitor` (legacy, Claude Code < 2.1.224 or no channel flag)         | `socket` (planned, #20) |
+|-------------------------|------------------------------------------------------------------------|-----------------------------------------------------------------------|--------------------------|
+| How a message wakes the session | The `switchboard` stdio server pushes a `<channel>` event into the conversation | Claude arms the `Monitor` tool on `/monitor`, re-arms every 30 minutes | Daemon writes to the session's inbox socket |
+| Launch                  | `claude --dangerously-load-development-channels server:switchboard`    | plain `claude`                                                        | plain `claude`           |
+| Required setting        | none                                                                   | none                                                                  | `crossSessionInbound: accept` |
+| Per-session cost        | one Bun process, ~45 MB                                                | bash + curl, ~17 MB, plus a cold start every 30 minutes               | none                     |
+| When it is misconfigured | Loud: no channel line under the startup banner, nothing arrives       | Loud: expiry notice every 30 minutes until Claude re-arms             | Silent: messages held for approval, dropped after 5 minutes |
+
+Set `SWITCHBOARD_DELIVERY` in the environment Claude Code starts from (`channel` when unset, or `monitor`). The hook reads it and describes only the chosen path.
+
+1. Add the MCP server to your workspace's `.mcp.json`. For `channel`, point it at the shim (see [`clients/cc-channel/`](clients/cc-channel/README.md)):
+
+    ```json
+    {
+      "mcpServers": {
+        "switchboard": {
+          "command": "bun",
+          "args": ["/absolute/path/to/Switchboard/clients/cc-channel/switchboard-channel.ts"]
+        }
+      }
+    }
+    ```
+
+    For `monitor`, connect to the daemon directly:
 
     ```json
     {
@@ -270,7 +296,7 @@ Bun's `idleTimeout` caps individual `/poll` waits at ~250s, so shims loop. `/mon
 
 ## Wake paths — which one, when?
 
-Both `/poll` and `/monitor` end at the same place (the `UnreadWaiterRegistry` inside the daemon), so either delivers messages reliably. They differ in transport, lifetime, and failure mode:
+The default for Claude Code is the channel shim described under [Wire up Claude Code](#wire-up-claude-code): it reads `/monitor` on the session's behalf and needs nothing from Claude. The two paths below are the legacy ones for sessions that cannot load a channel. All three end at the same place (the `UnreadWaiterRegistry` inside the daemon), so each delivers messages reliably; they differ in transport, lifetime, and failure mode:
 
 |                         | `/poll` + Stop-hook shim               | `/monitor` + Monitor tool                |
 |-------------------------|----------------------------------------|------------------------------------------|
