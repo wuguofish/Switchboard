@@ -190,13 +190,15 @@ Verified 2026-09-15: a `claude --bg` session launched with the channel flag load
 
 ### Getting Claude to register
 
-The `SessionStart` hook first tells Claude when Switchboard is the right tool: Claude Code ↔ Claude Code on the same machine goes through native `SendMessage`; cross-vendor peers, broadcasts, and being reachable by either are what registration is for. It then explains *how* to register, but Claude still needs a nudge to actually do it (and to decide on a role name). Two options:
+The `SessionStart` hook first tells Claude when Switchboard is the right tool: Claude Code ↔ Claude Code on the same machine goes through native `SendMessage`; cross-vendor peers, broadcasts, and being reachable by either are what registration is for. It then explains *how* to register, but Claude still needs a nudge to actually do it. Two options:
 
 **Ad hoc** — just say it in your first message:
 
-> Please register with switchboard as `my-role-name`.
+> Please register with switchboard.
 
-Claude will see the injected `cc_session_id` from the hook and call `mcp__switchboard__register(role='my-role-name', cc_session_id=...)`.
+Claude will see the injected `cc_session_id` from the hook and call `mcp__switchboard__register(cc_session_id=...)`.
+
+**The alias is the session name.** A Claude Code session's Switchboard alias is the name `ListAgents` shows, the one you set with `/rename`. The daemon reads it from `~/.claude/sessions/<pid>.json` on every register and every 15 seconds, so a rename shows up on Switchboard by itself and `set_alias` is refused on a named session (rename instead). New sessions, foreground or background, start unnamed and show the first eight characters of their id; the hook tells such a session to register with a placeholder `role`, which the real name replaces as soon as you `/rename`. One name for one session everywhere: what you call it in the agents view is what peers put in `to`.
 
 **Persistent** — add to your workspace's `CLAUDE.md` (or the user-global one):
 
@@ -206,10 +208,10 @@ Claude will see the injected `cc_session_id` from the hook and call `mcp__switch
 On your first turn in this workspace, register with switchboard using the
 cc_session_id from the SessionStart additionalContext:
 
-    mcp__switchboard__register(role='<role-name>', cc_session_id='<cc_session_id>')
+    mcp__switchboard__register(cc_session_id='<cc_session_id>')
 
-Pick a role name that describes what this session is doing (e.g. `tools`,
-`docs`, `bug-triage`). If the role is taken, try a variant. Skipping
+Your alias is this session's name (the user sets it with /rename); pass
+role='<placeholder>' only while the session is still unnamed. Skipping
 registration leaves the session anonymous on Switchboard — fine when the
 only peers you talk to are Claude Code sessions on this machine, which
 native SendMessage already reaches.
@@ -223,8 +225,8 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
-| `register` | `role?`, `cc_session_id?` | `{session_id, alias, anonymous}` |
-| `set_alias` | `alias` | `{old_alias, new_alias}` |
+| `register` | `role?`, `cc_session_id?` | `{session_id, alias, anonymous}` — with `cc_session_id`, the alias is the Claude Code session name when the session has one; `role` is the placeholder until then |
+| `set_alias` | `alias` | `{old_alias, new_alias}` — refused on a named Claude Code session (rename the session instead) |
 | `send` | `to`, `message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`, `scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}` — only mail no wake has carried; mail delivered by a wake is already read |

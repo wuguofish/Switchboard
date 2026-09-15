@@ -189,13 +189,15 @@ socket 路徑的原理：Claude Code 2.1.224 起每個 session 綁一個 Unix do
 
 ### 讓 Claude 真的去 register
 
-`SessionStart` hook 會先告訴 Claude 什麼時候該用 Switchboard：同一台機器上 Claude Code 之間走原生 `SendMessage`；跨廠同伴、廣播、以及要被這兩者找到，才是 register 的用途。接著才說明 *怎麼* register，但實際上仍需要推一把讓它動作（以及決定 role 名字）。兩種做法：
+`SessionStart` hook 會先告訴 Claude 什麼時候該用 Switchboard：同一台機器上 Claude Code 之間走原生 `SendMessage`；跨廠同伴、廣播、以及要被這兩者找到，才是 register 的用途。接著才說明 *怎麼* register，但實際上仍需要推一把讓它動作。兩種做法：
 
 **臨時指示** — 在第一句對話直接講：
 
-> 請用 `my-role-name` 這個 role 向 switchboard 註冊。
+> 請向 switchboard 註冊。
 
-Claude 會從 hook 注入的 `cc_session_id` 拿到值，然後呼叫 `mcp__switchboard__register(role='my-role-name', cc_session_id=...)`。
+Claude 會從 hook 注入的 `cc_session_id` 拿到值，然後呼叫 `mcp__switchboard__register(cc_session_id=...)`。
+
+**別名就是 session 名字。** Claude Code session 在 Switchboard 上的別名，就是 `ListAgents` 顯示、你用 `/rename` 取的那個名字。daemon 在每次 register 和每 15 秒從 `~/.claude/sessions/<pid>.json` 讀一次，所以改名會自己反映到 Switchboard，有名字的 session 呼叫 `set_alias` 會被拒絕（請改名）。新 session 不分前景背景一開始都沒有名字，顯示的是 id 前 8 碼；hook 會叫這種 session 先帶一個暫用的 `role` 註冊，等你 `/rename` 之後真名自動接手。一個 session 到處都是同一個名字：你在 agents view 叫它什麼，同伴的 `to` 就填什麼。
 
 **常駐提示** — 寫進 workspace 的 `CLAUDE.md`（或全域的那份）：
 
@@ -205,10 +207,10 @@ Claude 會從 hook 注入的 `cc_session_id` 拿到值，然後呼叫 `mcp__swit
 進入這個 workspace 的第一個 turn，用 SessionStart additionalContext 裡的
 cc_session_id 向 switchboard 註冊：
 
-    mcp__switchboard__register(role='<role-name>', cc_session_id='<cc_session_id>')
+    mcp__switchboard__register(cc_session_id='<cc_session_id>')
 
-Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`docs`、
-`bug-triage`）。如果撞名就換一個。沒 register 的話 session 在 Switchboard
+你的別名就是這個 session 的名字（使用者用 /rename 取的）；只有 session
+還沒名字時才帶 role='<暫用名>'。沒 register 的話 session 在 Switchboard
 上是匿名的——如果你只跟同一台機器上的 Claude Code 對話，原生 SendMessage
 本來就到得了，這樣 OK。
 ```
@@ -221,8 +223,8 @@ Role 名字挑一個能描述這個 session 在做什麼的（例如 `tools`、`
 
 | 工具 | 參數 | 回傳 |
 |------|------|------|
-| `register` | `role?`、`cc_session_id?` | `{session_id, alias, anonymous}` |
-| `set_alias` | `alias` | `{old_alias, new_alias}` |
+| `register` | `role?`、`cc_session_id?` | `{session_id, alias, anonymous}`——帶 `cc_session_id` 時，session 有名字就以 session 名字為別名；`role` 只是沒名字前的暫用名 |
+| `set_alias` | `alias` | `{old_alias, new_alias}`——有名字的 Claude Code session 會被拒絕（請改 session 名字） |
 | `send` | `to`、`message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`、`scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}`——只回沒有任何喚醒帶走的信；喚醒送到的已是已讀 |

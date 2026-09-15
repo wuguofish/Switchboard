@@ -26,6 +26,8 @@ import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
 import { crossSessionInboundSetting, inboxWakeText, wakeInboxSocket } from './inbox-socket'
 import { inboxDeliveryLine, inboxDeliveryText, type InboxDelivery } from './inbox-delivery'
+import { readSessionNames, sessionNameFor } from './session-names'
+import { defaultSessionsDir } from './inbox-socket'
 import type { BroadcastScope, ClientKind, SessionRow } from './types'
 import { isSessionOnline } from './online'
 
@@ -169,10 +171,37 @@ export async function startServer(opts: {
    * and mail marked read on the way out would be lost with it.
    */
   deliverContentOverSocket?: boolean
+  /** Where Claude Code keeps its per-session registry (name, socket). */
+  sessionsDir?: string
+  /** How often aliases are re-read from that registry. */
+  sessionNameSyncMs?: number
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
   const deliverContentOverSocket =
     opts.deliverContentOverSocket ?? (crossSessionInboundSetting() === 'accept')
+  const sessionsDir = opts.sessionsDir ?? defaultSessionsDir()
+
+  /**
+   * Claude Code aliases follow the session name. Runs on a timer and right
+   * after every register, so a fresh session gets its name at once and a
+   * /rename shows up within one tick. A name already used by another active
+   * row is left alone and logged rather than stolen.
+   */
+  function mirrorSessionNames(): void {
+    const names = readSessionNames(sessionsDir)
+    for (const row of listAllSessions(db)) {
+      if (row.client_kind !== 'claude_code' || row.released_at !== null || !row.client_session_id) continue
+      const name = names.get(row.client_session_id)
+      if (!name || name === row.alias) continue
+      try {
+        setAliasWithCollisionCheck(db, row.id, name)
+        process.stderr.write(`switchboard: alias ${row.alias ?? '(anonymous)'} -> ${name} (follows session name)\n`)
+      } catch (err) {
+        process.stderr.write(`switchboard: alias for ${row.alias ?? row.id} stays: ${err instanceof Error ? err.message : err}\n`)
+      }
+    }
+  }
+  const sessionNameTimer = setInterval(mirrorSessionNames, opts.sessionNameSyncMs ?? 15_000)
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
   const waiters = new UnreadWaiterRegistry()
@@ -699,6 +728,7 @@ export async function startServer(opts: {
           generation = findSessionById(db, sessionId)!.generation
         }
 
+        mirrorSessionNames()
         currentSwitchboardId = sessionId
         currentGeneration = generation
         currentOwnsLifecycle = ownsLifecycle
@@ -733,7 +763,8 @@ export async function startServer(opts: {
         }
         if (anonymous) {
           responseBody.hint =
-            'You are anonymous. Call set_alias(role) to give yourself a name.'
+            'You are anonymous. Your alias follows your Claude Code session name once the user sets one (/rename); ' +
+            'until then call set_alias(role) for a placeholder.'
         }
 
         return {
@@ -753,6 +784,15 @@ export async function startServer(opts: {
         // Look up current alias before changing
         const session = findSessionById(db, currentSwitchboardId)
         const oldAlias = session?.alias ?? null
+        if (session?.client_kind === 'claude_code' && session.client_session_id) {
+          const sessionName = sessionNameFor(session.client_session_id, sessionsDir)
+          if (sessionName) {
+            throw new Error(
+              `alias follows the Claude Code session name "${sessionName}"; ` +
+              'rename the session (/rename) instead of calling set_alias',
+            )
+          }
+        }
 
         // Will throw AliasCollisionError if taken by another session
         setAliasWithCollisionCheck(db, currentSwitchboardId, alias)
@@ -1391,6 +1431,7 @@ export async function startServer(opts: {
 
   return {
     async stop(): Promise<void> {
+      clearInterval(sessionNameTimer)
       // Stop retention loop first (before closing DB)
       retention.stop()
 

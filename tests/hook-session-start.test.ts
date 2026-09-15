@@ -53,6 +53,23 @@ test('channel delivery teaches the channel flag instead of Monitor', () => {
   expect(ctx).toContain('read_messages')
 })
 
+test('a named session is told its alias is its session name and not to pass a role', () => {
+  const input = JSON.stringify({ session_id: 'cc-named-hook' })
+  const ctx = buildHookOutput(input, 'socket', 'accept', 'RCTX阿宇')!.hookSpecificOutput.additionalContext
+  expect(ctx).toContain("mcp__switchboard__register(cc_session_id='cc-named-hook')")
+  expect(ctx).toContain('named "RCTX阿宇"')
+  expect(ctx).not.toContain("role='<your-role-name>'")
+  expect(ctx).not.toContain('no name yet')
+})
+
+test('an unnamed session is told to register a placeholder and that /rename takes over', () => {
+  const input = JSON.stringify({ session_id: 'cc-unnamed-hook' })
+  const ctx = buildHookOutput(input, 'socket', 'accept', null)!.hookSpecificOutput.additionalContext
+  expect(ctx).toContain('no name yet')
+  expect(ctx).toContain("role='<placeholder>'")
+  expect(ctx).toContain('/rename')
+})
+
 test('resolveDelivery defaults to socket; channel and monitor are explicit opt-in', () => {
   expect(resolveDelivery(undefined)).toBe('socket')
   expect(resolveDelivery('socket')).toBe('socket')

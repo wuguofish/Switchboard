@@ -1,4 +1,7 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { parseInboxDeliveryLine } from '../inbox-delivery'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -6,14 +9,23 @@ import { startServer } from '../server'
 import type { ServerHandle } from '../server'
 
 let handle: ServerHandle
+let sessionsDir: string
 const TEST_PORT = 19876
 const TEST_URL = `http://127.0.0.1:${TEST_PORT}/mcp`
 
+/** Simulate Claude Code's ~/.claude/sessions/<pid>.json for one session. */
+function nameSession(pid: number, sessionId: string, name: string): void {
+  writeFileSync(join(sessionsDir, `${pid}.json`), JSON.stringify({ pid, sessionId, name, peerProtocol: 1 }))
+}
+
 beforeEach(async () => {
+  sessionsDir = mkdtempSync(join(tmpdir(), 'sb-sessions-'))
   handle = await startServer({
     port: TEST_PORT,
     dbPath: ':memory:',
     ownerLeaseTtlMs: 50,
+    sessionsDir,
+    sessionNameSyncMs: 100,
   })
 })
 
@@ -342,6 +354,54 @@ test('read_messages marks as read (second call returns empty)', async () => {
 
   await a.close()
   await b.close()
+})
+
+test('a named Claude Code session gets its session name as alias, whatever role it passed', async () => {
+  nameSession(101, 'cc-named', '戰情看板阿宇')
+  const c = await makeClient('named')
+  const reg = JSON.parse(((await c.callTool({
+    name: 'register', arguments: { role: 'placeholder', cc_session_id: 'cc-named' },
+  })).content as any[])[0].text)
+  expect(reg.alias).toBe('戰情看板阿宇')
+  await c.close()
+})
+
+test('an unnamed session keeps its placeholder role until a name appears, then follows it', async () => {
+  nameSession(102, 'cc-unnamed', 'cc-unnam')  // 8-char id prefix = no name yet
+  const c = await makeClient('unnamed')
+  const reg = JSON.parse(((await c.callTool({
+    name: 'register', arguments: { role: 'scratch', cc_session_id: 'cc-unnamed' },
+  })).content as any[])[0].text)
+  expect(reg.alias).toBe('scratch')
+
+  nameSession(102, 'cc-unnamed', 'RCTX阿宇')  // the user ran /rename
+  await new Promise((r) => setTimeout(r, 350))
+  const list = JSON.parse(((await c.callTool({ name: 'list_sessions', arguments: {} })).content as any[])[0].text)
+  expect(list.map((s: any) => s.alias)).toContain('RCTX阿宇')
+  expect(list.map((s: any) => s.alias)).not.toContain('scratch')
+  await c.close()
+})
+
+test('set_alias is refused on a named Claude Code session and points at /rename', async () => {
+  nameSession(103, 'cc-fixed', 'LINE總機')
+  const c = await makeClient('fixed')
+  await c.callTool({ name: 'register', arguments: { cc_session_id: 'cc-fixed' } })
+  await expect(c.callTool({ name: 'set_alias', arguments: { alias: 'something-else' } }))
+    .rejects.toThrow(/\/rename/)
+  await c.close()
+})
+
+test('a name already held by another active session is not stolen', async () => {
+  const holder = await makeClient('holder')
+  await holder.callTool({ name: 'register', arguments: { role: 'RCTX阿宇', cc_session_id: 'cc-holder' } })
+  nameSession(104, 'cc-late', 'RCTX阿宇')
+  const late = await makeClient('late')
+  const reg = JSON.parse(((await late.callTool({
+    name: 'register', arguments: { role: 'late-placeholder', cc_session_id: 'cc-late' },
+  })).content as any[])[0].text)
+  expect(reg.alias).toBe('late-placeholder')
+  await holder.close()
+  await late.close()
 })
 
 test('list_sessions includes all registered with online flag', async () => {
