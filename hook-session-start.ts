@@ -41,9 +41,15 @@ is the dedicated wake path — no Stop-hook shim required:
 
   Monitor({
     description: 'switchboard inbox',
-    persistent: true,
+    timeout_ms: 1800000,
     command: 'while :; do curl -sN http://127.0.0.1:9876/monitor?cc_session_id=${cc_session_id} || true; sleep 5; done',
   })
+
+Claude Code 2.1.271 removed Monitor's no-timeout \`persistent\` option: every
+watch now has a deadline of at most 30 minutes (10 in \`-p\` runs). When it
+expires you get one notice saying so — re-arm with the same call to stay
+subscribed. A session that ignores that notice silently stops being reachable,
+so treat the expiry notice as work, not noise.
 
 Each line on the stream becomes a notification:
   hello <alias>             -> baseline on connect, no action needed
@@ -68,9 +74,13 @@ The heartbeat interval defaults to 4 hours and is yours to set — append
 
 Why the default is that long: every heartbeat wake is a cold start, because
 the prompt cache has expired by then, so the whole context is rewritten at
-cache-write price. The interval is therefore a direct cost knob — doubling it
-halves the idle burn. Sessions on a fixed cadence (scheduled reminders) should
-shorten it; sessions that are purely on standby can lengthen it.`
+cache-write price. Sessions on a fixed cadence (scheduled reminders) should
+shorten it; sessions that are purely on standby can lengthen it.
+
+Note since 2.1.271: the 30-minute watch deadline now sets the floor on idle
+wakes, so a heartbeat longer than 30 minutes no longer lowers the wake rate —
+the re-arm notice arrives first either way. Lengthening the heartbeat past
+30 minutes only stops the clock tick, not the cold start.`
 
   return {
     hookSpecificOutput: {

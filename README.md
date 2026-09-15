@@ -282,10 +282,12 @@ In the session you want to keep reachable, start the `Monitor` tool after `regis
 ```
 Monitor({
   description: 'switchboard inbox for <my-alias>',
-  persistent: true,
+  timeout_ms: 1800000,
   command: 'while :; do curl -sN "http://127.0.0.1:9876/monitor?cc_session_id=<cc_session_id>" || true; sleep 5; done',
 })
 ```
+
+Claude Code 2.1.271 removed Monitor's no-timeout `persistent` option — every watch now has a deadline of at most 30 minutes (10 in `-p` runs) and Claude gets one notice when it expires. **Re-arm on that notice**: a session that treats it as noise silently stops being reachable. This also puts a floor on idle wakes, so a `heartbeat_secs` longer than 30 minutes no longer lowers the wake rate.
 
 The `while … sleep 5` wrapper auto-reconnects if the daemon restarts or the TCP connection blips. Advanced subscribers can `grep --line-buffered "^inbox "` to suppress `hello`/`heartbeat` noise once the stream is known to be healthy.
 
