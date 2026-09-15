@@ -134,7 +134,7 @@ powershell -File install-task.ps1
 | 訊息怎麼叫醒 session | `switchboard` stdio server 把 `<channel>` 事件直接推進對話          | Claude 用 `Monitor` tool 掛 `/monitor`，每 30 分鐘重掛一次               | daemon 直接寫 session 的 inbox socket |
 | 啟動           | `claude --dangerously-load-development-channels server:switchboard`   | 一般 `claude`                                                           | 一般 `claude`             |
 | 必要設定       | 無                                                                    | 無                                                                      | `crossSessionInbound: accept` |
-| 每 session 成本 | 一支 Bun 行程，約 45 MB                                               | bash＋curl 約 17 MB，外加每 30 分鐘一次冷啟動                            | 無                        |
+| 每 session 成本 | 一支 Bun 行程，約 80 MB                                               | bash＋curl 約 17 MB，外加每 30 分鐘一次冷啟動                            | 無                        |
 | 設錯時         | 大聲：啟動畫面沒有 channel 那行，訊息一封都不來                        | 大聲：每 30 分鐘一次到期通知直到 Claude 重掛                             | 安靜：訊息被扣住等核准，5 分鐘後丟棄 |
 
 在啟動 Claude Code 的環境設 `SWITCHBOARD_DELIVERY`（未設＝`channel`，或 `monitor`）。hook 會讀它，只講被選的那一條。

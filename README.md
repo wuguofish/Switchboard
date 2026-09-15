@@ -135,7 +135,7 @@ Pick one delivery path for the session. It decides how the MCP server is wired a
 | How a message wakes the session | The `switchboard` stdio server pushes a `<channel>` event into the conversation | Claude arms the `Monitor` tool on `/monitor`, re-arms every 30 minutes | Daemon writes to the session's inbox socket |
 | Launch                  | `claude --dangerously-load-development-channels server:switchboard`    | plain `claude`                                                        | plain `claude`           |
 | Required setting        | none                                                                   | none                                                                  | `crossSessionInbound: accept` |
-| Per-session cost        | one Bun process, ~45 MB                                                | bash + curl, ~17 MB, plus a cold start every 30 minutes               | none                     |
+| Per-session cost        | one Bun process, ~80 MB                                                | bash + curl, ~17 MB, plus a cold start every 30 minutes               | none                     |
 | When it is misconfigured | Loud: no channel line under the startup banner, nothing arrives       | Loud: expiry notice every 30 minutes until Claude re-arms             | Silent: messages held for approval, dropped after 5 minutes |
 
 Set `SWITCHBOARD_DELIVERY` in the environment Claude Code starts from (`channel` when unset, or `monitor`). The hook reads it and describes only the chosen path.
