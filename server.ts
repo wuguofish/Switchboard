@@ -26,7 +26,7 @@ import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
 import { crossSessionInboundSetting, inboxWakeText, wakeInboxSocket } from './inbox-socket'
 import { inboxDeliveryLine, inboxDeliveryText, type InboxDelivery } from './inbox-delivery'
-import { readSessionNames, sessionNameFor } from './session-names'
+import { isProcessAlive, readSessionRecords, sessionNameFor } from './session-names'
 import { defaultSessionsDir } from './inbox-socket'
 import type { BroadcastScope, ClientKind, SessionRow } from './types'
 import { isSessionOnline } from './online'
@@ -180,21 +180,32 @@ export async function startServer(opts: {
   const sessionsDir = opts.sessionsDir ?? defaultSessionsDir()
 
   /**
-   * Claude Code aliases follow the session name. Runs whenever anyone uses
+   * Claude Code rows follow the sessions directory. Runs whenever anyone uses
    * Switchboard (every HTTP request and every MCP tool call), which is the
-   * only time a name matters: the next send after a /rename resolves the new
-   * name. A name already used by another active row is left alone and logged
+   * only time it matters:
+   *   - the alias becomes the session name, so the next send after a /rename
+   *     resolves the new name;
+   *   - a row released by a daemon restart comes back under its session name
+   *     while the process is still running, so nobody re-registers;
+   *   - a running session's lease is renewed, because the socket path can
+   *     reach it whether or not it holds an MCP connection.
+   * A name already used by another active row is left alone and logged
    * rather than stolen.
    */
   function mirrorSessionNames(): void {
-    const names = readSessionNames(sessionsDir)
+    const records = new Map(readSessionRecords(sessionsDir).map((record) => [record.sessionId, record]))
     for (const row of listAllSessions(db)) {
-      if (row.client_kind !== 'claude_code' || row.released_at !== null || !row.client_session_id) continue
-      const name = names.get(row.client_session_id)
-      if (!name || name === row.alias) continue
+      if (row.client_kind !== 'claude_code' || !row.client_session_id) continue
+      const record = records.get(row.client_session_id)
+      if (!record) continue
+      const alive = isProcessAlive(record.pid)
+      if (row.released_at !== null && !alive) continue
+      if (alive && row.owner_token === null) updateLastSeen(db, row.id)
+      if (!record.name || record.name === row.alias) continue
+      const why = row.released_at !== null ? 'revived after release' : 'follows session name'
       try {
-        setAliasWithCollisionCheck(db, row.id, name)
-        process.stderr.write(`switchboard: alias ${row.alias ?? '(anonymous)'} -> ${name} (follows session name)\n`)
+        setAliasWithCollisionCheck(db, row.id, record.name)
+        process.stderr.write(`switchboard: alias ${row.alias ?? '(anonymous)'} -> ${record.name} (${why})\n`)
       } catch (err) {
         process.stderr.write(`switchboard: alias for ${row.alias ?? row.id} stays: ${err instanceof Error ? err.message : err}\n`)
       }

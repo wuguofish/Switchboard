@@ -17,14 +17,21 @@ export function isPlaceholderName(name: string | null | undefined, sessionId: st
   return name === sessionId.slice(0, 8)
 }
 
-/** Session id → real name, for every registered Claude Code process that has one. */
-export function readSessionNames(sessionsDir = defaultSessionsDir()): Map<string, string> {
-  const names = new Map<string, string>()
+export interface SessionRecord {
+  sessionId: string
+  pid: number
+  /** The session name, or null while the session still carries a placeholder. */
+  name: string | null
+}
+
+/** Every Claude Code process registered in the sessions directory. */
+export function readSessionRecords(sessionsDir = defaultSessionsDir()): SessionRecord[] {
+  const records: SessionRecord[] = []
   let files: string[]
   try {
     files = readdirSync(sessionsDir)
   } catch {
-    return names
+    return records
   }
   for (const file of files) {
     if (!file.endsWith('.json')) continue
@@ -34,13 +41,34 @@ export function readSessionNames(sessionsDir = defaultSessionsDir()): Map<string
     } catch {
       continue
     }
-    const sessionId = record.sessionId
-    const name = record.name
-    if (typeof sessionId !== 'string' || typeof name !== 'string') continue
-    if (isPlaceholderName(name, sessionId)) continue
-    names.set(sessionId, name)
+    const { sessionId, pid, name } = record
+    if (typeof sessionId !== 'string' || typeof pid !== 'number') continue
+    records.push({
+      sessionId,
+      pid,
+      name: typeof name === 'string' && !isPlaceholderName(name, sessionId) ? name : null,
+    })
+  }
+  return records
+}
+
+/** Session id → real name, for every registered Claude Code process that has one. */
+export function readSessionNames(sessionsDir = defaultSessionsDir()): Map<string, string> {
+  const names = new Map<string, string>()
+  for (const record of readSessionRecords(sessionsDir)) {
+    if (record.name) names.set(record.sessionId, record.name)
   }
   return names
+}
+
+/** A registry file can outlive a crashed Claude Code; check the process too. */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 export function sessionNameFor(ccSessionId: string, sessionsDir = defaultSessionsDir()): string | null {

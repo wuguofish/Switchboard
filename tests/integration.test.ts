@@ -390,6 +390,30 @@ test('set_alias is refused on a named Claude Code session and points at /rename'
   await c.close()
 })
 
+test('a released row comes back under its session name while the process lives', async () => {
+  nameSession(process.pid, 'cc-revive', '戰情看板阿宇')
+  const c = await makeClient('revive')
+  await c.callTool({ name: 'register', arguments: { cc_session_id: 'cc-revive' } })
+  await c.callTool({ name: 'unregister', arguments: {} })  // what a daemon restart does to every row
+  await c.close()
+
+  const other = await makeClient('other')
+  const list = JSON.parse(((await other.callTool({ name: 'list_sessions', arguments: {} })).content as any[])[0].text)
+  const revived = list.find((s: any) => s.alias === '戰情看板阿宇')
+  expect(revived?.online).toBe(true)
+  await other.close()
+})
+
+test('a released row whose process is gone stays released', async () => {
+  nameSession(999_999, 'cc-dead', '幽靈阿宇')
+  const c = await makeClient('dead')
+  await c.callTool({ name: 'register', arguments: { cc_session_id: 'cc-dead' } })
+  await c.callTool({ name: 'unregister', arguments: {} })
+  const list = JSON.parse(((await c.callTool({ name: 'list_sessions', arguments: {} })).content as any[])[0].text)
+  expect(list.map((s: any) => s.alias)).not.toContain('幽靈阿宇')
+  await c.close()
+})
+
 test('a name already held by another active session is not stolen', async () => {
   const holder = await makeClient('holder')
   await holder.callTool({ name: 'register', arguments: { role: 'RCTX阿宇', cc_session_id: 'cc-holder' } })

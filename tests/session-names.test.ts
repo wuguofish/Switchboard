@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { isPlaceholderName, readSessionNames, sessionNameFor } from '../session-names'
+import { isPlaceholderName, isProcessAlive, readSessionNames, readSessionRecords, sessionNameFor } from '../session-names'
 
 function fixtureDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'sb-names-'))
@@ -31,6 +31,21 @@ describe('readSessionNames', () => {
   })
   test('missing directory yields an empty map', () => {
     expect(readSessionNames('/nonexistent/sessions').size).toBe(0)
+  })
+})
+
+describe('readSessionRecords', () => {
+  test('keeps every process, with null name for placeholders', () => {
+    expect(readSessionRecords(fixtureDir()).map((r) => [r.pid, r.name]).sort((x, y) => (x[0] as number) - (y[0] as number))).toEqual([
+      [1, 'LINE總機-關東煮阿宇'], [2, null], [3, null],
+    ])
+  })
+})
+
+describe('isProcessAlive', () => {
+  test('this process is alive; an absurd pid is not', () => {
+    expect(isProcessAlive(process.pid)).toBe(true)
+    expect(isProcessAlive(999_999)).toBe(false)
   })
 })
 
