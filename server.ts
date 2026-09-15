@@ -173,8 +173,6 @@ export async function startServer(opts: {
   deliverContentOverSocket?: boolean
   /** Where Claude Code keeps its per-session registry (name, socket). */
   sessionsDir?: string
-  /** How often aliases are re-read from that registry. */
-  sessionNameSyncMs?: number
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
   const deliverContentOverSocket =
@@ -182,10 +180,11 @@ export async function startServer(opts: {
   const sessionsDir = opts.sessionsDir ?? defaultSessionsDir()
 
   /**
-   * Claude Code aliases follow the session name. Runs on a timer and right
-   * after every register, so a fresh session gets its name at once and a
-   * /rename shows up within one tick. A name already used by another active
-   * row is left alone and logged rather than stolen.
+   * Claude Code aliases follow the session name. Runs whenever anyone uses
+   * Switchboard (every HTTP request and every MCP tool call), which is the
+   * only time a name matters: the next send after a /rename resolves the new
+   * name. A name already used by another active row is left alone and logged
+   * rather than stolen.
    */
   function mirrorSessionNames(): void {
     const names = readSessionNames(sessionsDir)
@@ -201,7 +200,6 @@ export async function startServer(opts: {
       }
     }
   }
-  const sessionNameTimer = setInterval(mirrorSessionNames, opts.sessionNameSyncMs ?? 15_000)
   const registry = new ConnectionRegistry()
   const retention = startRetentionLoop(db, registry)
   const waiters = new UnreadWaiterRegistry()
@@ -668,6 +666,7 @@ export async function startServer(opts: {
     // --- Call tool ---
     mcpServer.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { name, arguments: args } = req.params
+      mirrorSessionNames()
 
       if (name === 'register') {
         const argsObj = (args as Record<string, unknown>) ?? {}
@@ -728,7 +727,7 @@ export async function startServer(opts: {
           generation = findSessionById(db, sessionId)!.generation
         }
 
-        mirrorSessionNames()
+        mirrorSessionNames()  // a just-created row gets its name before the response
         currentSwitchboardId = sessionId
         currentGeneration = generation
         currentOwnsLifecycle = ownsLifecycle
@@ -1281,6 +1280,7 @@ export async function startServer(opts: {
 
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url)
+      mirrorSessionNames()
 
       if (url.pathname === '/poll') {
         return handlePoll(req, url)
@@ -1431,7 +1431,6 @@ export async function startServer(opts: {
 
   return {
     async stop(): Promise<void> {
-      clearInterval(sessionNameTimer)
       // Stop retention loop first (before closing DB)
       retention.stop()
 

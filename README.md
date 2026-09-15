@@ -198,7 +198,7 @@ The `SessionStart` hook first tells Claude when Switchboard is the right tool: C
 
 Claude will see the injected `cc_session_id` from the hook and call `mcp__switchboard__register(cc_session_id=...)`.
 
-**The alias is the session name.** A Claude Code session's Switchboard alias is the name `ListAgents` shows, the one you set with `/rename`. The daemon reads it from `~/.claude/sessions/<pid>.json` on every register and every 15 seconds, so a rename shows up on Switchboard by itself and `set_alias` is refused on a named session (rename instead). New sessions, foreground or background, start unnamed and show the first eight characters of their id; the hook tells such a session to register with a placeholder `role`, which the real name replaces as soon as you `/rename`. One name for one session everywhere: what you call it in the agents view is what peers put in `to`.
+**The alias is the session name.** A Claude Code session's Switchboard alias is the name `ListAgents` shows, the one you set with `/rename`. The daemon reads it from `~/.claude/sessions/<pid>.json` whenever anyone uses Switchboard (each request and tool call), so a rename is in effect by the next send and `set_alias` is refused on a named session (rename instead). New sessions, foreground or background, start unnamed and show the first eight characters of their id; the hook tells such a session to register with a placeholder `role`, which the real name replaces as soon as you `/rename`. One name for one session everywhere: what you call it in the agents view is what peers put in `to`.
 
 **Persistent** — add to your workspace's `CLAUDE.md` (or the user-global one):
 

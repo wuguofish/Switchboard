@@ -25,7 +25,6 @@ beforeEach(async () => {
     dbPath: ':memory:',
     ownerLeaseTtlMs: 50,
     sessionsDir,
-    sessionNameSyncMs: 100,
   })
 })
 
@@ -375,7 +374,7 @@ test('an unnamed session keeps its placeholder role until a name appears, then f
   expect(reg.alias).toBe('scratch')
 
   nameSession(102, 'cc-unnamed', 'RCTX阿宇')  // the user ran /rename
-  await new Promise((r) => setTimeout(r, 350))
+  // No waiting: the next use of Switchboard re-reads the names.
   const list = JSON.parse(((await c.callTool({ name: 'list_sessions', arguments: {} })).content as any[])[0].text)
   expect(list.map((s: any) => s.alias)).toContain('RCTX阿宇')
   expect(list.map((s: any) => s.alias)).not.toContain('scratch')
