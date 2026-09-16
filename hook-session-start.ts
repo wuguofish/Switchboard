@@ -106,6 +106,9 @@ inbox socket, which starts a new turn carrying them, already marked read.
 Act on them directly; mcp__switchboard__read_messages only returns mail that
 no wake could carry (for example mail that arrived before register). No
 Monitor tool, no channel flag, and it works in background sessions too.
+Register once per session, not per connection: the daemon recognises this
+process on every later connection (daemon restarts included) and binds it
+to the same row, so send and broadcast work without registering again.
 
 ${preflight}`
 }

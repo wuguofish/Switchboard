@@ -414,6 +414,41 @@ test('a released row whose process is gone stays released', async () => {
   await c.close()
 })
 
+test('a later connection from the same process is bound to its row without register', async () => {
+  nameSession(process.pid, 'cc-auto', 'AutoBound阿宇')
+  const first = await makeClient('first')
+  await first.callTool({ name: 'register', arguments: { cc_session_id: 'cc-auto' } })
+  await first.close()
+
+  const peer = await makeClient('peer')
+  await peer.callTool({ name: 'register', arguments: { role: 'peer-row', cc_session_id: 'cc-peer' } })
+
+  const later = await makeClient('later')  // same process, never calls register
+  const sent = JSON.parse(((await later.callTool({
+    name: 'send', arguments: { to: 'peer-row', message: 'hello from an unregistered connection' },
+  })).content as any[])[0].text)
+  expect(sent.message_id).toBeString()
+  const inbox = JSON.parse(((await peer.callTool({ name: 'read_messages', arguments: {} })).content as any[])[0].text)
+  expect(inbox.messages.map((m: any) => m.sender_alias)).toEqual(['AutoBound阿宇'])
+
+  await later.close()
+  await peer.close()
+})
+
+test('register without cc_session_id from a Claude Code process still finds its row', async () => {
+  nameSession(process.pid, 'cc-implicit', 'Implicit阿宇')
+  const c = await makeClient('implicit')
+  const reg = JSON.parse(((await c.callTool({ name: 'register', arguments: {} })).content as any[])[0].text)
+  expect(reg.alias).toBe('Implicit阿宇')
+  await c.close()
+})
+
+test('a process that never registered is not bound to anything', async () => {
+  const c = await makeClient('stranger')
+  await expect(c.callTool({ name: 'send', arguments: { to: 'nobody', message: 'x' } })).rejects.toThrow(/not registered/)
+  await c.close()
+})
+
 test('a name already held by another active session is not stolen', async () => {
   const holder = await makeClient('holder')
   await holder.callTool({ name: 'register', arguments: { role: 'RCTX阿宇', cc_session_id: 'cc-holder' } })

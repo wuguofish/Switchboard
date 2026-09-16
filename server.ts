@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
+import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
 import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
@@ -27,6 +27,7 @@ import { UnreadWaiterRegistry } from './waiters'
 import { crossSessionInboundSetting, inboxWakeText, wakeInboxSocket } from './inbox-socket'
 import { inboxDeliveryLine, inboxDeliveryText, type InboxDelivery } from './inbox-delivery'
 import { isProcessAlive, readSessionRecords, sessionNameFor } from './session-names'
+import { peerPidForClientPort } from './peer-pid'
 import { defaultSessionsDir } from './inbox-socket'
 import type { BroadcastScope, ClientKind, SessionRow } from './types'
 import { isSessionOnline } from './online'
@@ -38,6 +39,11 @@ export interface ServerHandle {
 interface SessionEntry {
   transport: WebStandardStreamableHTTPServerTransport
   mcpServer: Server
+  /** Client-side port of the latest request on this MCP session. */
+  clientPort?: number
+  /** Claude Code session id of the peer process, resolved once per port; null when unknown. */
+  peerCcSessionId?: string | null
+  peerLookupPort?: number
 }
 
 const CLIENT_KINDS: readonly ClientKind[] = ['claude_code', 'codex', 'external']
@@ -517,6 +523,26 @@ export async function startServer(opts: {
   const mcpSessionToSwitchboard = new Map<string, string>()
 
   /**
+   * The Claude Code session behind a loopback connection, found through the
+   * peer process: the connection's owner pid is looked up in /proc and matched
+   * against the pids Claude Code records in its sessions directory.
+   */
+  function peerCcSessionIdForPort(clientPort: number): string | null {
+    const records = readSessionRecords(sessionsDir)
+    const pid = peerPidForClientPort(clientPort, records.map((record) => record.pid))
+    return records.find((record) => record.pid === pid)?.sessionId ?? null
+  }
+
+  function peerCcSessionIdFor(entry: SessionEntry): string | null {
+    if (entry.clientPort === undefined) return null
+    if (entry.peerCcSessionId === undefined || entry.peerLookupPort !== entry.clientPort) {
+      entry.peerCcSessionId = peerCcSessionIdForPort(entry.clientPort)
+      entry.peerLookupPort = entry.clientPort
+    }
+    return entry.peerCcSessionId
+  }
+
+  /**
    * Creates a new Server + Transport pair for a fresh MCP session.
    * The per-switchboard session ID is captured in a closure.
    */
@@ -556,6 +582,60 @@ export async function startServer(opts: {
       { name: 'switchboard', version: '0.1.0' },
       { capabilities: { tools: {} } }
     )
+
+    /** Tie this MCP connection to a switchboard row: notifications, liveness, release on close. */
+    function bindConnection(sessionId: string, generation: number, ownsLifecycle: boolean): void {
+      currentSwitchboardId = sessionId
+      currentGeneration = generation
+      currentOwnsLifecycle = ownsLifecycle
+      if (transport.sessionId) {
+        mcpSessionToSwitchboard.set(transport.sessionId, sessionId)
+      }
+      const pushCallback: PushCallback = (payload) => {
+        mcpServer
+          .notification({
+            method: 'notifications/switchboard/new_message',
+            params: payload as Record<string, unknown>,
+          })
+          .catch(() => {
+            // Notification rejected — transport is likely dead but onclose
+            // may not have fired (TCP reset / SSE break without DELETE).
+            // Drop the leaked registry entry so list_sessions stops
+            // reporting this session as online; retention will release
+            // the DB row on its next tick.
+            registry.unregister(sessionId, pushCallback)
+          })
+      }
+      currentPushCallback = pushCallback
+      registry.register(sessionId, pushCallback)
+    }
+
+    function peerCcSessionId(): string | null {
+      const entry = transport.sessionId ? sessionMap.get(transport.sessionId) : undefined
+      return entry ? peerCcSessionIdFor(entry) : null
+    }
+
+    /**
+     * A Claude Code session that registered once stays reachable for as long
+     * as it runs: every later connection from that process (after a daemon
+     * restart, or a session that never called register on this connection)
+     * is bound to its row by peer pid. Sessions that never registered are
+     * left alone, so Switchboard stays opt-in.
+     */
+    function autoBind(): boolean {
+      if (currentSwitchboardId) return true
+      const ccSessionId = peerCcSessionId()
+      if (!ccSessionId || !findAnySessionByCcSessionId(db, ccSessionId)) return false
+      const row = registerClientSession(db, {
+        alias: null,
+        client_kind: 'claude_code',
+        client_session_id: ccSessionId,
+      })
+      bindConnection(row.id, row.generation, true)
+      mirrorSessionNames()
+      process.stderr.write(`switchboard: connection bound to ${findSessionById(db, row.id)?.alias ?? row.id} by peer process\n`)
+      return true
+    }
 
     // --- List tools ---
     mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -678,13 +758,16 @@ export async function startServer(opts: {
     mcpServer.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { name, arguments: args } = req.params
       mirrorSessionNames()
+      if (name !== 'register') autoBind()
 
       if (name === 'register') {
         const argsObj = (args as Record<string, unknown>) ?? {}
         const role = (argsObj.role as string | undefined) ?? null
-        const cc_session_id = (argsObj.cc_session_id as string | undefined) ?? null
         const clientKindArg = argsObj.client_kind
         const clientSessionIdArg = argsObj.client_session_id
+        // A Claude Code caller need not say who it is: the peer process tells us.
+        const cc_session_id = (argsObj.cc_session_id as string | undefined)
+          ?? (clientKindArg === undefined && clientSessionIdArg === undefined ? peerCcSessionId() : null)
 
         let sessionId: string
         let generation: number
@@ -739,30 +822,7 @@ export async function startServer(opts: {
         }
 
         mirrorSessionNames()  // a just-created row gets its name before the response
-        currentSwitchboardId = sessionId
-        currentGeneration = generation
-        currentOwnsLifecycle = ownsLifecycle
-        if (transport.sessionId) {
-          mcpSessionToSwitchboard.set(transport.sessionId, sessionId)
-        }
-
-        const pushCallback: PushCallback = (payload) => {
-          mcpServer
-            .notification({
-              method: 'notifications/switchboard/new_message',
-              params: payload as Record<string, unknown>,
-            })
-            .catch(() => {
-              // Notification rejected — transport is likely dead but onclose
-              // may not have fired (TCP reset / SSE break without DELETE).
-              // Drop the leaked registry entry so list_sessions stops
-              // reporting this session as online; retention will release
-              // the DB row on its next tick.
-              registry.unregister(sessionId, pushCallback)
-            })
-        }
-        currentPushCallback = pushCallback
-        registry.register(sessionId, pushCallback)
+        bindConnection(sessionId, generation, ownsLifecycle)
 
         const finalAlias = findSessionById(db, sessionId)?.alias ?? null
         const anonymous = finalAlias === null
@@ -784,7 +844,7 @@ export async function startServer(opts: {
 
       if (name === 'set_alias') {
         if (!currentSwitchboardId) {
-          throw new Error('session not registered; call register() first')
+          throw new Error('session not registered; call register(cc_session_id=<your Claude Code session id>) first')
         }
         const alias = (args as Record<string, unknown>)?.alias as string
         if (!alias) {
@@ -818,7 +878,7 @@ export async function startServer(opts: {
       }
 
       if (name === 'send') {
-        if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
+        if (!currentSwitchboardId) throw new Error('session not registered; call register(cc_session_id=<your Claude Code session id>) first')
         const to = (args as Record<string, unknown>)?.to as string
         const message = (args as Record<string, unknown>)?.message as string
         const targetId = resolveTarget(db, to)  // throws UnknownTargetError if not found
@@ -853,7 +913,7 @@ export async function startServer(opts: {
       }
 
       if (name === 'broadcast') {
-        if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
+        if (!currentSwitchboardId) throw new Error('session not registered; call register(cc_session_id=<your Claude Code session id>) first')
         const argsObj = (args as Record<string, unknown>) ?? {}
         const message = argsObj.message as string
         const scope = requireBroadcastScope(argsObj.scope)
@@ -901,7 +961,7 @@ export async function startServer(opts: {
       }
 
       if (name === 'read_messages') {
-        if (!currentSwitchboardId) throw new Error('session not registered; call register() first')
+        if (!currentSwitchboardId) throw new Error('session not registered; call register(cc_session_id=<your Claude Code session id>) first')
         return {
           content: [{
             type: 'text',
@@ -1331,6 +1391,7 @@ export async function startServer(opts: {
       }
 
       const mcpSessionId = req.headers.get('mcp-session-id')
+      const clientPort = bunServer.requestIP(req)?.port
 
       // Liveness signal: any request on an already-registered MCP session
       // (POST for tool calls, GET for SSE reconnects, DELETE for shutdown)
@@ -1380,7 +1441,10 @@ export async function startServer(opts: {
             body: bodyText,
           })
 
-          return transport.handleRequest(newReq, { parsedBody: body })
+          const response = await transport.handleRequest(newReq, { parsedBody: body })
+          const entry = transport.sessionId ? sessionMap.get(transport.sessionId) : undefined
+          if (entry && clientPort !== undefined) entry.clientPort = clientPort
+          return response
         }
 
         // Existing session: route to existing transport
@@ -1405,6 +1469,7 @@ export async function startServer(opts: {
             headers: req.headers,
             body: bodyText,
           })
+          if (clientPort !== undefined) entry.clientPort = clientPort
           return entry.transport.handleRequest(newReq, { parsedBody: body })
         }
 
