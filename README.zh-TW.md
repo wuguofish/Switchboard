@@ -197,7 +197,7 @@ socket 路徑的原理：Claude Code 2.1.224 起每個 session 綁一個 Unix do
 
 Claude 會從 hook 注入的 `cc_session_id` 拿到值，然後呼叫 `mcp__switchboard__register(cc_session_id=...)`。
 
-**別名就是 session 名字。** Claude Code session 在 Switchboard 上的別名，就是 `ListAgents` 顯示、你用 `/rename` 取的那個名字。daemon 在每次有人使用 Switchboard 時（每個請求、每次工具呼叫）從 `~/.claude/sessions/<pid>.json` 讀一次，所以改完名下一封信就生效，有名字的 session 呼叫 `set_alias` 會被拒絕（請改名）。新 session 不分前景背景一開始都沒有名字，顯示的是 id 前 8 碼；hook 會叫這種 session 先帶一個暫用的 `role` 註冊，等你 `/rename` 之後真名自動接手。一個 session 到處都是同一個名字：你在 agents view 叫它什麼，同伴的 `to` 就填什麼。同一輪掃描也會把 daemon 重啟時釋放掉的列救回來（只要 Claude Code 行程還活著），並替活著的 session 續 lease；daemon 重啟後沒有人需要重新 register。
+**別名就是 session 名字。** Claude Code session 在 Switchboard 上的別名，就是 `ListAgents` 顯示、你用 `/rename` 取的那個名字。daemon 在每次有人使用 Switchboard 時（每個請求、每次工具呼叫）從 `~/.claude/sessions/<pid>.json` 讀一次，所以改完名下一封信就生效，有名字的 session 呼叫 `set_alias` 會被拒絕（請改名）。新 session 不分前景背景一開始都沒有名字，顯示的是 id 前 8 碼；hook 會叫這種 session 先帶一個暫用的 `role` 註冊，等你 `/rename` 之後真名自動接手。一個 session 到處都是同一個名字：你在 agents view 叫它什麼，同伴的 `to` 就填什麼。同一輪掃描也會把 daemon 重啟時釋放掉的列救回來（只要 Claude Code 行程還活著），並替活著的 session 續 lease；daemon 重啟後沒有人需要重新 register。寄信也不用再報到：daemon 透過 `/proc` 認出每條本機連線是哪個行程，直接綁回那個行程先前註冊的列，所以一個 Claude Code session 一輩子只 `register` 一次。
 
 **常駐提示** — 寫進 workspace 的 `CLAUDE.md`（或全域的那份）：
 
