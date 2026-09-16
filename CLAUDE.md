@@ -14,13 +14,16 @@ powershell -File start-daemon.ps1  # detached background
 常駐部署掛成服務（設定範本 `switchboard-service.example.xml` / `switchboard.service.example`，
 安裝步驟見 README）。Windows 服務名 `switchboard-daemon`，**重啟要提權**；
 Linux 是 systemd user service，`systemctl --user restart switchboard` 不用提權。
-兩邊都要明寫 `SWITCHBOARD_DB` 與 `SWITCHBOARD_POLLER_STATE_DIR`——服務帳號的
-`os.homedir()` 不是你的家目錄，漏填會開到空資料庫。
+兩邊都要明寫 `SWITCHBOARD_DB`、`SWITCHBOARD_POLLER_STATE_DIR` 與
+`SWITCHBOARD_CLAUDE_DIR`——服務帳號的 `os.homedir()` 不是你的家目錄。漏填第一個
+會開到空資料庫，漏填第三個則是 socket 投遞找不到任何 session、alias 也不跟著
+改名，而且兩者都不會報錯。
 
 環境變數：
 - `SWITCHBOARD_PORT` — 預設 9876
 - `SWITCHBOARD_DB` — 預設 `<homedir>/.claude/switchboard.db`（用 `os.homedir()`，slash-normalized）
 - `SWITCHBOARD_POLLER_STATE_DIR` — 預設 `<homedir>/.claude`，poller state/lock 檔案目錄
+- `SWITCHBOARD_CLAUDE_DIR` — 預設 `<homedir>/.claude`，Claude Code 的家目錄：socket 投遞與 alias 鏡像讀 `sessions/`，啟動檢查讀 `settings.json`
 
 ## 架構要點
 
@@ -43,7 +46,7 @@ bun test tests/integration.test.ts
 
 - 這個 daemon 沒有 auth，只 bind loopback，不能暴露到 0.0.0.0
 - SessionStart hook（client-side）需要在 Claude Code 啟動時提示 session 呼叫 `register()` 和 `read_messages()`——見 workspace 的 `.claude/settings.local.json` 裡的 hook 設定（範本見 `client-hooks.example.json`）
-- `/rename` Claude Code 指令改的是 transcript metadata，MCP subprocess 看不到；所以 switchboard 用 `register(role)` 明確命名，不依賴 Claude Code 的 session name
+- Claude Code session 的 alias 就是它的 session 名字：Claude Code 把名字寫在 `<claude 家目錄>/sessions/<pid>.json`，daemon 從那裡讀並跟著 `/rename` 改。`register(role)` 只剩非 Claude Code 的 client 與還沒命名的 session 在用
 
 ## 踩坑紀錄（Implementation notes）
 
