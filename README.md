@@ -81,6 +81,7 @@ Environment variables (all optional):
 | `SWITCHBOARD_PORT` | `9876` | Daemon HTTP port |
 | `SWITCHBOARD_DB` | `<homedir>/.claude/switchboard.db` | SQLite file path |
 | `SWITCHBOARD_POLLER_STATE_DIR` | `<homedir>/.claude` | Directory for poller state/lock files |
+| `SWITCHBOARD_CLAUDE_DIR` | `<homedir>/.claude` | Claude Code's home: socket delivery and alias mirroring read `sessions/`, the startup check reads `settings.json` |
 
 ### Run as a service (recommended)
 
@@ -113,9 +114,11 @@ loginctl enable-linger "$USER"   # survive reboots without logging in first
 Logs go to the journal (`journalctl --user -u switchboard -f`) and restarting
 needs no elevation: `systemctl --user restart switchboard`.
 
-Both templates spell out `SWITCHBOARD_DB` and `SWITCHBOARD_POLLER_STATE_DIR`
-instead of leaning on `os.homedir()`, because a service account's home is not
-yours — omit them and the daemon quietly opens an empty database.
+Both templates spell out all three path variables instead of leaning on
+`os.homedir()`, because a service account's home is not yours. Omit
+`SWITCHBOARD_DB` and the daemon quietly opens an empty database; omit
+`SWITCHBOARD_CLAUDE_DIR` and socket delivery finds no sessions while aliases
+stop following renames. Neither failure says anything.
 
 ### Auto-start on login (Windows scheduled task, legacy)
 
