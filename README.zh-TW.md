@@ -81,6 +81,7 @@ powershell -File start-daemon.ps1
 | `SWITCHBOARD_PORT` | `9876` | Daemon HTTP port |
 | `SWITCHBOARD_DB` | `<homedir>/.claude/switchboard.db` | SQLite 檔案路徑 |
 | `SWITCHBOARD_POLLER_STATE_DIR` | `<homedir>/.claude` | Poller state/lock 檔案目錄 |
+| `SWITCHBOARD_CLAUDE_DIR` | `<homedir>/.claude` | Claude Code 的家目錄：socket 投遞與 alias 鏡像讀 `sessions/`，啟動檢查讀 `settings.json` |
 
 ### 掛成服務執行（建議）
 
@@ -113,9 +114,9 @@ loginctl enable-linger "$USER"   # 沒登入也要能撐過重開機就加這行
 Log 走 journal（`journalctl --user -u switchboard -f`），重啟不需要提權：
 `systemctl --user restart switchboard`。
 
-兩份範本都把 `SWITCHBOARD_DB` 和 `SWITCHBOARD_POLLER_STATE_DIR` 寫死，而不是靠
-`os.homedir()`——服務帳號的家目錄不是你的家目錄，漏填的話 daemon 會無聲地開一個
-空資料庫。
+三個路徑變數在兩份範本裡都寫死，而不是靠 `os.homedir()`——服務帳號的家目錄不是你的
+家目錄。漏填 `SWITCHBOARD_DB` 會無聲地開一個空資料庫；漏填 `SWITCHBOARD_CLAUDE_DIR`
+則是 socket 投遞找不到任何 session、alias 也不跟著改名，兩者同樣不會報錯。
 
 ### 登入自動啟動（Windows Scheduled Task，舊做法）
 
