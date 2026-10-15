@@ -21,6 +21,7 @@ Linux 是 systemd user service，`systemctl --user restart switchboard` 不用�
 - `SWITCHBOARD_PORT` — 預設 9876
 - `SWITCHBOARD_DB` — 預設 `<homedir>/.claude/switchboard.db`（用 `os.homedir()`，slash-normalized）
 - `SWITCHBOARD_POLLER_STATE_DIR` — 預設 `<homedir>/.claude`，poller state/lock 檔案目錄
+- `SWITCHBOARD_PEER_RELAY_URL` — 預設 `http://127.0.0.1:3456`，本機 line-gateway；`send` 的目標寫 `<peer>:<alias>` 且本機查無此人時，交給它跨機轉送（`peer-relay.ts`）
 
 ## 架構要點
 
