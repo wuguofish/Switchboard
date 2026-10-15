@@ -21,7 +21,7 @@ import type { Database } from 'bun:sqlite'
 import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget, UnknownTargetError } from './aliases'
-import { parsePeerTarget, relayToPeer, DEFAULT_PEER_RELAY_URL } from './peer-relay'
+import { parsePeerTarget, relayToPeer, listPeerSessions, DEFAULT_PEER_RELAY_URL } from './peer-relay'
 import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
@@ -247,6 +247,20 @@ export async function startServer(opts: {
       throw new RequestValidationError('invalid JSON body')
     }
     return requireJsonObject(parsed)
+  }
+
+  /** Online sessions only: offline rows pile up into the hundreds and flood the caller. */
+  function onlineSessionsPublic() {
+    return listAllSessions(db)
+      .filter(s => isSessionOnline(s, registry, waiters))
+      .map(s => ({
+        session_id: s.id,
+        alias: s.alias,
+        client_kind: s.client_kind,
+        online: true,
+        created_at: toTaipeiISOString(s.created_at),
+        last_activity: toTaipeiISOString(s.last_activity),
+      }))
   }
 
   function readUnreadMessages(sessionId: string) {
@@ -742,8 +756,15 @@ export async function startServer(opts: {
           name: 'list_sessions',
           description:
             'List the sessions that are currently online. '
-            + 'Offline history is not returned — query the sessions table directly if you need it.',
-          inputSchema: { type: 'object' as const, properties: {} },
+            + 'Offline history is not returned — query the sessions table directly if you need it. '
+            + 'With `peer`, asks that machine (through the local line-gateway) for its online '
+            + 'sessions; each alias comes back as `<peer>:<alias>`, ready for `send`.',
+          inputSchema: {
+            type: 'object' as const,
+            properties: {
+              peer: { type: 'string', description: 'Peer machine name from the gateway\'s peers.json, e.g. home.' },
+            },
+          },
         },
         {
           name: 'recall',
@@ -1007,18 +1028,13 @@ export async function startServer(opts: {
       }
 
       if (name === 'list_sessions') {
-        // Online only: offline rows pile up into the hundreds and flood the caller's context
-        const result = listAllSessions(db)
-          .filter(s => isSessionOnline(s, registry, waiters))
-          .map(s => ({
-            session_id: s.id,
-            alias: s.alias,
-            online: true,
-            created_at: toTaipeiISOString(s.created_at),
-            last_activity: toTaipeiISOString(s.last_activity),
-          }))
+        const peer = (args as Record<string, unknown>)?.peer
+        if (typeof peer === 'string' && peer.trim()) {
+          const remote = await listPeerSessions(peerRelayUrl, peer.trim(), opts.fetchImpl)
+          return { content: [{ type: 'text', text: JSON.stringify(remote) }] }
+        }
         return {
-          content: [{ type: 'text', text: JSON.stringify(result) }],
+          content: [{ type: 'text', text: JSON.stringify(onlineSessionsPublic()) }],
         }
       }
 
@@ -1409,6 +1425,13 @@ export async function startServer(opts: {
 
       if (url.pathname === '/messages/read') {
         return handleMessageRead(req)
+      }
+
+      // Loopback listing for the line-gateway, which answers peer machines
+      // asking who is online here.
+      if (url.pathname === '/sessions') {
+        if (req.method !== 'GET') return new Response('Method Not Allowed', { status: 405 })
+        return Response.json({ sessions: onlineSessionsPublic() })
       }
 
       if (url.pathname !== '/mcp') {

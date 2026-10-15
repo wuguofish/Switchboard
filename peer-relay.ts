@@ -74,3 +74,48 @@ export async function relayToPeer(
     delivered_notification: remote.switchboard?.delivered_notification === true,
   }
 }
+
+export interface PeerSessionPublic {
+  /** `<peer>:<alias>`, the string `send` accepts. */
+  alias: string
+  client_kind: string
+  online: boolean
+  last_activity: string
+}
+
+/** Asks the local gateway which sessions are online on a peer machine. */
+export async function listPeerSessions(
+  relayUrl: string,
+  peer: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ peer: string; sessions: PeerSessionPublic[] }> {
+  let res: Response
+  try {
+    res = await fetchImpl(relayUrl.replace(/\/+$/, '') + '/peer/sessions?peer=' + encodeURIComponent(peer), {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch (err) {
+    throw new PeerRelayError(`peer relay at ${relayUrl} unreachable: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  const text = await res.text()
+  let body: Record<string, unknown> = {}
+  try { body = JSON.parse(text) as Record<string, unknown> } catch {}
+  if (!res.ok) {
+    const known = Array.isArray(body.known_peers) ? `; known peers: ${body.known_peers.join(', ') || 'none'}` : ''
+    throw new PeerRelayError(`${typeof body.error === 'string' ? body.error : `peer relay returned HTTP ${res.status}`}${known}`)
+  }
+  const raw = Array.isArray(body.sessions) ? body.sessions as Array<Record<string, unknown>> : []
+  return {
+    peer,
+    sessions: raw
+      .filter(s => typeof s.alias === 'string' && s.alias)
+      .map(s => ({
+        alias: `${peer}:${s.alias as string}`,
+        client_kind: typeof s.client_kind === 'string' ? s.client_kind : 'unknown',
+        online: s.online === true,
+        last_activity: typeof s.last_activity === 'string' ? s.last_activity : '',
+      })),
+  }
+}
