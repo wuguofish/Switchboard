@@ -100,6 +100,22 @@ describe('send tool with a <peer>:<alias> target', () => {
     await sender.close()
   })
 
+  test('a remote sender\'s external row does not shadow the peer route', async () => {
+    // Mail from the other machine lands through /external/send and leaves an
+    // external row named office:LINE總機 behind.
+    const sender = await connect('sender')
+    const landed = await fetch(`http://127.0.0.1:${TEST_PORT}/external/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ from: 'home:家裡阿宇', to: 'sender', message: 'hi' }),
+    })
+    expect(landed.status).toBe(200)
+    const result = await sender.callTool({ name: 'send', arguments: { to: 'home:家裡阿宇', message: 'reply' } })
+    expect(JSON.parse(text(result)).via_peer).toBe('home')
+    expect(relayCalls).toHaveLength(1)
+    await sender.close()
+  })
+
   test('surfaces the gateway error and still rejects plain unknown aliases', async () => {
     const client = await connect('sender')
     relayAnswer = () => Response.json({ error: 'unknown peer: cabin', known_peers: ['home'] }, { status: 404 })

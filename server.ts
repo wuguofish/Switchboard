@@ -918,6 +918,12 @@ export async function startServer(opts: {
         let targetId: string
         try {
           targetId = resolveTarget(db, to)
+          // A remote sender shows up here as an external row named
+          // `<peer>:<alias>` once its mail has been delivered; nobody reads
+          // that mailbox, so a reply to that name goes back across instead.
+          if (findSessionById(db, targetId)?.client_kind === 'external' && parsePeerTarget(to)) {
+            throw new UnknownTargetError(to)
+          }
         } catch (err) {
           const peerTarget = err instanceof UnknownTargetError ? parsePeerTarget(to) : null
           if (!peerTarget) throw err
