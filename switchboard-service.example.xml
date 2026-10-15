@@ -46,4 +46,5 @@
   -->
   <env name="SWITCHBOARD_DB" value="C:/Users/YOUR_USER/.claude/switchboard.db"/>
   <env name="SWITCHBOARD_POLLER_STATE_DIR" value="C:/Users/YOUR_USER/.claude"/>
+  <env name="SWITCHBOARD_CLAUDE_DIR" value="C:/Users/YOUR_USER/.claude"/>
 </service>

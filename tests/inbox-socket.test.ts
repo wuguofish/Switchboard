@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, writeFileSync } from 'fs'
-import { tmpdir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
-import { findInboxSocket, inboxFrames, inboxWakeText, postInboxFrames, wakeInboxSocket } from '../inbox-socket'
+import { claudeDir, crossSessionInboundSetting, defaultSessionsDir, findInboxSocket, inboxFrames, inboxWakeText, postInboxFrames, wakeInboxSocket } from '../inbox-socket'
 
 function fixtureDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'sb-sessions-'))
@@ -79,5 +79,32 @@ describe('delivery', () => {
     const result = await wakeInboxSocket('cc-9999', 'x', fixtureDir())
     expect(result.delivered).toBe(false)
     expect(result.reason).toContain('peerProtocol 2')
+  })
+})
+
+describe('claude directory override', () => {
+  test('SWITCHBOARD_CLAUDE_DIR decides where sessions and settings are read', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sb-home-'))
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ crossSessionInbound: 'accept' }))
+    const previous = process.env.SWITCHBOARD_CLAUDE_DIR
+    process.env.SWITCHBOARD_CLAUDE_DIR = dir
+    try {
+      expect(claudeDir()).toBe(dir)
+      expect(defaultSessionsDir()).toBe(join(dir, 'sessions'))
+      expect(crossSessionInboundSetting()).toBe('accept')
+    } finally {
+      if (previous === undefined) delete process.env.SWITCHBOARD_CLAUDE_DIR
+      else process.env.SWITCHBOARD_CLAUDE_DIR = previous
+    }
+  })
+
+  test('falls back to the home directory when the override is unset', () => {
+    const previous = process.env.SWITCHBOARD_CLAUDE_DIR
+    delete process.env.SWITCHBOARD_CLAUDE_DIR
+    try {
+      expect(claudeDir()).toBe(join(homedir(), '.claude'))
+    } finally {
+      if (previous !== undefined) process.env.SWITCHBOARD_CLAUDE_DIR = previous
+    }
   })
 })

@@ -26,8 +26,18 @@ export interface InboxSocket {
   version: string
 }
 
+/**
+ * Where Claude Code keeps its per-user state. Hosted as a Windows service the
+ * daemon runs as LocalSystem, whose homedir() is the system profile, so this
+ * has to be overridable the way SWITCHBOARD_DB already is — otherwise every
+ * socket wake and every name lookup reads an empty directory and says nothing.
+ */
+export function claudeDir(): string {
+  return process.env.SWITCHBOARD_CLAUDE_DIR ?? join(homedir(), '.claude')
+}
+
 export function defaultSessionsDir(): string {
-  return join(homedir(), '.claude', 'sessions')
+  return join(claudeDir(), 'sessions')
 }
 
 /** Locate the inbox socket registered for a Claude Code session id. */
@@ -139,7 +149,7 @@ export async function wakeInboxSocket(
  * delivered or held for approval. Read the user-level setting so the daemon
  * can warn at startup instead of failing silently per message.
  */
-export function crossSessionInboundSetting(settingsPath = join(homedir(), '.claude', 'settings.json')): string | null {
+export function crossSessionInboundSetting(settingsPath = join(claudeDir(), 'settings.json')): string | null {
   try {
     const value = JSON.parse(readFileSync(settingsPath, 'utf8')).crossSessionInbound
     return typeof value === 'string' ? value : null
