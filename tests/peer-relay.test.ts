@@ -112,3 +112,55 @@ describe('send tool with a <peer>:<alias> target', () => {
     await client.close()
   })
 })
+
+describe('session listing across machines', () => {
+  const TEST_PORT = 19878
+  let handle: ServerHandle
+  let relayCalls: string[]
+
+  beforeEach(async () => {
+    relayCalls = []
+    const fetchImpl = (async (url: string | URL | Request) => {
+      relayCalls.push(String(url))
+      return Response.json({ peer: 'home', sessions: [
+        { alias: '家裡阿宇', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
+        { alias: null, client_kind: 'external', online: true },
+      ] })
+    }) as unknown as typeof fetch
+    handle = await startServer({
+      port: TEST_PORT,
+      dbPath: ':memory:',
+      sessionsDir: mkdtempSync(join(tmpdir(), 'sb-peer-')),
+      peerRelayUrl: 'http://gw',
+      fetchImpl,
+    })
+  })
+
+  afterEach(async () => {
+    await handle.stop()
+  })
+
+  test('GET /sessions lists online sessions with their client kind', async () => {
+    const client = new Client({ name: 'x', version: '0.1.0' }, { capabilities: {} })
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${TEST_PORT}/mcp`)))
+    await client.callTool({ name: 'register', arguments: { role: 'LINE總機' } })
+    const res = await fetch(`http://127.0.0.1:${TEST_PORT}/sessions`)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { sessions: Array<{ alias: string; client_kind: string; online: boolean }> }
+    expect(body.sessions).toEqual([expect.objectContaining({ alias: 'LINE總機', client_kind: 'claude_code', online: true })])
+    expect((await fetch(`http://127.0.0.1:${TEST_PORT}/sessions`, { method: 'POST' })).status).toBe(405)
+    await client.close()
+  })
+
+  test('list_sessions with peer asks the gateway and prefixes the aliases', async () => {
+    const client = new Client({ name: 'x', version: '0.1.0' }, { capabilities: {} })
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${TEST_PORT}/mcp`)))
+    const result = await client.callTool({ name: 'list_sessions', arguments: { peer: 'home' } })
+    const parsed = JSON.parse((result.content as Array<{ text: string }>)[0]!.text)
+    expect(relayCalls).toEqual(['http://gw/peer/sessions?peer=home'])
+    expect(parsed).toEqual({ peer: 'home', sessions: [
+      { alias: 'home:家裡阿宇', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
+    ] })
+    await client.close()
+  })
+})

@@ -238,7 +238,7 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}` — `status` is `released`, `stale_ignored` (a newer generation re-registered this identity; nothing was released), or `already_offline` |
 
-`to` accepts either an alias or a session UUID, or `<peer>:<alias>` (for example `home:家裡阿宇`) to reach a session on another machine: when no local session has that name, the daemon hands the message to the local line-gateway, which signs it and carries it over the tunnel to the peer machine's gateway and Switchboard (see line-gateway's *Cross-machine peers*). The remote side sees the sender as `<self>:<alias>`. Nothing is queued when the peer is unreachable; the send tool returns the error. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+`to` accepts either an alias or a session UUID, or `<peer>:<alias>` (for example `home:家裡阿宇`) to reach a session on another machine: when no local session has that name, the daemon hands the message to the local line-gateway, which signs it and carries it over the tunnel to the peer machine's gateway and Switchboard (see line-gateway's *Cross-machine peers*). The remote side sees the sender as `<self>:<alias>`. `list_sessions(peer)` asks that machine who is online and returns aliases already prefixed. Nothing is queued when the peer is unreachable; the send tool returns the error. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
 
 `broadcast` accepts an optional `scope` (default `all`, preserving legacy calls):
 
@@ -251,6 +251,7 @@ Codex-kind recipients are only written to when they are online at insert time �
 ## HTTP endpoints
 
 - `POST /mcp`, `GET /mcp`, `DELETE /mcp` — MCP Streamable HTTP transport
+- `GET /sessions` — the sessions currently online here (`alias`, `client_kind`, timestamps); the local line-gateway reads it to answer a peer machine asking who is online.
 - `POST /external/send` — local non-MCP send endpoint for programs such as
   codex-bridge to notify Claude Code when a background job finishes. JSON body:
   `{ "to": "<alias-or-session-id>", "message": "...", "from": "codex" }`.

@@ -234,7 +234,7 @@ cc_session_id 向 switchboard 註冊：
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}`——`status` 為 `released`、`stale_ignored`（同一 identity 已被更新世代重新註冊，未釋放任何東西）或 `already_offline` |
 
-`to` 可以是 alias 或 session UUID，也可以寫 `<peer>:<alias>`（例如 `home:家裡阿宇`）送到另一台機器：本機沒有這個名字的 session 時，daemon 把訊息交給本機的 line-gateway，由它簽名後走 tunnel 送到對方機器的 gateway 與 Switchboard（見 line-gateway 的「跨機 peer」）。對方看到的寄件人是 `<self>:<alias>`。對方不通時不排隊，send 直接回錯誤。`delivered_notification` 在訊息經由活的 MCP 連線推送成功、*或*收件人依下方 lease/polling 判定為在線時回 true。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
+`to` 可以是 alias 或 session UUID，也可以寫 `<peer>:<alias>`（例如 `home:家裡阿宇`）送到另一台機器：本機沒有這個名字的 session 時，daemon 把訊息交給本機的 line-gateway，由它簽名後走 tunnel 送到對方機器的 gateway 與 Switchboard（見 line-gateway 的「跨機 peer」）。對方看到的寄件人是 `<self>:<alias>`。`list_sessions(peer)` 會去問那台誰在線，回來的 alias 已帶前綴。對方不通時不排隊，send 直接回錯誤。`delivered_notification` 在訊息經由活的 MCP 連線推送成功、*或*收件人依下方 lease/polling 判定為在線時回 true。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
 
 `broadcast` 可帶選填的 `scope`（預設 `all`，舊呼叫行為不變）：
 
@@ -247,6 +247,7 @@ cc_session_id 向 switchboard 註冊：
 ## HTTP endpoints
 
 - `POST /mcp`、`GET /mcp`、`DELETE /mcp` — MCP Streamable HTTP 傳輸
+- `GET /sessions` — 本機目前在線的 session（`alias`、`client_kind`、時間）；本機 line-gateway 靠它回答對方機器「誰在線」。
 - `POST /external/send` — 給本機非 MCP 程序投遞訊息用，例如
   codex-bridge 在背景 job 完成後通知 Claude Code。JSON body：
   `{ "to": "<alias-or-session-id>", "message": "...", "from": "codex" }`
