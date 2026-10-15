@@ -20,7 +20,8 @@ import {
 import type { Database } from 'bun:sqlite'
 import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
-import { setAliasWithCollisionCheck, resolveTarget } from './aliases'
+import { setAliasWithCollisionCheck, resolveTarget, UnknownTargetError } from './aliases'
+import { parsePeerTarget, relayToPeer, DEFAULT_PEER_RELAY_URL } from './peer-relay'
 import { toTaipeiISOString, toTaipeiHeartbeatString } from './time'
 import { startRetentionLoop } from './retention'
 import { UnreadWaiterRegistry } from './waiters'
@@ -179,11 +180,19 @@ export async function startServer(opts: {
   deliverContentOverSocket?: boolean
   /** Where Claude Code keeps its per-session registry (name, socket). */
   sessionsDir?: string
+  /**
+   * Origin of the local line-gateway that carries `<peer>:<alias>` sends
+   * to another machine (see peer-relay.ts). Defaults to
+   * SWITCHBOARD_PEER_RELAY_URL or the gateway's loopback port.
+   */
+  peerRelayUrl?: string
+  fetchImpl?: typeof fetch
 }): Promise<ServerHandle> {
   const db: Database = openDatabase(opts.dbPath)
   const deliverContentOverSocket =
     opts.deliverContentOverSocket ?? (crossSessionInboundSetting() === 'accept')
   const sessionsDir = opts.sessionsDir ?? defaultSessionsDir()
+  const peerRelayUrl = opts.peerRelayUrl ?? process.env.SWITCHBOARD_PEER_RELAY_URL ?? DEFAULT_PEER_RELAY_URL
 
   /**
    * Claude Code rows follow the sessions directory. Runs whenever anyone uses
@@ -690,7 +699,10 @@ export async function startServer(opts: {
         },
         {
           name: 'send',
-          description: '1-to-1 message. `to` can be alias or session UUID.',
+          description:
+            '1-to-1 message. `to` can be alias or session UUID; `<peer>:<alias>` ' +
+            '(e.g. home:家裡阿宇) reaches a session on another machine through ' +
+            'the local line-gateway when no local session has that name.',
           inputSchema: {
             type: 'object' as const,
             properties: {
@@ -881,8 +893,30 @@ export async function startServer(opts: {
         if (!currentSwitchboardId) throw new Error('session not registered; call register(cc_session_id=<your Claude Code session id>) first')
         const to = (args as Record<string, unknown>)?.to as string
         const message = (args as Record<string, unknown>)?.message as string
-        const targetId = resolveTarget(db, to)  // throws UnknownTargetError if not found
         const sender = findSessionById(db, currentSwitchboardId)
+        let targetId: string
+        try {
+          targetId = resolveTarget(db, to)
+        } catch (err) {
+          const peerTarget = err instanceof UnknownTargetError ? parsePeerTarget(to) : null
+          if (!peerTarget) throw err
+          if (!sender?.alias) throw new Error('cross-machine send needs an alias; this session is anonymous')
+          const relayed = await relayToPeer(peerRelayUrl, {
+            target: peerTarget,
+            from_alias: sender.alias,
+            content: message,
+          }, opts.fetchImpl)
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                message_id: relayed.envelope_id,
+                delivered_notification: relayed.delivered_notification,
+                via_peer: relayed.peer,
+              }),
+            }],
+          }
+        }
         const message_id = insertMessage(db, {
           sender_id: currentSwitchboardId,
           recipient_id: targetId,

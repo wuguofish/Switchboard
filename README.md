@@ -81,6 +81,7 @@ Environment variables (all optional):
 | `SWITCHBOARD_PORT` | `9876` | Daemon HTTP port |
 | `SWITCHBOARD_DB` | `<homedir>/.claude/switchboard.db` | SQLite file path |
 | `SWITCHBOARD_POLLER_STATE_DIR` | `<homedir>/.claude` | Directory for poller state/lock files |
+| `SWITCHBOARD_PEER_RELAY_URL` | `http://127.0.0.1:3456` | Local line-gateway that carries `<peer>:<alias>` sends to another machine |
 
 ### Run as a service (recommended)
 
@@ -234,7 +235,7 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}` — `status` is `released`, `stale_ignored` (a newer generation re-registered this identity; nothing was released), or `already_offline` |
 
-`to` accepts either an alias or a session UUID. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+`to` accepts either an alias or a session UUID, or `<peer>:<alias>` (for example `home:家裡阿宇`) to reach a session on another machine: when no local session has that name, the daemon hands the message to the local line-gateway, which signs it and carries it over the tunnel to the peer machine's gateway and Switchboard (see line-gateway's *Cross-machine peers*). The remote side sees the sender as `<self>:<alias>`. Nothing is queued when the peer is unreachable; the send tool returns the error. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
 
 `broadcast` accepts an optional `scope` (default `all`, preserving legacy calls):
 
