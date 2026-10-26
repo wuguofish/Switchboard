@@ -11,6 +11,7 @@ Claude Code 2.1.224+ ships native cross-session messaging (`ListAgents` / `SendM
 - **Peers that are not Claude Code** — Codex, OpenCode, or anything that can `POST /register`
 - **Broadcast** to every registered session at once
 - **Being reachable by those peers** — a Claude Code session on someone else's delivery list needs an alias here even if it never sends anything itself
+- **Sessions on another machine** — `send` to `<peer>:<alias>` reaches them through the local line-gateway, and a session needs an alias here to be reachable from the other side
 
 On top of that it provides:
 
@@ -194,7 +195,7 @@ Verified 2026-09-15: a `claude --bg` session launched with the channel flag load
 
 ### Getting Claude to register
 
-The `SessionStart` hook first tells Claude when Switchboard is the right tool: Claude Code ↔ Claude Code on the same machine goes through native `SendMessage`; cross-vendor peers, broadcasts, and being reachable by either are what registration is for. It then explains *how* to register, but Claude still needs a nudge to actually do it. Two options:
+The `SessionStart` hook first tells Claude when Switchboard is the right tool: Claude Code ↔ Claude Code on the same machine goes through native `SendMessage`; cross-vendor peers, broadcasts, sessions on another machine, and being reachable by any of them are what registration is for. It then explains *how* to register, but Claude still needs a nudge to actually do it. Two options:
 
 **Ad hoc** — just say it in your first message:
 
@@ -234,11 +235,11 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `send` | `to`, `message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`, `scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}` — only mail no wake has carried; mail delivered by a wake is already read |
-| `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
+| `list_sessions` | `peer?` | `[{session_id, alias, client_kind, online, created_at, last_activity}, ...]` — online sessions only; with `peer`, `{peer, sessions: [{alias, client_kind, online, last_activity}, ...]}` from that machine, aliases already prefixed |
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}` — `status` is `released`, `stale_ignored` (a newer generation re-registered this identity; nothing was released), or `already_offline` |
 
-`to` accepts either an alias or a session UUID, or `<peer>:<alias>` (for example `home:家裡阿宇`) to reach a session on another machine: when no local session has that name, the daemon hands the message to the local line-gateway, which signs it and carries it over the tunnel to the peer machine's gateway and Switchboard (see line-gateway's *Cross-machine peers*). The remote side sees the sender as `<self>:<alias>`. `list_sessions(peer)` asks that machine who is online and returns aliases already prefixed. Nothing is queued when the peer is unreachable; the send tool returns the error. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
+`to` accepts either an alias or a session UUID, or `<peer>:<alias>` (for example `home:docs-writer`) to reach a session on another machine: when no local session has that name, the daemon hands the message to the local line-gateway, which signs it and carries it over the tunnel to the peer machine's gateway and Switchboard (see line-gateway's *Cross-machine peers*). The remote side sees the sender as `<self>:<alias>`. `list_sessions(peer)` asks that machine who is online and returns aliases already prefixed. Nothing is queued when the peer is unreachable; the send tool returns the error. `delivered_notification` is true when the message was pushed over a live MCP connection *or* the recipient is online per the lease/polling predicate below. It's an honest *"the recipient will notice this without user intervention"* signal, not just *"the bytes hit the socket."*
 
 `broadcast` accepts an optional `scope` (default `all`, preserving legacy calls):
 

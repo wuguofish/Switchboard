@@ -58,6 +58,8 @@ Switchboard is for what the native path does not cover:
   - being reachable BY those peers or by broadcasts — a session that never
     sends anything itself still needs a Switchboard alias if its name is on
     someone else's delivery list
+  - sessions on another machine, addressed as <peer>:<alias> — both sending
+    to them and being reachable from them
 
 If any of those apply, register in your first turn:
 

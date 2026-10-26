@@ -715,7 +715,7 @@ export async function startServer(opts: {
           name: 'send',
           description:
             '1-to-1 message. `to` can be alias or session UUID; `<peer>:<alias>` ' +
-            '(e.g. home:家裡阿宇) reaches a session on another machine through ' +
+            '(e.g. home:docs-writer) reaches a session on another machine through ' +
             'the local line-gateway when no local session has that name.',
           inputSchema: {
             type: 'object' as const,

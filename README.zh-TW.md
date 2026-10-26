@@ -11,6 +11,7 @@ Claude Code 2.1.224 起原生就有跨 session 傳訊（`ListAgents` / `SendMess
 - **非 Claude Code 的同伴**——Codex、OpenCode，或任何能 `POST /register` 的東西
 - **廣播**，一次送給所有已註冊的 session
 - **讓那些同伴找得到你**——只要你的名字在別人的收件名單上，就算自己從不寄信也需要這裡的門牌
+- **另一台機器上的 session**——`send` 給 `<peer>:<alias>` 會經由本機的 line-gateway 送過去；要讓對面找得到你，也需要這裡的門牌
 
 在此之上另外提供：
 
@@ -191,7 +192,7 @@ socket 路徑的原理：Claude Code 2.1.224 起每個 session 綁一個 Unix do
 
 ### 讓 Claude 真的去 register
 
-`SessionStart` hook 會先告訴 Claude 什麼時候該用 Switchboard：同一台機器上 Claude Code 之間走原生 `SendMessage`；跨廠同伴、廣播、以及要被這兩者找到，才是 register 的用途。接著才說明 *怎麼* register，但實際上仍需要推一把讓它動作。兩種做法：
+`SessionStart` hook 會先告訴 Claude 什麼時候該用 Switchboard：同一台機器上 Claude Code 之間走原生 `SendMessage`；跨廠同伴、廣播、另一台機器上的 session，以及要被這些對象找到，才是 register 的用途。接著才說明 *怎麼* register，但實際上仍需要推一把讓它動作。兩種做法：
 
 **臨時指示** — 在第一句對話直接講：
 
@@ -230,11 +231,11 @@ cc_session_id 向 switchboard 註冊：
 | `send` | `to`、`message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`、`scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}`——只回沒有任何喚醒帶走的信；喚醒送到的已是已讀 |
-| `list_sessions` | — | `[{session_id, alias, online, created_at, last_activity}, ...]` |
+| `list_sessions` | `peer?` | `[{session_id, alias, client_kind, online, created_at, last_activity}, ...]`——只列在線的 session；帶 `peer` 時回那台機器的 `{peer, sessions: [{alias, client_kind, online, last_activity}, ...]}`，alias 已帶前綴 |
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}`——`status` 為 `released`、`stale_ignored`（同一 identity 已被更新世代重新註冊，未釋放任何東西）或 `already_offline` |
 
-`to` 可以是 alias 或 session UUID，也可以寫 `<peer>:<alias>`（例如 `home:家裡阿宇`）送到另一台機器：本機沒有這個名字的 session 時，daemon 把訊息交給本機的 line-gateway，由它簽名後走 tunnel 送到對方機器的 gateway 與 Switchboard（見 line-gateway 的「跨機 peer」）。對方看到的寄件人是 `<self>:<alias>`。`list_sessions(peer)` 會去問那台誰在線，回來的 alias 已帶前綴。對方不通時不排隊，send 直接回錯誤。`delivered_notification` 在訊息經由活的 MCP 連線推送成功、*或*收件人依下方 lease/polling 判定為在線時回 true。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
+`to` 可以是 alias 或 session UUID，也可以寫 `<peer>:<alias>`（例如 `home:docs-writer`）送到另一台機器：本機沒有這個名字的 session 時，daemon 把訊息交給本機的 line-gateway，由它簽名後走 tunnel 送到對方機器的 gateway 與 Switchboard（見 line-gateway 的「跨機 peer」）。對方看到的寄件人是 `<self>:<alias>`。`list_sessions(peer)` 會去問那台誰在線，回來的 alias 已帶前綴。對方不通時不排隊，send 直接回錯誤。`delivered_notification` 在訊息經由活的 MCP 連線推送成功、*或*收件人依下方 lease/polling 判定為在線時回 true。這是誠實的「收件人不用人類介入也會注意到」訊號，而不是「bytes 有送到 socket」。
 
 `broadcast` 可帶選填的 `scope`（預設 `all`，舊呼叫行為不變）：
 

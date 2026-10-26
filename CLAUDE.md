@@ -1,6 +1,6 @@
 # CLAUDE.md — switchboard
 
-本地 MCP Server，讓多個 Claude Code session 互傳訊息。對應的 design spec 在 `docs/superpowers/specs/2026-04-15-switchboard-mcp-design.md`。
+本地 MCP Server，讓多個 Claude Code session 互傳訊息。
 
 ## 運行
 
@@ -73,7 +73,7 @@ bun test tests/integration.test.ts
 
 ## Phase 2.5: Auto-wake with per-session identity（opt-in）
 
-背景 poller + Stop hook auto-wake，讓 idle session 有新訊息時自動喚醒。身份綁定從 workspace 層級（Phase 2 的 `SWITCHBOARD_ROLE` env var）移到每個 Claude Code session 的 `session_id`，所以同一個 workspace 裡並行的多個 session 各自有獨立身份、獨立 poller。設計 spec：`docs/superpowers/specs/2026-04-16-switchboard-phase2-5-per-session-identity-design.md`。
+背景 poller + Stop hook auto-wake，讓 idle session 有新訊息時自動喚醒。身份綁定從 workspace 層級（Phase 2 的 `SWITCHBOARD_ROLE` env var）移到每個 Claude Code session 的 `session_id`，所以同一個 workspace 裡並行的多個 session 各自有獨立身份、獨立 poller。
 
 ### 啟用流程
 
