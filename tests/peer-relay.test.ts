@@ -139,8 +139,13 @@ describe('session listing across machines', () => {
     const fetchImpl = (async (url: string | URL | Request) => {
       relayCalls.push(String(url))
       return Response.json({ peer: 'home', sessions: [
+        // Written by a daemon without statuses: no status fields at all.
         { alias: 'docs-writer', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
         { alias: null, client_kind: 'external', online: true },
+        {
+          alias: 'release-bot', client_kind: 'claude_code', online: true, last_activity: '2026-10-26T10:00:00+08:00',
+          status: 'cutting the 1.4 release', status_updated_at: '2026-10-26T09:30:00.000+08:00',
+        },
       ] })
     }) as unknown as typeof fetch
     handle = await startServer({
@@ -160,10 +165,11 @@ describe('session listing across machines', () => {
     const client = new Client({ name: 'x', version: '0.1.0' }, { capabilities: {} })
     await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${TEST_PORT}/mcp`)))
     await client.callTool({ name: 'register', arguments: { role: 'LINE總機' } })
+    await client.callTool({ name: 'set_status', arguments: { text: 'on duty' } })
     const res = await fetch(`http://127.0.0.1:${TEST_PORT}/sessions`)
     expect(res.status).toBe(200)
     const body = await res.json() as { sessions: Array<{ alias: string; client_kind: string; online: boolean }> }
-    expect(body.sessions).toEqual([expect.objectContaining({ alias: 'LINE總機', client_kind: 'claude_code', online: true })])
+    expect(body.sessions).toEqual([expect.objectContaining({ alias: 'LINE總機', client_kind: 'claude_code', online: true, status: 'on duty' })])
     expect((await fetch(`http://127.0.0.1:${TEST_PORT}/sessions`, { method: 'POST' })).status).toBe(405)
     await client.close()
   })
@@ -175,7 +181,11 @@ describe('session listing across machines', () => {
     const parsed = JSON.parse((result.content as Array<{ text: string }>)[0]!.text)
     expect(relayCalls).toEqual(['http://gw/peer/sessions?peer=home'])
     expect(parsed).toEqual({ peer: 'home', sessions: [
-      { alias: 'home:docs-writer', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
+      { alias: 'home:docs-writer', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00', status: null, status_updated_at: null },
+      {
+        alias: 'home:release-bot', client_kind: 'claude_code', online: true, last_activity: '2026-10-26T10:00:00+08:00',
+        status: 'cutting the 1.4 release', status_updated_at: '2026-10-26T09:30:00.000+08:00',
+      },
     ] })
     await client.close()
   })

@@ -3,7 +3,7 @@ import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
-import type { ClientKind, SessionRow, MessageRow } from './types'
+import type { ClientKind, SessionRow, MessageRow, StatusRow } from './types'
 import { nowUtc } from './time'
 import { LEASE_TTL_MS } from './online'
 
@@ -578,6 +578,49 @@ export function deleteStaleSessionRows(db: Database, retentionDays: number): num
       AND id NOT IN (SELECT sender_id FROM messages)
       AND id NOT IN (SELECT recipient_id FROM messages)
   `).run(`-${retentionDays} days`)
+  return Number(info.changes)
+}
+
+const STATUS_RETENTION_DAYS = 7
+
+export function setSessionStatus(db: Database, alias: string, status: string): StatusRow {
+  const now = nowUtc()
+  db.query(`
+    INSERT INTO session_status (alias, status, updated_at, last_seen_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(alias) DO UPDATE SET
+      status = excluded.status,
+      updated_at = excluded.updated_at,
+      last_seen_at = excluded.last_seen_at
+  `).run(alias, status, now, now)
+  return { alias, status, updated_at: now, last_seen_at: now }
+}
+
+export function clearSessionStatus(db: Database, alias: string): void {
+  db.query('DELETE FROM session_status WHERE alias = ?').run(alias)
+}
+
+export function listSessionStatuses(db: Database): StatusRow[] {
+  return db.query<StatusRow, []>(
+    'SELECT alias, status, updated_at, last_seen_at FROM session_status ORDER BY alias ASC',
+  ).all()
+}
+
+/** An alias still held by an active session counts as seen now, however old its status is. */
+export function markHeldStatusesSeen(db: Database): number {
+  const info = db.query(`
+    UPDATE session_status SET last_seen_at = ?
+    WHERE alias IN (SELECT alias FROM sessions WHERE alias IS NOT NULL AND released_at IS NULL)
+  `).run(nowUtc())
+  return Number(info.changes)
+}
+
+/** Clear statuses whose alias nobody has held for STATUS_RETENTION_DAYS. */
+export function deleteExpiredStatuses(db: Database): number {
+  const info = db.query(`
+    DELETE FROM session_status
+    WHERE datetime(last_seen_at) < datetime('now', ?)
+  `).run(`-${STATUS_RETENTION_DAYS} days`)
   return Number(info.changes)
 }
 

@@ -29,11 +29,11 @@ Linux 是 systemd user service，`systemctl --user restart switchboard` 不用�
 ## 架構要點
 
 - **Transport**：Streamable HTTP MCP，bind 127.0.0.1。Bun 環境用 `WebStandardStreamableHTTPServerTransport`（SDK 為 Bun/Deno/CF Workers 提供的 variant），不走 `node:http`。
-- **State**：in-memory connection registry + SQLite（sessions, messages）
+- **State**：in-memory connection registry + SQLite（sessions, messages, session_status）
 - **Time**：DB 內部存 UTC ISO 8601；API response 透過 `toTaipeiISOString` 轉 `Asia/Taipei +08:00`（跟 `claude-line-channel` 一致）
 - **Online 判斷**：MCP connection 活著 = online（沒有 heartbeat）
 - **Recall**：hard delete；broadcast 的 recall 會 group delete 整組
-- **Retention**：已讀訊息 7 天後由 `retention.ts` 背景清掉
+- **Retention**：已讀訊息 7 天後由 `retention.ts` 背景清掉；`set_status` 的狀態以 alias 為鍵，alias 最後一次被 active session 持有後 7 天清掉（每小時先把被持有的 alias 標成剛看到，再刪過期的）
 
 ## 測試
 

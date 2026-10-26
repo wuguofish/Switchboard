@@ -30,6 +30,13 @@ export interface MessageRow {
   read_at: string | null
 }
 
+export interface StatusRow {
+  alias: string
+  status: string
+  updated_at: string   // ISO 8601 UTC
+  last_seen_at: string // ISO 8601 UTC; last time an active session held the alias
+}
+
 export interface SessionPublic {
   session_id: SessionId
   alias: string | null
