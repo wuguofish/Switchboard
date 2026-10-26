@@ -11,6 +11,12 @@ test('buildHookOutput embeds cc_session_id into additionalContext', () => {
   expect(out!.hookSpecificOutput.additionalContext).toContain("cc_session_id='cc-xyz-789'")
 })
 
+test('buildHookOutput lists sessions on another machine as a reason to register', () => {
+  const input = JSON.stringify({ session_id: 'cc-peer-reason' })
+  const ctx = buildHookOutput(input, 'socket', 'accept')!.hookSpecificOutput.additionalContext
+  expect(ctx).toContain('sessions on another machine, addressed as <peer>:<alias>')
+})
+
 test('buildHookOutput returns null when stdin JSON has no session_id', () => {
   expect(buildHookOutput('{}')).toBeNull()
   expect(buildHookOutput('{"other":"field"}')).toBeNull()

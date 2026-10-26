@@ -9,9 +9,9 @@ import { parsePeerTarget, relayToPeer, PeerRelayError } from '../peer-relay'
 
 describe('parsePeerTarget', () => {
   test('splits <peer>:<alias> and rejects everything else', () => {
-    expect(parsePeerTarget('home:家裡阿宇')).toEqual({ peer: 'home', alias: '家裡阿宇' })
-    expect(parsePeerTarget('home: 家裡阿宇 ')).toEqual({ peer: 'home', alias: '家裡阿宇' })
-    expect(parsePeerTarget('家裡阿宇')).toBeNull()
+    expect(parsePeerTarget('home:文件組')).toEqual({ peer: 'home', alias: '文件組' })
+    expect(parsePeerTarget('home: docs-writer ')).toEqual({ peer: 'home', alias: 'docs-writer' })
+    expect(parsePeerTarget('docs-writer')).toBeNull()
     expect(parsePeerTarget(':x')).toBeNull()
     expect(parsePeerTarget('home:')).toBeNull()
     expect(parsePeerTarget('Home Office:x')).toBeNull()
@@ -25,8 +25,8 @@ describe('relayToPeer', () => {
       seen = JSON.parse(init!.body as string)
       return Response.json({ ok: true, envelope_id: 'env-1', peer: 'home', remote: { switchboard: { delivered_notification: true } } })
     }) as typeof fetch
-    const result = await relayToPeer('http://gw/', { target: { peer: 'home', alias: '家裡阿宇' }, from_alias: '總機', content: 'hi' }, fetchImpl)
-    expect(seen).toEqual({ to_peer: 'home', to_alias: '家裡阿宇', from_alias: '總機', content: 'hi' })
+    const result = await relayToPeer('http://gw/', { target: { peer: 'home', alias: 'docs-writer' }, from_alias: '總機', content: 'hi' }, fetchImpl)
+    expect(seen).toEqual({ to_peer: 'home', to_alias: 'docs-writer', from_alias: '總機', content: 'hi' })
     expect(result).toEqual({ envelope_id: 'env-1', peer: 'home', delivered_notification: true })
   })
 
@@ -84,16 +84,16 @@ describe('send tool with a <peer>:<alias> target', () => {
 
   test('relays through the local gateway when no local session matches', async () => {
     const client = await connect('LINE總機')
-    const result = await client.callTool({ name: 'send', arguments: { to: 'home:家裡阿宇', message: '阿童今天很晚' } })
+    const result = await client.callTool({ name: 'send', arguments: { to: 'home:docs-writer', message: 'build is running late' } })
     expect(JSON.parse(text(result))).toEqual({ message_id: 'env-7', delivered_notification: false, via_peer: 'home' })
-    expect(relayCalls).toEqual([{ url: 'http://gw/peer/send', body: { to_peer: 'home', to_alias: '家裡阿宇', from_alias: 'LINE總機', content: '阿童今天很晚' } }])
+    expect(relayCalls).toEqual([{ url: 'http://gw/peer/send', body: { to_peer: 'home', to_alias: 'docs-writer', from_alias: 'LINE總機', content: 'build is running late' } }])
     await client.close()
   })
 
   test('prefers a local session whose alias contains a colon', async () => {
     const sender = await connect('sender')
-    const local = await connect('home:家裡阿宇')
-    const result = await sender.callTool({ name: 'send', arguments: { to: 'home:家裡阿宇', message: 'local' } })
+    const local = await connect('home:docs-writer')
+    const result = await sender.callTool({ name: 'send', arguments: { to: 'home:docs-writer', message: 'local' } })
     expect(JSON.parse(text(result)).via_peer).toBeUndefined()
     expect(relayCalls).toHaveLength(0)
     await local.close()
@@ -107,10 +107,10 @@ describe('send tool with a <peer>:<alias> target', () => {
     const landed = await fetch(`http://127.0.0.1:${TEST_PORT}/external/send`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ from: 'home:家裡阿宇', to: 'sender', message: 'hi' }),
+      body: JSON.stringify({ from: 'home:docs-writer', to: 'sender', message: 'hi' }),
     })
     expect(landed.status).toBe(200)
-    const result = await sender.callTool({ name: 'send', arguments: { to: 'home:家裡阿宇', message: 'reply' } })
+    const result = await sender.callTool({ name: 'send', arguments: { to: 'home:docs-writer', message: 'reply' } })
     expect(JSON.parse(text(result)).via_peer).toBe('home')
     expect(relayCalls).toHaveLength(1)
     await sender.close()
@@ -139,7 +139,7 @@ describe('session listing across machines', () => {
     const fetchImpl = (async (url: string | URL | Request) => {
       relayCalls.push(String(url))
       return Response.json({ peer: 'home', sessions: [
-        { alias: '家裡阿宇', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
+        { alias: 'docs-writer', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
         { alias: null, client_kind: 'external', online: true },
       ] })
     }) as unknown as typeof fetch
@@ -175,7 +175,7 @@ describe('session listing across machines', () => {
     const parsed = JSON.parse((result.content as Array<{ text: string }>)[0]!.text)
     expect(relayCalls).toEqual(['http://gw/peer/sessions?peer=home'])
     expect(parsed).toEqual({ peer: 'home', sessions: [
-      { alias: 'home:家裡阿宇', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
+      { alias: 'home:docs-writer', client_kind: 'claude_code', online: true, last_activity: '2026-10-15T13:00:00+08:00' },
     ] })
     await client.close()
   })
