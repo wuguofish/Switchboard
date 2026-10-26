@@ -2187,3 +2187,114 @@ test('HTTP message read returns an empty array for an empty mailbox', async () =
   expect(resp.status).toBe(200)
   expect(await resp.json()).toEqual({ messages: [] })
 })
+
+function toolJson(result: Awaited<ReturnType<Client['callTool']>>): any {
+  return JSON.parse((result.content as any[])[0].text)
+}
+
+async function listSessions(client: Client, args: Record<string, unknown> = {}): Promise<any[]> {
+  return toolJson(await client.callTool({ name: 'list_sessions', arguments: args }))
+}
+
+test('set_status needs a registered session with an alias', async () => {
+  const stranger = await makeClient('status-stranger')
+  await expect(stranger.callTool({ name: 'set_status', arguments: { text: 'hi' } }))
+    .rejects.toThrow('not registered')
+
+  await stranger.callTool({ name: 'register', arguments: {} })
+  await expect(stranger.callTool({ name: 'set_status', arguments: { text: 'hi' } }))
+    .rejects.toThrow('anonymous')
+  await stranger.close()
+})
+
+test('set_status rejects more than 200 characters, counting each CJK character once', async () => {
+  const client = await makeClient('status-limit')
+  await client.callTool({ name: 'register', arguments: { role: 'status-limit' } })
+
+  const exact = toolJson(await client.callTool({ name: 'set_status', arguments: { text: '字'.repeat(200) } }))
+  expect(exact.status).toBe('字'.repeat(200))
+  await expect(client.callTool({ name: 'set_status', arguments: { text: '字'.repeat(201) } }))
+    .rejects.toThrow('201 characters; the limit is 200')
+  await client.close()
+})
+
+test('set_status sets, overwrites and clears, and other sessions see it in list_sessions', async () => {
+  const a = await makeClient('status-a')
+  const b = await makeClient('status-b')
+  await a.callTool({ name: 'register', arguments: { role: 'docs-writer' } })
+  await b.callTool({ name: 'register', arguments: { role: 'ci-watcher' } })
+
+  const set = toolJson(await a.callTool({ name: 'set_status', arguments: { text: '  rewriting the install guide ' } }))
+  expect(set).toEqual({ alias: 'docs-writer', status: 'rewriting the install guide', updated_at: expect.stringMatching(/\+08:00$/) })
+  await b.callTool({ name: 'set_status', arguments: { text: 'watching main' } })
+  await a.callTool({ name: 'set_status', arguments: { text: 'reviewing PR #42' } })
+
+  const seenByB = new Map((await listSessions(b)).map(s => [s.alias, s]))
+  expect(seenByB.get('docs-writer')).toMatchObject({ online: true, status: 'reviewing PR #42' })
+  expect(seenByB.get('docs-writer').status_updated_at).toMatch(/\+08:00$/)
+  const seenByA = new Map((await listSessions(a)).map(s => [s.alias, s]))
+  expect(seenByA.get('ci-watcher')).toMatchObject({ online: true, status: 'watching main' })
+
+  const cleared = toolJson(await a.callTool({ name: 'set_status', arguments: { text: '' } }))
+  expect(cleared).toEqual({ alias: 'docs-writer', status: null, updated_at: null })
+  const afterClear = (await listSessions(b)).find(s => s.alias === 'docs-writer')
+  expect(afterClear).toMatchObject({ status: null, status_updated_at: null })
+
+  await a.close()
+  await b.close()
+})
+
+test('an offline session\'s status is listed only with include_offline', async () => {
+  const leaver = await makeClient('status-leaver')
+  const stayer = await makeClient('status-stayer')
+  await leaver.callTool({ name: 'register', arguments: { role: 'release-bot' } })
+  await stayer.callTool({ name: 'register', arguments: { role: 'stayer' } })
+  await leaver.callTool({ name: 'set_status', arguments: { text: 'offline, handover in #42' } })
+  await leaver.close()
+
+  expect((await listSessions(stayer)).map(s => s.alias)).toEqual(['stayer'])
+  const withOffline = await listSessions(stayer, { include_offline: true })
+  expect(withOffline).toContainEqual({
+    session_id: null,
+    alias: 'release-bot',
+    client_kind: null,
+    online: false,
+    created_at: null,
+    last_activity: null,
+    status: 'offline, handover in #42',
+    status_updated_at: expect.stringMatching(/\+08:00$/),
+  })
+  expect(withOffline.filter(s => s.alias === 'stayer')).toHaveLength(1)
+  await stayer.close()
+})
+
+test('a status stays with the alias it was set under: a renamed session starts without one', async () => {
+  const renamer = await makeClient('status-renamer')
+  await renamer.callTool({ name: 'register', arguments: { role: 'old-name' } })
+  await renamer.callTool({ name: 'set_status', arguments: { text: 'set before the rename' } })
+  await renamer.callTool({ name: 'set_alias', arguments: { alias: 'new-name' } })
+
+  expect(await listSessions(renamer)).toEqual([expect.objectContaining({ alias: 'new-name', online: true, status: null })])
+  expect(await listSessions(renamer, { include_offline: true })).toContainEqual(
+    expect.objectContaining({ alias: 'old-name', online: false, status: 'set before the rename' }),
+  )
+  await renamer.close()
+})
+
+test('statuses survive a daemon restart', async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'sb-status-restart-')), 'switchboard.db')
+  await handle.stop()
+  handle = await startServer({ port: TEST_PORT, dbPath, sessionsDir })
+
+  const before = await makeClient('status-before-restart')
+  await before.callTool({ name: 'register', arguments: { role: 'night-shift' } })
+  await before.callTool({ name: 'set_status', arguments: { text: 'paused until morning' } })
+  await before.close()
+  await handle.stop()
+
+  handle = await startServer({ port: TEST_PORT, dbPath, sessionsDir })
+  const after = await makeClient('status-after-restart')
+  const listed = await listSessions(after, { include_offline: true })
+  expect(listed).toContainEqual(expect.objectContaining({ alias: 'night-shift', online: false, status: 'paused until morning' }))
+  await after.close()
+})

@@ -34,6 +34,16 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (recipient_id) REFERENCES sessions(id)
 );
 
+-- One status line per alias, kept after the session goes offline so whoever
+-- takes over the name can read it. last_seen_at is when the alias was last
+-- held by an active session; retention clears rows 7 days after that.
+CREATE TABLE IF NOT EXISTS session_status (
+    alias         TEXT PRIMARY KEY,
+    status        TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_recipient_unread
     ON messages(recipient_id, read_at) WHERE read_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_broadcast

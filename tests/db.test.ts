@@ -3,7 +3,7 @@ import { unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions, deleteStaleSessionRows, OwnershipConflictError } from '../db'
+import { openDatabase, createClientSession, createSession, findSessionById, findSessionByAlias, findSessionByClientSessionId, findSessionByCcSessionId, registerClientSession, unregisterClientSession, releaseSession, updateLastActivity, updateLastSeen, insertMessage, fetchUnreadForRecipient, markMessagesRead, insertBroadcast, recallMessage, listAllSessions, deleteExpiredMessages, releaseStaleActiveSessions, deleteStaleSessionRows, OwnershipConflictError, setSessionStatus, clearSessionStatus, listSessionStatuses, markHeldStatusesSeen, deleteExpiredStatuses } from '../db'
 
 const TEST_DB = ':memory:'
 let db: Database
@@ -20,7 +20,7 @@ test('openDatabase creates schema', () => {
   const tables = db.query<{ name: string }, []>(
     "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
   ).all()
-  expect(tables.map(t => t.name)).toEqual(['messages', 'sessions'])
+  expect(tables.map(t => t.name)).toEqual(['messages', 'session_status', 'sessions'])
 })
 
 test('createSession inserts row', () => {
@@ -772,4 +772,79 @@ test('deleteStaleSessionRows keeps recently released rows', () => {
 
   expect(deleteStaleSessionRows(db, 30)).toBe(0)
   expect(findSessionById(db, recent)).not.toBeNull()
+})
+
+function backdateStatus(alias: string, ageMs: number): void {
+  const past = new Date(Date.now() - ageMs).toISOString()
+  db.query('UPDATE session_status SET updated_at = ?, last_seen_at = ? WHERE alias = ?').run(past, past, alias)
+}
+
+const DAY_MS = 86400_000
+
+test('session status: set, overwrite, clear', () => {
+  const first = setSessionStatus(db, 'docs-writer', 'rewriting the install guide')
+  expect(first).toMatchObject({ alias: 'docs-writer', status: 'rewriting the install guide' })
+  expect(first.updated_at).toBe(first.last_seen_at)
+
+  setSessionStatus(db, 'docs-writer', 'reviewing PR #42')
+  expect(listSessionStatuses(db)).toEqual([
+    expect.objectContaining({ alias: 'docs-writer', status: 'reviewing PR #42' }),
+  ])
+
+  clearSessionStatus(db, 'docs-writer')
+  expect(listSessionStatuses(db)).toEqual([])
+})
+
+test('session status survives reopening the database', () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'switchboard-status-')), 'status.db')
+  const first = openDatabase(dbPath)
+  setSessionStatus(first, 'ci-watcher', 'watching main')
+  first.close()
+
+  const reopened = openDatabase(dbPath)
+  expect(listSessionStatuses(reopened)).toEqual([
+    expect.objectContaining({ alias: 'ci-watcher', status: 'watching main' }),
+  ])
+  reopened.close()
+})
+
+test('opening a database from before statuses adds the table and keeps sessions and messages', () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'switchboard-status-upgrade-')), 'old.db')
+  const old = openDatabase(dbPath)
+  const sender = createSession(old, { alias: 'sender' })
+  const recipient = createSession(old, { alias: 'recipient' })
+  insertMessage(old, { sender_id: sender, recipient_id: recipient, broadcast_id: null, content: 'keep me' })
+  old.exec('DROP TABLE session_status')
+  old.close()
+
+  const upgraded = openDatabase(dbPath)
+  expect(listSessionStatuses(upgraded)).toEqual([])
+  expect(findSessionByAlias(upgraded, 'sender')?.id).toBe(sender)
+  expect(fetchUnreadForRecipient(upgraded, recipient).map(m => m.content)).toEqual(['keep me'])
+  upgraded.close()
+})
+
+test('markHeldStatusesSeen refreshes only aliases an active session holds', () => {
+  createSession(db, { alias: 'online-old' })
+  const released = createSession(db, { alias: 'gone' })
+  releaseSession(db, released)
+  setSessionStatus(db, 'online-old', 'standing by')
+  setSessionStatus(db, 'gone', 'left for the day')
+  backdateStatus('online-old', 10 * DAY_MS)
+  backdateStatus('gone', 10 * DAY_MS)
+
+  expect(markHeldStatusesSeen(db)).toBe(1)
+  const byAlias = new Map(listSessionStatuses(db).map(row => [row.alias, row]))
+  expect(Date.now() - Date.parse(byAlias.get('online-old')!.last_seen_at)).toBeLessThan(60_000)
+  expect(Date.now() - Date.parse(byAlias.get('gone')!.last_seen_at)).toBeGreaterThan(9 * DAY_MS)
+})
+
+test('deleteExpiredStatuses clears statuses unseen for over 7 days and keeps newer ones', () => {
+  setSessionStatus(db, 'just-expired', 'a')
+  setSessionStatus(db, 'not-yet', 'b')
+  backdateStatus('just-expired', 7 * DAY_MS + 60_000)
+  backdateStatus('not-yet', 7 * DAY_MS - 60_000)
+
+  expect(deleteExpiredStatuses(db)).toBe(1)
+  expect(listSessionStatuses(db).map(row => row.alias)).toEqual(['not-yet'])
 })

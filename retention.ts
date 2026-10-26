@@ -1,5 +1,11 @@
 import type { Database } from 'bun:sqlite'
-import { deleteExpiredMessages, deleteStaleSessionRows, releaseStaleActiveSessions } from './db'
+import {
+  deleteExpiredMessages,
+  deleteExpiredStatuses,
+  deleteStaleSessionRows,
+  markHeldStatusesSeen,
+  releaseStaleActiveSessions,
+} from './db'
 import type { ConnectionRegistry } from './connections'
 
 const ONE_HOUR_MS = 60 * 60 * 1000
@@ -56,18 +62,33 @@ export function startRetentionLoop(
     }
   }
 
+  const statusesTick = () => {
+    try {
+      markHeldStatusesSeen(db)
+      const deleted = deleteExpiredStatuses(db)
+      if (deleted > 0) {
+        process.stderr.write(`switchboard: retention deleted ${deleted} status(es)\n`)
+      }
+    } catch (err) {
+      process.stderr.write(`switchboard: statuses retention error: ${err}\n`)
+    }
+  }
+
   // Run once immediately, then schedule periodic ticks.
   messagesTick()
   sessionsTick()
   staleRowsTick()
+  statusesTick()
   const messagesTimer = setInterval(messagesTick, ONE_HOUR_MS)
   const staleRowsTimer = setInterval(staleRowsTick, ONE_HOUR_MS)
   const sessionsTimer = setInterval(sessionsTick, 2 * ONE_HOUR_MS)
+  const statusesTimer = setInterval(statusesTick, ONE_HOUR_MS)
   return {
     stop() {
       clearInterval(messagesTimer)
       clearInterval(staleRowsTimer)
       clearInterval(sessionsTimer)
+      clearInterval(statusesTimer)
     },
   }
 }

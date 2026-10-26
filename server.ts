@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { Database } from 'bun:sqlite'
-import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError } from './db'
+import { openDatabase, createSession, createClientSession, findSessionById, findSessionByAlias, findSessionByCcSessionId, findAnySessionByCcSessionId, findSessionByClientSessionId, findAnySessionByClientSessionId, registerClientSession, unregisterClientSession, updateLastActivity, updateLastSeen, updateOwnerSeen, releaseSessionIfGeneration, insertMessage, insertBroadcast, fetchUnreadForRecipient, markMessagesRead, listAllSessions, recallMessage, countUnreadBySessionId, OwnershipConflictError, setSessionStatus, clearSessionStatus, listSessionStatuses } from './db'
 import { ConnectionRegistry, type PushCallback } from './connections'
 import { setAliasWithCollisionCheck, resolveTarget, UnknownTargetError } from './aliases'
 import { parsePeerTarget, relayToPeer, listPeerSessions, DEFAULT_PEER_RELAY_URL } from './peer-relay'
@@ -49,6 +49,8 @@ interface SessionEntry {
 
 const CLIENT_KINDS: readonly ClientKind[] = ['claude_code', 'codex', 'external']
 const BROADCAST_SCOPES: readonly BroadcastScope[] = ['all', 'same_kind', 'same_cwd']
+/** Counted in code points, so one CJK character or emoji is one character. */
+const STATUS_MAX_CHARS = 200
 
 class RequestValidationError extends Error {}
 
@@ -251,15 +253,37 @@ export async function startServer(opts: {
 
   /** Online sessions only: offline rows pile up into the hundreds and flood the caller. */
   function onlineSessionsPublic() {
+    const statuses = new Map(listSessionStatuses(db).map(row => [row.alias, row]))
     return listAllSessions(db)
       .filter(s => isSessionOnline(s, registry, waiters))
-      .map(s => ({
-        session_id: s.id,
-        alias: s.alias,
-        client_kind: s.client_kind,
-        online: true,
-        created_at: toTaipeiISOString(s.created_at),
-        last_activity: toTaipeiISOString(s.last_activity),
+      .map(s => {
+        const status = s.alias === null ? undefined : statuses.get(s.alias)
+        return {
+          session_id: s.id,
+          alias: s.alias,
+          client_kind: s.client_kind,
+          online: true,
+          created_at: toTaipeiISOString(s.created_at),
+          last_activity: toTaipeiISOString(s.last_activity),
+          status: status?.status ?? null,
+          status_updated_at: status ? toTaipeiISOString(status.updated_at) : null,
+        }
+      })
+  }
+
+  /** Aliases that kept a status but have no online session behind them right now. */
+  function offlineStatusesPublic(onlineAliases: Set<string>) {
+    return listSessionStatuses(db)
+      .filter(row => !onlineAliases.has(row.alias))
+      .map(row => ({
+        session_id: null,
+        alias: row.alias,
+        client_kind: null,
+        online: false,
+        created_at: null,
+        last_activity: null,
+        status: row.status,
+        status_updated_at: toTaipeiISOString(row.updated_at),
       }))
   }
 
@@ -755,15 +779,36 @@ export async function startServer(opts: {
         {
           name: 'list_sessions',
           description:
-            'List the sessions that are currently online. '
-            + 'Offline history is not returned — query the sessions table directly if you need it. '
+            'List the sessions that are currently online, each with the status line it set '
+            + '(`status`, `status_updated_at`; null when none). '
+            + 'With `include_offline`, also lists aliases that are offline but kept a status, as `online: false`. '
             + 'With `peer`, asks that machine (through the local line-gateway) for its online '
             + 'sessions; each alias comes back as `<peer>:<alias>`, ready for `send`.',
           inputSchema: {
             type: 'object' as const,
             properties: {
               peer: { type: 'string', description: 'Peer machine name from the gateway\'s peers.json, e.g. home.' },
+              include_offline: {
+                type: 'boolean',
+                default: false,
+                description: 'Also list offline aliases that still have a status. Ignored with `peer`.',
+              },
             },
+          },
+        },
+        {
+          name: 'set_status',
+          description:
+            'Set the one-line status list_sessions shows for this session, for example what you are working on. '
+            + 'Nobody is notified; others read it when they list sessions. '
+            + 'An empty string clears it. At most 200 characters. '
+            + 'The status belongs to your current alias and is kept for 7 days after the alias goes offline.',
+          inputSchema: {
+            type: 'object' as const,
+            properties: {
+              text: { type: 'string', description: 'The status line; empty to clear.' },
+            },
+            required: ['text'],
           },
         },
         {
@@ -1034,13 +1079,46 @@ export async function startServer(opts: {
       }
 
       if (name === 'list_sessions') {
-        const peer = (args as Record<string, unknown>)?.peer
+        const argsObj = (args as Record<string, unknown>) ?? {}
+        const peer = argsObj.peer
         if (typeof peer === 'string' && peer.trim()) {
           const remote = await listPeerSessions(peerRelayUrl, peer.trim(), opts.fetchImpl)
           return { content: [{ type: 'text', text: JSON.stringify(remote) }] }
         }
+        const online = onlineSessionsPublic()
+        const sessions = argsObj.include_offline === true
+          ? [...online, ...offlineStatusesPublic(new Set(online.flatMap(s => s.alias ?? [])))]
+          : online
         return {
-          content: [{ type: 'text', text: JSON.stringify(onlineSessionsPublic()) }],
+          content: [{ type: 'text', text: JSON.stringify(sessions) }],
+        }
+      }
+
+      if (name === 'set_status') {
+        if (!currentSwitchboardId) {
+          throw new Error('session not registered; call register(cc_session_id=<your Claude Code session id>) first')
+        }
+        const alias = findSessionById(db, currentSwitchboardId)?.alias ?? null
+        if (alias === null) {
+          throw new Error('set_status needs an alias; this session is anonymous')
+        }
+        const text = (args as Record<string, unknown>)?.text
+        if (typeof text !== 'string') throw new Error('text is required and must be a string')
+        const status = text.trim()
+        if (status === '') {
+          clearSessionStatus(db, alias)
+          return { content: [{ type: 'text', text: JSON.stringify({ alias, status: null, updated_at: null }) }] }
+        }
+        const length = [...status].length
+        if (length > STATUS_MAX_CHARS) {
+          throw new Error(`status is ${length} characters; the limit is ${STATUS_MAX_CHARS}`)
+        }
+        const row = setSessionStatus(db, alias, status)
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ alias, status: row.status, updated_at: toTaipeiISOString(row.updated_at) }),
+          }],
         }
       }
 

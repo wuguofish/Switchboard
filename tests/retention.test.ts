@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { openDatabase, createSession, findSessionByAlias, releaseStaleActiveSessions } from '../db'
+import { openDatabase, createSession, findSessionByAlias, releaseSession, releaseStaleActiveSessions, setSessionStatus, listSessionStatuses } from '../db'
 import { ConnectionRegistry } from '../connections'
 import { startRetentionLoop } from '../retention'
 
@@ -66,6 +66,38 @@ test('retention sessionsTick unregisters released sessions from the in-memory re
   expect(registry.isOnline(orphaned)).toBe(false)
 
   db.close()
+})
+
+test('retention keeps an online session\'s old status, clears one offline past 7 days, keeps one offline under 7 days', () => {
+  const db = openDatabase(':memory:')
+  const registry = new ConnectionRegistry()
+  const DAY_MS = 86400_000
+  const backdate = (alias: string, ageMs: number) => {
+    const past = new Date(Date.now() - ageMs).toISOString()
+    db.query('UPDATE session_status SET updated_at = ?, last_seen_at = ? WHERE alias = ?').run(past, past, alias)
+  }
+
+  createSession(db, { alias: 'standing-by' })
+  setSessionStatus(db, 'standing-by', 'waiting for review')
+  backdate('standing-by', 30 * DAY_MS)
+
+  const gone = createSession(db, { alias: 'gone-a-week' })
+  releaseSession(db, gone)
+  setSessionStatus(db, 'gone-a-week', 'handover in #42')
+  backdate('gone-a-week', 7 * DAY_MS + 60_000)
+
+  const recent = createSession(db, { alias: 'gone-yesterday' })
+  releaseSession(db, recent)
+  setSessionStatus(db, 'gone-yesterday', 'back tomorrow')
+  backdate('gone-yesterday', 7 * DAY_MS - 60_000)
+
+  const handle = startRetentionLoop(db, registry)
+  try {
+    expect(listSessionStatuses(db).map(row => row.alias)).toEqual(['gone-yesterday', 'standing-by'])
+  } finally {
+    handle.stop()
+    db.close()
+  }
 })
 
 test('retention stop() cancels timers so the loop does not keep the event loop alive', () => {

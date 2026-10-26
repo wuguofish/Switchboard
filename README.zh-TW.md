@@ -231,7 +231,8 @@ cc_session_id 向 switchboard 註冊：
 | `send` | `to`、`message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`、`scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}`——只回沒有任何喚醒帶走的信；喚醒送到的已是已讀 |
-| `list_sessions` | `peer?` | `[{session_id, alias, client_kind, online, created_at, last_activity}, ...]`——只列在線的 session；帶 `peer` 時回那台機器的 `{peer, sessions: [{alias, client_kind, online, last_activity}, ...]}`，alias 已帶前綴 |
+| `list_sessions` | `peer?`、`include_offline?` | `[{session_id, alias, client_kind, online, created_at, last_activity, status, status_updated_at}, ...]`——在線的 session，各自帶著設定的狀態（沒設過是 `null`）。`include_offline: true` 會再列出離線但保留了狀態的 alias，`online: false`，session 相關欄位為 `null`。帶 `peer` 時回那台機器的 `{peer, sessions: [{alias, client_kind, online, last_activity, status, status_updated_at}, ...]}`，alias 已帶前綴（忽略 `include_offline`） |
+| `set_status` | `text` | `{alias, status, updated_at}`——替這個 session 的 alias 設一句狀態，最多 200 字元；空字串會清除狀態，回傳 `null`。不通知任何人，別人透過 `list_sessions` 讀到。需要已註冊、有 alias 的 session |
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}`——`status` 為 `released`、`stale_ignored`（同一 identity 已被更新世代重新註冊，未釋放任何東西）或 `already_offline` |
 
@@ -248,7 +249,7 @@ cc_session_id 向 switchboard 註冊：
 ## HTTP endpoints
 
 - `POST /mcp`、`GET /mcp`、`DELETE /mcp` — MCP Streamable HTTP 傳輸
-- `GET /sessions` — 本機目前在線的 session（`alias`、`client_kind`、時間）；本機 line-gateway 靠它回答對方機器「誰在線」。
+- `GET /sessions` — 本機目前在線的 session（`alias`、`client_kind`、時間、`status`）；本機 line-gateway 靠它回答對方機器「誰在線」。
 - `POST /external/send` — 給本機非 MCP 程序投遞訊息用，例如
   codex-bridge 在背景 job 完成後通知 Claude Code。JSON body：
   `{ "to": "<alias-or-session-id>", "message": "...", "from": "codex" }`
@@ -375,6 +376,7 @@ generation/identity 驗證身分、讀取並標記自己未讀訊息的途徑。
 ## 保留 & 清理
 
 - 已讀訊息 7 天後自動刪除。
+- `set_status` 設的狀態，在它的 alias 最後一次被 active session 持有之後 7 天刪除。所以狀態比設定它的 session 活得久，接手同一個名字的人讀得到。session 離線、daemon 重啟都不會清掉它。
 - lease 過期超過 24 小時的 session（沒 MCP 連線、沒 polling、沒續租）由保留巡檢
   （每 2 小時一次）補蓋 released_at、讓出 alias。crash 且沒觸發 `transport.onclose` 的
   session 因此最長可能占用 alias 約 26 小時；同一 identity 隨時可透過冪等重新註冊立即取回自己的列。

@@ -81,6 +81,9 @@ export interface PeerSessionPublic {
   client_kind: string
   online: boolean
   last_activity: string
+  /** Null when none is set, or when the peer runs a daemon without statuses. */
+  status: string | null
+  status_updated_at: string | null
 }
 
 /** Asks the local gateway which sessions are online on a peer machine. */
@@ -116,6 +119,8 @@ export async function listPeerSessions(
         client_kind: typeof s.client_kind === 'string' ? s.client_kind : 'unknown',
         online: s.online === true,
         last_activity: typeof s.last_activity === 'string' ? s.last_activity : '',
+        status: typeof s.status === 'string' ? s.status : null,
+        status_updated_at: typeof s.status_updated_at === 'string' ? s.status_updated_at : null,
       })),
   }
 }

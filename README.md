@@ -235,7 +235,8 @@ Each tool takes JSON arguments; responses are JSON inside a `content[0].text` te
 | `send` | `to`, `message` | `{message_id, delivered_notification}` |
 | `broadcast` | `message`, `scope?` | `{broadcast_id, recipient_count, notified_count}` |
 | `read_messages` | — | `{messages: [...]}` — only mail no wake has carried; mail delivered by a wake is already read |
-| `list_sessions` | `peer?` | `[{session_id, alias, client_kind, online, created_at, last_activity}, ...]` — online sessions only; with `peer`, `{peer, sessions: [{alias, client_kind, online, last_activity}, ...]}` from that machine, aliases already prefixed |
+| `list_sessions` | `peer?`, `include_offline?` | `[{session_id, alias, client_kind, online, created_at, last_activity, status, status_updated_at}, ...]` — online sessions, each with the status it set (`null` when none). `include_offline: true` adds offline aliases that kept a status, with `online: false` and `null` session fields. With `peer`, `{peer, sessions: [{alias, client_kind, online, last_activity, status, status_updated_at}, ...]}` from that machine, aliases already prefixed (`include_offline` is ignored) |
+| `set_status` | `text` | `{alias, status, updated_at}` — one status line for this session's alias, at most 200 characters; an empty string clears it and returns `null`s. Nobody is notified; others read it through `list_sessions`. Needs a registered session with an alias |
 | `recall` | `message_id` | `{recalled_count}` |
 | `unregister` | — | `{status, released_alias}` — `status` is `released`, `stale_ignored` (a newer generation re-registered this identity; nothing was released), or `already_offline` |
 
@@ -252,7 +253,7 @@ Codex-kind recipients are only written to when they are online at insert time �
 ## HTTP endpoints
 
 - `POST /mcp`, `GET /mcp`, `DELETE /mcp` — MCP Streamable HTTP transport
-- `GET /sessions` — the sessions currently online here (`alias`, `client_kind`, timestamps); the local line-gateway reads it to answer a peer machine asking who is online.
+- `GET /sessions` — the sessions currently online here (`alias`, `client_kind`, timestamps, `status`); the local line-gateway reads it to answer a peer machine asking who is online.
 - `POST /external/send` — local non-MCP send endpoint for programs such as
   codex-bridge to notify Claude Code when a background job finishes. JSON body:
   `{ "to": "<alias-or-session-id>", "message": "...", "from": "codex" }`.
@@ -396,6 +397,7 @@ consume the inbox without touching SQLite or retriggering on already-read mail.
 ## Retention & cleanup
 
 - Messages marked read are deleted after 7 days.
+- A status set with `set_status` is deleted 7 days after its alias was last held by an active session, so it outlives the session that set it and whoever takes over the name can read it. Going offline and daemon restarts do not clear it.
 - Sessions whose lease has been stale for over 24 hours — no MCP connection,
   no polling, no lease renewal — are released by the retention sweep (every
   2 hours), freeing their aliases. A crashed session that never fired
